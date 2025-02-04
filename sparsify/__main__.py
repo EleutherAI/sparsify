@@ -9,7 +9,9 @@ import torch.distributed as dist
 from datasets import Dataset, load_dataset
 from safetensors.torch import load_model
 from simple_parsing import field, parse
-from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig, PreTrainedModel
+from transformers import (
+    AutoModel, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, PreTrainedModel,
+)
 
 from .data import MemmapDataset, chunk_and_tokenize
 from .trainer import TrainConfig, Trainer
@@ -75,7 +77,9 @@ def load_artifacts(
     else:
         dtype = "auto"
 
-    model = AutoModel.from_pretrained(
+    # End-to-end training requires a model with a causal LM head
+    model_cls = AutoModelForCausalLM if args.end_to_end else AutoModel
+    model = model_cls.from_pretrained(
         args.model,
         device_map={"": f"cuda:{rank}"},
         quantization_config=(

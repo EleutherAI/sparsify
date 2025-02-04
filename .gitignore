@@ -161,3 +161,6 @@ cython_debug/
 
 checkpoints/
 wandb/
+sae-ckpts/
+sched*
+smoll*

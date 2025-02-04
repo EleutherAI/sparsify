@@ -37,7 +37,9 @@ def resolve_widths(
     dim: int = -1,
 ) -> dict[str, int]:
     """Find number of output dimensions for the specified modules."""
-    module_to_name = {model.get_submodule(name): name for name in module_names}
+    module_to_name = {
+        model.base_model.get_submodule(name): name for name in module_names
+    }
     shapes: dict[str, int] = {}
 
     def hook(module, _, output):
