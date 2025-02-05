@@ -225,7 +225,9 @@ class SparseCoder(nn.Module):
 
     # Wrapping the forward in bf16 autocast improves performance by almost 2x
     @torch.autocast(
-        "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_bf16_supported()
+        "cuda",
+        dtype=torch.bfloat16,
+        enabled=torch.cuda.is_bf16_supported(including_emulation=False),
     )
     def forward(
         self, x: Tensor, y: Tensor | None = None, *, dead_mask: Tensor | None = None

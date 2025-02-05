@@ -61,6 +61,23 @@ def resolve_widths(
     return shapes
 
 
+def set_submodule(model: nn.Module, submodule_path: str, new_submodule: nn.Module):
+    """
+    Replaces a submodule in a PyTorch model dynamically.
+
+    Args:
+        model (nn.Module): The root model containing the submodule.
+        submodule_path (str): Dotted path to the submodule.
+        new_submodule (nn.Module): The new module to replace the existing one.
+
+    Example:
+        set_submodule(model, "encoder.layer.0.attention.self", nn.Identity())
+    """
+    parent_path, _, last_name = submodule_path.rpartition(".")
+    parent_module = model.get_submodule(parent_path) if parent_path else model
+    setattr(parent_module, last_name, new_submodule)
+
+
 # Fallback implementation of SAE decoder
 def eager_decode(top_indices: Tensor, top_acts: Tensor, W_dec: Tensor):
     return nn.functional.embedding_bag(
