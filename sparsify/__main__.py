@@ -10,7 +10,11 @@ from datasets import Dataset, load_dataset
 from safetensors.torch import load_model
 from simple_parsing import field, parse
 from transformers import (
-    AutoModel, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, PreTrainedModel,
+    AutoModel,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    PreTrainedModel,
 )
 
 from .data import MemmapDataset, chunk_and_tokenize

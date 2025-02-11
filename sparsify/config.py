@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from functools import partial
 from typing import Literal
 
 from simple_parsing import Serializable, list_field
@@ -12,7 +11,6 @@ class SparseCoderConfig(Serializable):
     """
 
     activation: Literal["groupmax", "topk"] = "topk"
-    """Activation function to use."""
 
     expansion_factor: int = 32
     """Multiple of the input dimension to use as the SAE dimension."""
