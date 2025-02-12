@@ -1,4 +1,3 @@
-import math
 from collections import defaultdict
 from dataclasses import asdict
 from fnmatch import fnmatchcase
@@ -437,23 +436,13 @@ class SaeTrainer:
                 mod.register_forward_hook(hook) for mod in name_to_module.values()
             ]
             try:
-                ce_loss = None
-
                 # If we're training end-to-end, we need to pass the labels to the model
                 # and do a backward pass through the entire model.
                 if self.cfg.end_to_end:
                     ce_loss = self.model(x, labels=x).loss
-
-                    alpha = self.cfg.local_loss_weight
-                    loss = (
-                        # Normalize the CE loss by log(vocab_size) to compare with FVU
-                        (1 - alpha) * ce_loss / math.log(self.model.config.vocab_size)
-                        +
-                        # Normalize the aux loss by the number of SAEs
-                        alpha * aux_loss / len(self.saes)
-                    )
-                    loss.div(acc_steps).backward()
+                    ce_loss.div(acc_steps).backward()
                 else:
+                    ce_loss = None
                     self.model(x)
             finally:
                 aux_loss = 0.0
