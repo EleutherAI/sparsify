@@ -344,7 +344,7 @@ class SaeTrainer:
 
             # Flatten the batch and sequence dimensions
             outputs = outputs.flatten(0, 1)
-            inputs = inputs.flatten(0, 1) if self.cfg.transcode else outputs
+            inputs = inputs.flatten(0, 1) if self.cfg.sae.transcode else outputs
             raw = self.saes[name]
 
             # On the first iteration, initialize the encoder and decoder biases
@@ -360,7 +360,7 @@ class SaeTrainer:
                 raw.b_dec.data = mean.to(raw.dtype)
 
             # Make sure the W_dec is still unit-norm if we're autoencoding
-            if raw.cfg.normalize_decoder and not self.cfg.transcode:
+            if raw.cfg.normalize_decoder and not self.cfg.sae.transcode:
                 raw.set_decoder_norm_to_unit_norm()
 
             wrapped = maybe_wrapped[name]
