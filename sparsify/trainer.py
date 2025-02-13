@@ -2,6 +2,7 @@ from collections import defaultdict
 from dataclasses import asdict
 from fnmatch import fnmatchcase
 from typing import Sized
+from glob import glob
 
 import torch
 import torch.distributed as dist
@@ -122,8 +123,18 @@ class Trainer:
         train_state = torch.load(
             f"{path}/state.pt", map_location=device, weights_only=True
         )
+        train_state["num_tokens_since_fired"] = {}
+
+        for file in glob(f"{path}/rank_*_state.pt"):
+            rank_train_state = torch.load(file, map_location=device)
+            train_state["num_tokens_since_fired"].update(rank_train_state["num_tokens_since_fired"])
+
+
         self.global_step = train_state["global_step"]
-        self.num_tokens_since_fired = train_state["num_tokens_since_fired"]
+        self.num_tokens_since_fired = {
+            k: train_state["num_tokens_since_fired"][k]
+            for k in self.local_hookpoints()
+        }
 
         print(
             f"\033[92mResuming training at step {self.global_step} from '{path}'\033[0m"
@@ -489,16 +500,12 @@ class Trainer:
 
                 sae.save_to_disk(f"{path}/{name}")
 
+            torch.save({"num_tokens_since_fired": self.num_tokens_since_fired}, f"{path}/rank_{dist.get_rank()}_state.pt")
+
         if rank_zero:
             torch.save(self.lr_scheduler.state_dict(), f"{path}/lr_scheduler.pt")
             torch.save(self.optimizer.state_dict(), f"{path}/optimizer.pt")
-            torch.save(
-                {
-                    "global_step": self.global_step,
-                    "num_tokens_since_fired": self.num_tokens_since_fired,
-                },
-                f"{path}/state.pt",
-            )
+            torch.save({"global_step": self.global_step}, f"{path}/state.pt")
 
             self.cfg.save_json(f"{path}/config.json")
 
