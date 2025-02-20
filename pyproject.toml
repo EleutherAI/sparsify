@@ -16,6 +16,7 @@ dependencies = [
     "huggingface-hub",
     "natsort",  # For sorting module names
     "safetensors",
+    "schedulefree",
     "simple-parsing",
     "torch",
     "transformers",

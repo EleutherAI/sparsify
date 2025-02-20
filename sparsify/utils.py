@@ -62,7 +62,7 @@ def resolve_widths(
 # Fallback implementation of SAE decoder
 def eager_decode(top_indices: Tensor, top_acts: Tensor, W_dec: Tensor):
     return nn.functional.embedding_bag(
-        top_indices, W_dec.mT, per_sample_weights=top_acts, mode='sum'
+        top_indices, W_dec.mT, per_sample_weights=top_acts, mode="sum"
     )
 
 
@@ -77,7 +77,7 @@ except ImportError:
     decoder_impl = eager_decode
     print("Triton not installed, using eager implementation of SAE decoder.")
 else:
-    if os.environ.get("SAE_DISABLE_TRITON") == "1":
+    if os.environ.get("SPARSIFY_DISABLE_TRITON") == "1":
         print("Triton disabled, using eager implementation of SAE decoder.")
         decoder_impl = eager_decode
     else:
