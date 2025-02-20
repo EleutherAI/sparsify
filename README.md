@@ -130,3 +130,13 @@ There are several features that we'd like to add in the near future:
 - [ ] Evaluate SAEs with KL divergence when grafted into the model
 
 If you'd like to help out with any of these, please feel free to open a PR! You can collaborate with us in the sparse-autoencoders channel of the EleutherAI Discord.
+
+## Experimental features
+
+Linear k decay schedule:
+
+```bash python -m sparsify gpt2 --hookpoints "h.*.attn" "h.*.mlp.act" --k_decay_steps 10_000```
+
+GroupMax activation function:
+
+```bash python -m sparsify gpt2 --hookpoints "h.*.attn" "h.*.mlp.act" --activation groupmax```

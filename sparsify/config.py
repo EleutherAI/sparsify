@@ -57,6 +57,10 @@ class TrainConfig(Serializable):
     lr: float | None = None
     """Base LR. If None, it is automatically chosen based on the number of latents."""
 
+    k_decay_steps: int = 0
+    """Number of steps over which to decay the number of active latents. Starts at
+    input width * 10 and decays to k. Experimental feature."""
+
     auxk_alpha: float = 0.0
     """Weight of the auxiliary loss term."""
 
