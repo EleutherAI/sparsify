@@ -86,7 +86,7 @@ class Trainer:
             {
                 "params": sae.parameters(),
                 # Auto-select LR using 1 / sqrt(d) scaling law from Fig 3 of the paper
-                "lr": cfg.lr or 5e-3 / (sae.num_latents / (2**14)) ** 0.5,
+                "lr": cfg.lr or 3e-3 / (sae.num_latents / (2**14)) ** 0.5,
             }
             for sae in self.saes.values()
         ]
