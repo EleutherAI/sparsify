@@ -76,8 +76,6 @@ class Trainer:
 
             # Natural sort to impose a consistent order
             cfg.hookpoints = natsorted(raw_hookpoints)
-            if cfg.layer_stride > 1:
-                cfg.hookpoints = cfg.hookpoints[:: cfg.layer_stride]
         else:
             # If no layers are specified, train on all of them
             if not cfg.layers:
@@ -122,7 +120,7 @@ class Trainer:
             {
                 "params": sae.parameters(),
                 # Auto-select LR using 1 / sqrt(d) scaling law from Fig 3 of the paper
-                "lr": cfg.lr or 3e-3 / (sae.num_latents / (2**14)) ** 0.5,
+                "lr": cfg.lr or 5e-3 / (sae.num_latents / (2**14)) ** 0.5,
             }
             for sae in self.saes.values()
         ]
@@ -136,7 +134,7 @@ class Trainer:
             name: torch.zeros(sae.num_latents, device=device, dtype=torch.long)
             for name, sae in self.saes.items()
         }
-        self.optimizer = ScheduleFreeWrapper(SignSGD(pgs))
+        self.optimizer = ScheduleFreeWrapper(SignSGD(pgs), momentum=0.95)
         self.optimizer.train()
 
         num_latents = list(self.saes.values())[0].num_latents
@@ -158,7 +156,7 @@ class Trainer:
         train_state["num_tokens_since_fired"] = {}
 
         for file in glob(f"{path}/rank_*_state.pt"):
-            rank_train_state = torch.load(file, map_location=device)
+            rank_train_state = torch.load(file, map_location=device, weights_only=True)
             train_state["num_tokens_since_fired"].update(
                 rank_train_state["num_tokens_since_fired"]
             )
@@ -171,10 +169,10 @@ class Trainer:
         print(
             f"\033[92mResuming training at step {self.global_step} from '{path}'\033[0m"
         )
-        opt_state = torch.load(
-            f"{path}/optimizer.pt", map_location=device, weights_only=True
-        )
-        self.optimizer.load_state_dict(opt_state)
+        torch.load(f"{path}/optimizer.pt", map_location=device, weights_only=True)
+        # self.optimizer.load_state_dict(opt_state)
+        for pg in self.optimizer.param_groups:
+            pg["lr"] *= 0.1
 
         for name, sae in self.saes.items():
             load_model(sae, f"{path}/{name}/sae.safetensors", device=str(device))
@@ -330,15 +328,6 @@ class Trainer:
                     else None
                 ),
             )
-            avg_fvu[name] += float(self.maybe_all_reduce(out.fvu.detach()) / denom)
-            if self.cfg.auxk_alpha > 0:
-                avg_auxk_loss[name] += float(
-                    self.maybe_all_reduce(out.auxk_loss.detach()) / denom
-                )
-            if self.cfg.sae.multi_topk:
-                avg_multi_topk_fvu[name] += float(
-                    self.maybe_all_reduce(out.multi_topk_fvu.detach()) / denom
-                )
 
             counts = fire_counts[name]
             counts += torch.bincount(
@@ -354,6 +343,17 @@ class Trainer:
                 # Replace the normal output with the SAE output
                 output = out.sae_out.reshape(out_shape).type_as(outputs)
                 return (output, *aux_out) if aux_out is not None else output
+
+            # Metrics that only make sense for local
+            avg_fvu[name] += float(self.maybe_all_reduce(out.fvu.detach()) / denom)
+            if self.cfg.auxk_alpha > 0:
+                avg_auxk_loss[name] += float(
+                    self.maybe_all_reduce(out.auxk_loss.detach()) / denom
+                )
+            if self.cfg.sae.multi_topk:
+                avg_multi_topk_fvu[name] += float(
+                    self.maybe_all_reduce(out.multi_topk_fvu.detach()) / denom
+                )
 
             # Do a "local" backward pass if we're not training end-to-end
             loss = (
@@ -425,10 +425,6 @@ class Trainer:
                 for name, sae in self.saes.items():
                     sae.cfg.k = k
 
-                k = self.get_current_k()
-                for name, sae in self.saes.items():
-                    sae.cfg.k = k
-
                 ###############
                 with torch.no_grad():
                     # Update the dead feature mask
@@ -457,7 +453,6 @@ class Trainer:
 
                         info.update(
                             {
-                                f"fvu/{name}": avg_fvu[name],
                                 f"dead_pct/{name}": mask.mean(
                                     dtype=torch.float32
                                 ).item(),
@@ -466,6 +461,9 @@ class Trainer:
                                 ).item(),
                             }
                         )
+                        if not self.cfg.end_to_end:
+                            info[f"fvu/{name}"] = avg_fvu[name]
+
                         fire_counts[name].zero_()
                         if self.cfg.auxk_alpha > 0:
                             info[f"auxk/{name}"] = avg_auxk_loss[name]
