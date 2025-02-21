@@ -22,7 +22,9 @@ def embedding_bag_k(
     for bag in range(0, bag_size):
         my_index = tl.load(indices_ptr + out_idx * bag_size + bag).to(tl.int64)
         my_scaling = tl.load(per_sample_weights + out_idx * bag_size + bag)
-        my_weight = tl.load(weight_ptr + tl.arange(0, dim_padded) + my_index * dim)
+        my_weight = tl.load(
+            weight_ptr + tl.arange(0, dim_padded) + my_index * dim, mask=dim_mask
+        )
         out_value = out_value + my_weight.to(tl.float32) * my_scaling
     tl.store(
         out_ptr + out_idx * dim + tl.arange(0, dim_padded), out_value, mask=dim_mask

@@ -157,17 +157,17 @@ def run():
 
     args = parse(RunConfig)
 
-    # Awkward hack to prevent other ranks from duplicating data preprocessing
-    if not ddp or rank == 0:
-        model, dataset = load_artifacts(args, rank)
-    if ddp:
-        dist.barrier()
-        if rank != 0:
-            model, dataset = load_artifacts(args, rank)
-        dataset = dataset.shard(dist.get_world_size(), rank)
-
     # Prevent ranks other than 0 from printing
     with nullcontext() if rank == 0 else redirect_stdout(None):
+        # Awkward hack to prevent other ranks from duplicating data preprocessing
+        if not ddp or rank == 0:
+            model, dataset = load_artifacts(args, rank)
+        if ddp:
+            dist.barrier()
+            if rank != 0:
+                model, dataset = load_artifacts(args, rank)
+            dataset = dataset.shard(dist.get_world_size(), rank)
+
         print(f"Training on '{args.dataset}' (split '{args.split}')")
         print(f"Storing model weights in {model.dtype}")
 

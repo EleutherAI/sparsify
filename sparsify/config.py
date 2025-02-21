@@ -45,7 +45,7 @@ TranscoderConfig = partial(SparseCoderConfig, transcode=True)
 class TrainConfig(Serializable):
     sae: SparseCoderConfig
 
-    batch_size: int = 8
+    batch_size: int = 32
     """Batch size measured in sequences."""
 
     end_to_end: bool = False
@@ -60,7 +60,9 @@ class TrainConfig(Serializable):
     lr: float | None = None
     """Base LR. If None, it is automatically chosen based on the number of latents."""
 
-    lr_warmup_steps: int = 1000
+    k_decay_steps: int = 0
+    """Number of steps over which to decay the number of active latents. Starts at
+    input width * 10 and decays to k. Experimental feature."""
 
     auxk_alpha: float = 0.0
     """Weight of the auxiliary loss term."""

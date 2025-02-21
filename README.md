@@ -49,7 +49,7 @@ To train SAEs from the command line, you can use the following command:
 ```bash
 python -m sparsify EleutherAI/pythia-160m <optional dataset>
 ```
-By default, we use the `EleutherAI/fineweb-edu-dedup-10b` dataset for training, but you can use any dataset HuggingFace Hub
+By default, we use the `EleutherAI/fineweb-edu-dedup-10b` dataset for training, but you can use any dataset from the HuggingFace Hub, or any local dataset in HuggingFace format (the string is passed to `load_dataset` from the `datasets` library).
 
 The CLI supports all of the config options provided by the `TrainConfig` class. You can see them by running `python -m sparsify --help`.
 
@@ -77,9 +77,7 @@ gpt = AutoModelForCausalLM.from_pretrained(
     torch_dtype=torch.bfloat16,
 )
 
-cfg = TrainConfig(
-    SaeConfig(gpt.config.hidden_size), batch_size=16
-)
+cfg = TrainConfig(SaeConfig(), batch_size=16)
 trainer = Trainer(cfg, tokenized, gpt)
 
 trainer.fit()
@@ -132,3 +130,13 @@ There are several features that we'd like to add in the near future:
 - [ ] Evaluate SAEs with KL divergence when grafted into the model
 
 If you'd like to help out with any of these, please feel free to open a PR! You can collaborate with us in the sparse-autoencoders channel of the EleutherAI Discord.
+
+## Experimental features
+
+Linear k decay schedule:
+
+```bash python -m sparsify gpt2 --hookpoints "h.*.attn" "h.*.mlp.act" --k_decay_steps 10_000```
+
+GroupMax activation function:
+
+```bash python -m sparsify gpt2 --hookpoints "h.*.attn" "h.*.mlp.act" --activation groupmax```

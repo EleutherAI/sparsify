@@ -245,7 +245,7 @@ class SparseCoder(nn.Module):
             sae_out += x.to(self.dtype) @ self.W_skip.mT
 
         # Compute the residual
-        e = sae_out - y
+        e = y - sae_out
 
         # Used as a denominator for putting everything on a reasonable scale
         total_variance = (y - y.mean(0)).pow(2).sum()

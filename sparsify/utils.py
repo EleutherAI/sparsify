@@ -96,7 +96,7 @@ except ImportError:
     decoder_impl = eager_decode
     print("Triton not installed, using eager implementation of SAE decoder.")
 else:
-    if os.environ.get("SAE_DISABLE_TRITON") == "1":
+    if os.environ.get("SPARSIFY_DISABLE_TRITON") == "1":
         print("Triton disabled, using eager implementation of SAE decoder.")
         decoder_impl = eager_decode
     else:

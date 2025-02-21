@@ -1,5 +1,5 @@
 from .config import SaeConfig, SparseCoderConfig, TrainConfig, TranscoderConfig
-from .sae import Sae, SparseCoder
+from .sparse_coder import Sae, SparseCoder
 from .trainer import SaeTrainer, Trainer
 
 __all__ = [

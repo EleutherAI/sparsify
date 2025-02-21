@@ -1,22 +1,24 @@
 from collections import defaultdict
 from dataclasses import asdict
 from fnmatch import fnmatchcase
-from typing import Sized
+from glob import glob
 
 import torch
 import torch.distributed as dist
 from datasets import Dataset as HfDataset
 from natsort import natsorted
 from safetensors.torch import load_model
+from schedulefree import ScheduleFreeWrapper
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-from transformers import PreTrainedModel, get_linear_schedule_with_warmup
+from transformers import PreTrainedModel
 
 from .config import TrainConfig
 from .data import MemmapDataset
-from .sae import SparseCoder
+from .sign_sgd import SignSGD
+from .sparse_coder import SparseCoder
 from .utils import get_layer_list, resolve_widths, set_submodule
 
 
@@ -80,19 +82,17 @@ class Trainer:
             # If no layers are specified, train on all of them
             if not cfg.layers:
                 N = model.config.num_hidden_layers
-                cfg.layers = list(range(0, N, cfg.layer_stride))
+                cfg.layers = list(range(0, N))
 
             # Now convert layers to hookpoints
             layers_name, _ = get_layer_list(model)
             cfg.hookpoints = [f"{layers_name}.{i}" for i in cfg.layers]
 
+        cfg.hookpoints = cfg.hookpoints[:: cfg.layer_stride]
+
         self.cfg = cfg
         self.dataset = dataset
         self.distribute_modules()
-
-        N = len(cfg.hookpoints)
-        assert isinstance(dataset, Sized)
-        num_examples = len(dataset)
 
         device = model.device
         input_widths = resolve_widths(model, cfg.hookpoints)
@@ -122,7 +122,7 @@ class Trainer:
             {
                 "params": sae.parameters(),
                 # Auto-select LR using 1 / sqrt(d) scaling law from Fig 3 of the paper
-                "lr": cfg.lr or 2e-4 / (sae.num_latents / (2**14)) ** 0.5,
+                "lr": cfg.lr or 3e-3 / (sae.num_latents / (2**14)) ** 0.5,
             }
             for sae in self.saes.values()
         ]
@@ -131,25 +131,21 @@ class Trainer:
         lrs = [f"{lr:.2e}" for lr in sorted(set(pg["lr"] for pg in pgs))]
         print(f"Learning rates: {lrs}" if len(lrs) > 1 else f"Learning rate: {lrs[0]}")
 
-        try:
-            from bitsandbytes.optim import Adam8bit as Adam
-
-            print("Using 8-bit Adam from bitsandbytes")
-        except ImportError:
-            from torch.optim import Adam
-
-            print("bitsandbytes 8-bit Adam not available, using torch.optim.Adam")
-            print("Run `pip install bitsandbytes` for less memory usage.")
-
         self.global_step = 0
         self.num_tokens_since_fired = {
             name: torch.zeros(sae.num_latents, device=device, dtype=torch.long)
             for name, sae in self.saes.items()
         }
-        self.optimizer = Adam(pgs)
-        self.lr_scheduler = get_linear_schedule_with_warmup(
-            self.optimizer, 0, num_examples // cfg.batch_size  # cfg.lr_warmup_steps
-        )
+        self.optimizer = ScheduleFreeWrapper(SignSGD(pgs))
+        self.optimizer.train()
+
+        num_latents = list(self.saes.values())[0].num_latents
+        self.initial_k = min(num_latents, round(list(input_widths.values())[0] * 10))
+        self.final_k = self.cfg.sae.k
+
+        num_latents = list(self.saes.values())[0].num_latents
+        self.initial_k = min(num_latents, round(list(input_widths.values())[0] * 10))
+        self.final_k = self.cfg.sae.k
 
     def load_state(self, path: str):
         """Load the trainer state from disk."""
@@ -159,22 +155,37 @@ class Trainer:
         train_state = torch.load(
             f"{path}/state.pt", map_location=device, weights_only=True
         )
+        train_state["num_tokens_since_fired"] = {}
+
+        for file in glob(f"{path}/rank_*_state.pt"):
+            rank_train_state = torch.load(file, map_location=device)
+            train_state["num_tokens_since_fired"].update(
+                rank_train_state["num_tokens_since_fired"]
+            )
+
         self.global_step = train_state["global_step"]
-        self.num_tokens_since_fired = train_state["num_tokens_since_fired"]
+        self.num_tokens_since_fired = {
+            k: train_state["num_tokens_since_fired"][k] for k in self.local_hookpoints()
+        }
 
         print(
             f"\033[92mResuming training at step {self.global_step} from '{path}'\033[0m"
         )
-
-        lr_state = torch.load(
-            f"{path}/lr_scheduler.pt", map_location=device, weights_only=True
+        opt_state = torch.load(
+            f"{path}/optimizer.pt", map_location=device, weights_only=True
         )
-        torch.load(f"{path}/optimizer.pt", map_location=device, weights_only=True)
-        # self.optimizer.load_state_dict(opt_state)
-        self.lr_scheduler.load_state_dict(lr_state)
+        self.optimizer.load_state_dict(opt_state)
 
         for name, sae in self.saes.items():
             load_model(sae, f"{path}/{name}/sae.safetensors", device=str(device))
+
+    def get_current_k(self) -> int:
+        """Get the current k value based on a linear decay schedule."""
+        if self.global_step >= self.cfg.k_decay_steps:
+            return self.final_k
+
+        progress = self.global_step / self.cfg.k_decay_steps
+        return round(self.initial_k * (1 - progress) + self.final_k * progress)
 
     def fit(self):
         # Use Tensor Cores even for fp32 matmuls
@@ -350,6 +361,10 @@ class Trainer:
             )
             loss.div(acc_steps).backward()
 
+        k = self.get_current_k()
+        for name, sae in self.saes.items():
+            sae.cfg.k = k
+
         for batch in dl:
             x = batch["input_ids"].to(device)
 
@@ -405,7 +420,14 @@ class Trainer:
 
                 self.optimizer.step()
                 self.optimizer.zero_grad()
-                self.lr_scheduler.step()
+
+                k = self.get_current_k()
+                for name, sae in self.saes.items():
+                    sae.cfg.k = k
+
+                k = self.get_current_k()
+                for name, sae in self.saes.items():
+                    sae.cfg.k = k
 
                 ###############
                 with torch.no_grad():
@@ -460,6 +482,8 @@ class Trainer:
                         info.update({k: v for out in outputs for k, v in out.items()})
 
                     if rank_zero:
+                        info["k"] = k
+
                         wandb.log(info, step=step)
 
                 if (step + 1) % self.cfg.save_every == 0:
@@ -557,6 +581,7 @@ class Trainer:
 
         path = self.cfg.run_name or "sae-ckpts"
         rank_zero = not dist.is_initialized() or dist.get_rank() == 0
+        self.optimizer.eval()
 
         if rank_zero or self.cfg.distribute_modules:
             print("Saving checkpoint")
@@ -566,22 +591,23 @@ class Trainer:
 
                 sae.save_to_disk(f"{path}/{name}")
 
-        if rank_zero:
-            torch.save(self.lr_scheduler.state_dict(), f"{path}/lr_scheduler.pt")
-            torch.save(self.optimizer.state_dict(), f"{path}/optimizer.pt")
+            rank = 0 if rank_zero else dist.get_rank()
             torch.save(
-                {
-                    "global_step": self.global_step,
-                    "num_tokens_since_fired": self.num_tokens_since_fired,
-                },
-                f"{path}/state.pt",
+                {"num_tokens_since_fired": self.num_tokens_since_fired},
+                f"{path}/rank_{rank}_state.pt",
             )
+
+        if rank_zero:
+            torch.save(self.optimizer.state_dict(), f"{path}/optimizer.pt")
+            torch.save({"global_step": self.global_step}, f"{path}/state.pt")
 
             self.cfg.save_json(f"{path}/config.json")
 
         # Barrier to ensure all ranks have saved before continuing
         if dist.is_initialized():
             dist.barrier()
+
+        self.optimizer.train()
 
 
 # Support old name for compatibility
