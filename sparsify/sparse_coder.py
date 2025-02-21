@@ -2,13 +2,15 @@ import json
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import NamedTuple
+from sympy import divisors
 
 import einops
 import torch
+from torch import Tensor, nn
+from torch.nn import functional as F
 from huggingface_hub import snapshot_download
 from natsort import natsorted
 from safetensors.torch import load_model, save_model
-from torch import Tensor, nn
 
 from .config import SparseCoderConfig
 from .utils import decoder_impl
@@ -78,6 +80,17 @@ class SparseCoder(nn.Module):
             if cfg.skip_connection
             else None
         )
+
+        self.divisors = divisors(self.num_latents)
+
+        def build_k_lookup(possible_k_values):
+            lookup = {}
+            for cfg_k in possible_k_values:
+                lookup[cfg_k] = min(self.divisors, key=lambda x: abs(x - cfg_k))
+            return lookup
+        
+        self.k_lookup = build_k_lookup(list(range(self.cfg.k, 10_000)))
+        
 
     @staticmethod
     def load_many(
@@ -195,20 +208,127 @@ class SparseCoder(nn.Module):
         out = self.encoder(sae_in)
         return nn.functional.relu(out)
 
+    def groupmax_simple(self, z: Tensor) -> EncoderOutput:
+        k = self.k_lookup[self.cfg.k]
+        print("rounding k from ", self.cfg.k, "to ", k, self.num_latents, self.num_latents % k)
+        # if self.num_latents % self.cfg.k != 0:
+            
+            # k = min(divisors(self.num_latents), key=lambda x: abs(x - self.cfg.k))
+        # else:
+            # k = self.cfg.k
+
+        values, indices = z.unflatten(-1, (k, -1)).max(dim=-1)
+
+        # torch.max gives us indices into each group, but we want indices into the
+        # flattened tensor. Add the offsets to get the correct indices.
+        offsets = torch.arange(
+            0, self.num_latents, self.num_latents // k, device=z.device
+        )
+        indices = offsets + indices
+        return EncoderOutput(values, indices)
+
+
+    # def groupmax(self, z: Tensor) -> EncoderOutput:
+    #     # If num latents is not a multiple of k we can view there as being either too many or too few latents.
+    #     # 1. If too few, we can pad the undersized groups.
+    #     # 2. If too many, we can select from a divisible subset of num_latents which means some latents don't get picked.
+
+    #     # This method is option 1.
+
+    #     padding = -self.num_latents % self.cfg.k
+
+    #     if padding == 0:
+    #         return EncoderOutput(*z.unflatten(-1, (self.cfg.k, -1)).max(dim=-1))
+
+    #     group_size = (self.num_latents + padding) // self.cfg.k
+    #     will_have_empty_groups = padding >= group_size
+
+    #     if will_have_empty_groups:
+    #         return self._groupmax_with_empty_groups(z, padding, group_size)
+    #     else:
+    #         return self._groupmax_simple_padding(z, padding)
+
+    # def _groupmax_simple_padding(self, z: Tensor, padding: int) -> EncoderOutput:
+    #     """Handle case where padding is small enough that all groups have real values"""
+    #     # Use all padding on left side for simplicity since no empty groups
+    #     z_padded = F.pad(z, (padding, 0), value=-1e9)
+    #     values, indices = z_padded.unflatten(-1, (self.cfg.k, -1)).max(dim=-1)
+        
+    #     # Simple offset calculation since all groups have same size
+    #     offsets = torch.arange(0, self.num_latents + padding, (self.num_latents + padding) // self.cfg.k, 
+    #                         device=z.device)
+    #     indices = indices + offsets - padding
+        
+    #     assert indices.max() < self.num_latents and indices.min() >= 0
+    #     return EncoderOutput(values, indices)
+
+    #     # We pad with -inf to produce a latent count that is a multiple of k. 
+    #     # For small k all groups will have some non-padding latents
+
+    #     # left_pad = int((padding * torch.rand(1, device=z.device)).item())
+    #     left_pad = padding
+    #     z = F.pad(z, (left_pad, padding - left_pad), value=-1e9)
+
+    #     values, indices = z.unflatten(-1, (self.cfg.k, -1)).max(dim=-1)
+
+        # For large k, some groups at the start and end will have no non-padding latents
+
+        # Convert relative indices within groups to global indices
+
+        # The first non-empty group will have an offset of 0, and the next will have an offset of 
+        # however many non-zero latents there were in the previous group
+
+        # empty_offsets = torch.zeros(self.cfg.k, device=z.device)
+
+        # # offsets = torch.arange(0, self.num_latents + padding, group_size, device=z.device)
+        # indices = indices + offsets - left_pad
+
+
+        # # Mask out empty groups
+        # group_size = (self.num_latents + padding) // self.cfg.k
+        # num_left_empty = left_pad // group_size
+        # num_right_empty = (padding - left_pad) // group_size
+
+        # if num_left_empty > 0:
+        #     indices = indices[..., num_left_empty:]
+        #     values = values[..., num_left_empty:]
+        # if num_right_empty > 0:
+        #     indices = indices[..., :-num_right_empty]
+        #     values = values[..., :-num_right_empty]
+
+        
+
+        # left pad in units of latents divided by group size in units of latents gives
+        
+
+        
+
+        # assert indices.max() < self.num_latents and indices.min() >= 0, "Indices are out of bounds"
+        # return EncoderOutput(values, indices)
+
+    # def groupmax_subset(self, z: Tensor) -> EncoderOutput:
+    #     # If num latents is not a multiple of k we can view there as being either too many or too few latents.
+    #     # 1. If too few, we can pad the undersized groups.
+    #     # 2. If too many, we can select from a divisible subset of num_latents which means some latents don't get picked.
+
+    #     # This method is option 2.
+
+    #     # We use randomness to select how many latents are removed from left vs right.
+    #     excess_latents = self.num_latents % self.cfg.k
+    #     if excess_latents > 0:
+    #         # uniform random sample from 0 to excess_latents
+    #         left_pad = int((excess_latents * torch.rand(1, device=z.device)).item())
+    #         z = z[:, left_pad:-(excess_latents - left_pad)]
+
+    #     # Now we can just do a normal groupmax
+    #     return EncoderOutput(*z.unflatten(-1, (self.cfg.k, -1)).max(dim=-1))
+
     def select_topk(self, z: Tensor) -> EncoderOutput:
         """Select the top-k latents."""
 
         # Use GroupMax activation to get the k "top" latents
         if self.cfg.activation == "groupmax":
-            values, indices = z.unflatten(-1, (self.cfg.k, -1)).max(dim=-1)
-
-            # torch.max gives us indices into each group, but we want indices into the
-            # flattened tensor. Add the offsets to get the correct indices.
-            offsets = torch.arange(
-                0, self.num_latents, self.num_latents // self.cfg.k, device=z.device
-            )
-            indices = offsets + indices
-            return EncoderOutput(values, indices)
+            return self.groupmax_simple(z)
 
         # Use TopK activation
         return EncoderOutput(*z.topk(self.cfg.k, sorted=False))
