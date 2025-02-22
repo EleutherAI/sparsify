@@ -11,7 +11,7 @@ class SparseCoderConfig(Serializable):
     Configuration for training a sparse coder on a language model.
     """
 
-    activation: Literal["groupmax", "topk"] = "topk"
+    activation: Literal["groupmax", "topk", "groupmax_decay"] = "groupmax_decay"
 
     expansion_factor: int = 32
     """Multiple of the input dimension to use as the SAE dimension."""
@@ -24,6 +24,9 @@ class SparseCoderConfig(Serializable):
 
     k: int = 32
     """Number of nonzero features."""
+
+    group_max_k: int = 32
+    """Number of groups to use for GroupMax activation."""
 
     multi_topk: bool = False
     """Use Multi-TopK loss."""
@@ -72,6 +75,10 @@ class TrainConfig(Serializable):
     k_decay_steps: int = 0
     """Number of steps over which to decay the number of active latents. Starts at
     input width * 10 and decays to k. Experimental feature."""
+
+    group_max_k_decay_steps: int = 0
+    """Number of steps over which to decay the number of groups for GroupMax activation. Starts at
+    input width * 10 and decays to group_max_k. Experimental feature."""
 
     auxk_alpha: float = 0.0
     """Weight of the auxiliary loss term."""

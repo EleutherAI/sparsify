@@ -3,6 +3,7 @@ from dataclasses import asdict
 from fnmatch import fnmatchcase
 from typing import Sized
 
+import math
 import torch
 import torch.distributed as dist
 from datasets import Dataset as HfDataset
@@ -165,7 +166,7 @@ class Trainer:
                 self.optimizer, cfg.lr_warmup_steps, num_examples // cfg.batch_size
             )
         else:
-            self.optimizer = ScheduleFreeWrapper(SignSGD(pgs))
+            self.optimizer = ScheduleFreeWrapper(SignSGD(pgs), momentum=0.95)
             self.optimizer.train()
             self.lr_scheduler = None
             
@@ -178,6 +179,7 @@ class Trainer:
         num_latents = list(self.saes.values())[0].num_latents
         self.initial_k = min(num_latents, round(list(input_widths.values())[0] * 10))
         self.final_k = self.cfg.sae.k
+        self.initial_group_max_k = self.cfg.sae.group_max_k
 
 
     def load_state(self, path: str):
@@ -229,6 +231,11 @@ class Trainer:
         progress = self.global_step / self.cfg.k_decay_steps
         return round(self.initial_k * (1 - progress) + self.final_k * progress)
     
+    def update_group_max_k(self) -> int:
+        progress_ratio = min(1.0, self.global_step / self.cfg.group_max_k_decay_steps)
+        updated_group_max_k = max(1, int(self.initial_group_max_k * (1 - progress_ratio) + 1 * progress_ratio))
+        return 2 ** int(math.floor(math.log(updated_group_max_k, 2)))
+
     def fit(self):
         # Use Tensor Cores even for fp32 matmuls
         torch.set_float32_matmul_precision("high")
@@ -317,6 +324,8 @@ class Trainer:
             for point in self.cfg.hookpoints:
                 set_submodule(self.model.base_model, point, nn.Identity())
 
+        input_dict: dict[str, Tensor] = {}
+        output_dict: dict[str, Tensor] = {}
         name_to_module = {
             name: self.model.base_model.get_submodule(name)
             for name in self.cfg.hookpoints
@@ -337,6 +346,10 @@ class Trainer:
             # Name may optionally contain a suffix of the form /seedN where N is an
             # integer. We only care about the part before the slash.
             name = module_to_name[module]
+            output_dict[name] = outputs.flatten(0, 1)
+
+            if self.cfg.sae.transcode:
+                input_dict[name] = inputs.flatten(0, 1)
 
             # Remember the original output shape since we'll need it for e2e training
             out_shape = outputs.shape
@@ -541,7 +554,7 @@ class Trainer:
                 k = self.get_current_k()
                 for name, sae in self.saes.items():
                     sae.cfg.k = k
-
+                    sae.cfg.group_max_k = self.update_group_max_k()
                 ###############
                 with torch.no_grad():
                     # Update the dead feature mask

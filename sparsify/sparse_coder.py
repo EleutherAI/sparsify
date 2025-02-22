@@ -215,7 +215,36 @@ class SparseCoder(nn.Module):
             )
             indices = offsets + indices
             return EncoderOutput(values, indices)
+        elif self.cfg.activation == "groupmax_decay":
+            k_per_group = max(1, self.cfg.k // self.cfg.group_max_k)
+            group_size = self.num_latents // self.cfg.group_max_k
+            grouped_z = z.unflatten(-1, (self.cfg.group_max_k, -1))
+            remainder = self.cfg.k % self.cfg.group_max_k
 
+            # Maximum number of elements any group may need.
+            max_select = k_per_group + (1 if remainder > 0 else 0)
+            
+            # Compute topk for all groups at once.
+            topk_vals, topk_indices = grouped_z.topk(max_select, dim=-1, sorted=False)
+            
+            # Add the per-group offsets (broadcasted across the last dimension).
+            offsets = (torch.arange(self.cfg.group_max_k, device=z.device) * group_size).view(1, self.cfg.group_max_k, 1)
+            topk_indices = topk_indices + offsets
+
+            # Create a mask to select only the required number of elements per group.
+            # For group i, we want k_per_group + 1 elements if i < remainder, otherwise k_per_group.
+            group_counts = k_per_group + (torch.arange(self.cfg.group_max_k, device=z.device) < remainder).long()
+            # Create the mask with shape [1, group_max_k, max_select]
+            mask = torch.arange(max_select, device=z.device).unsqueeze(0) < group_counts.unsqueeze(1)
+            mask = mask.unsqueeze(0)  # shape: (1, group_max_k, max_select)
+
+            # Expand the mask to match the batch dimension
+            mask = mask.expand(z.shape[0], -1, -1)  # now shape: (B, group_max_k, max_select)
+
+            final_values = topk_vals[mask].view(z.shape[0], -1)
+            final_indices = topk_indices[mask].view(z.shape[0], -1)
+
+            return EncoderOutput(final_values, final_indices)
         return EncoderOutput(*z.topk(self.cfg.k, sorted=False))
 
         # Use GroupMax activation to get the k "top" latents
