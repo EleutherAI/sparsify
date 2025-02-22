@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 from datasets import Dataset as HfDataset
 from natsort import natsorted
+from schedulefree import ScheduleFreeWrapper
 from safetensors.torch import load_model
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -18,6 +19,7 @@ from .config import TrainConfig
 from .data import MemmapDataset
 from .sae import Sae
 from .utils import get_layer_list, resolve_widths
+from .sign_sgd import SignSGD
 
 
 class SaeTrainer:
@@ -96,7 +98,7 @@ class SaeTrainer:
             {
                 "params": sae.parameters(),
                 # Auto-select LR using 1 / sqrt(d) scaling law from Fig 3 of the paper
-                "lr": cfg.lr or 2e-4 / (sae.num_latents / (2**14)) ** 0.5,
+                "lr": cfg.lr or (2e-4 if not cfg.sfssgd else 3e-3) / (sae.num_latents / (2**14)) ** 0.5,
             }
             for sae in self.saes.values()
         ]
@@ -119,10 +121,15 @@ class SaeTrainer:
             name: torch.zeros(sae.num_latents, device=device, dtype=torch.long)
             for name, sae in self.saes.items()
         }
-        self.optimizer = Adam(pgs)
-        self.lr_scheduler = get_linear_schedule_with_warmup(
-            self.optimizer, cfg.lr_warmup_steps, num_examples // cfg.batch_size
-        )
+        if cfg.sfssgd:
+            self.optimizer = ScheduleFreeWrapper(SignSGD(pgs), momentum=cfg.sf_momentum)
+            self.optimizer.train()
+            self.lr_scheduler = None
+        else:
+            self.optimizer = Adam(pgs)
+            self.lr_scheduler = get_linear_schedule_with_warmup(
+                self.optimizer, cfg.lr_warmup_steps, num_examples // cfg.batch_size
+            )
 
     def load_state(self, path: str):
         """Load the trainer state from disk."""
@@ -139,14 +146,15 @@ class SaeTrainer:
             f"\033[92mResuming training at step {self.global_step} from '{path}'\033[0m"
         )
 
-        lr_state = torch.load(
-            f"{path}/lr_scheduler.pt", map_location=device, weights_only=True
-        )
         opt_state = torch.load(
             f"{path}/optimizer.pt", map_location=device, weights_only=True
         )
         self.optimizer.load_state_dict(opt_state)
-        self.lr_scheduler.load_state_dict(lr_state)
+        if self.lr_scheduler is not None:
+            lr_state = torch.load(
+                f"{path}/lr_scheduler.pt", map_location=device, weights_only=True
+            )
+            self.lr_scheduler.load_state_dict(lr_state)
 
         for name, sae in self.saes.items():
             load_model(sae, f"{path}/{name}/sae.safetensors", device=str(device))
@@ -348,7 +356,8 @@ class SaeTrainer:
                     self.maybe_all_reduce(did_fire[name], "max")  # max is boolean "any"
 
                 # Clip gradient norm independently for each SAE
-                torch.nn.utils.clip_grad_norm_(raw.parameters(), 1.0)
+                if not self.cfg.sfssgd:
+                    torch.nn.utils.clip_grad_norm_(raw.parameters(), 1.0)
 
             # Check if we need to actually do a training step
             step, substep = divmod(self.global_step + 1, self.cfg.grad_acc_steps)
@@ -358,7 +367,8 @@ class SaeTrainer:
                         sae.remove_gradient_parallel_to_decoder_directions()
 
                 optimizer_step()
-                self.lr_scheduler.step()
+                if self.lr_scheduler is not None:
+                    self.lr_scheduler.step()
 
                 if self.cfg.sae.encoder_halut:
                     for sae in self.saes.values():
@@ -511,6 +521,8 @@ class SaeTrainer:
 
         path = self.cfg.run_name or "sae-ckpts"
         rank_zero = not dist.is_initialized() or dist.get_rank() == 0
+        if self.cfg.sfssgd:
+            self.optimizer.eval()
 
         if rank_zero or self.cfg.distribute_modules:
             print("Saving checkpoint")
@@ -521,7 +533,8 @@ class SaeTrainer:
                 sae.save_to_disk(f"{path}/{name}")
 
         if rank_zero:
-            torch.save(self.lr_scheduler.state_dict(), f"{path}/lr_scheduler.pt")
+            if self.lr_scheduler is not None:
+                torch.save(self.lr_scheduler.state_dict(), f"{path}/lr_scheduler.pt")
             torch.save(self.optimizer.state_dict(), f"{path}/optimizer.pt")
             torch.save(
                 {
@@ -536,3 +549,6 @@ class SaeTrainer:
         # Barrier to ensure all ranks have saved before continuing
         if dist.is_initialized():
             dist.barrier()
+        
+        if self.cfg.sfssgd:
+            self.optimizer.train()

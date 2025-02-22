@@ -72,6 +72,13 @@ class ActivationLoader(object):
         for m in model.modules():
             m._forward_hooks = OrderedDict()
         return cache
+
+def strip_high_cossim(x, threshold=0.8, remove_pct = 0.5):
+    x = x - x.mean(0)
+    x = x / x.norm(dim=-1, keepdim=True)
+    has_duplicate = ((x @ x.T - 2 * torch.eye(x.shape[0], device=x.device, dtype=x.dtype)) > threshold).any(dim=-1)
+    rand_mask = (torch.rand_like(has_duplicate, dtype=torch.float16) < remove_pct)
+    return ~(has_duplicate & rand_mask)
 # %%
 %load_ext autoreload
 %autoreload 2
@@ -89,13 +96,16 @@ loader = ActivationLoader(model, tokenizer, bs=bs, msl=msl)
 d_model = model.config.hidden_size
 add_error = False
 subtract_mean = True
-skip_connection = True
+skip_connection = False
 preprocessing_batches = 64
-transcode = True
+prune_every = 100
+prune_every = 0
+# prune_thresh = 0.7
+transcode = False
 itda_config = ITDAConfig(
     d_model=d_model,
     target_l0=32,
-    loss_threshold=0.3,
+    loss_threshold=0.2,
     add_error=add_error,
     subtract_mean=subtract_mean,
     skip_connection=skip_connection,
@@ -113,12 +123,14 @@ if subtract_mean:
     run_name += "-mean"
 if skip_connection:
     run_name += "-skip"
+if prune_every > 1:
+    run_name += f"-prune{prune_every}"
 run_name += f"-k{itda_config.target_l0}"
 run = wandb.init(project="itda", entity="eleutherai", name=run_name)
 run.config.update(itda_config)
 losses = []
 dictionary_sizes = []
-take_n = 10_000
+take_n = 20_000
 lim_dictionary_size = 50_000
 try:
     for batch_idx, batch in (
@@ -143,6 +155,16 @@ try:
         }, step=batch_idx)
         if itda.dictionary_size > lim_dictionary_size:
             break
+        
+        if prune_every and batch_idx % prune_every == prune_every - 1:
+            xs = itda.xs[:itda.dictionary_size]
+            mask = strip_high_cossim(xs, threshold=prune_thresh)
+            itda.xs.data = xs[mask]
+            itda.ys.data = itda.ys[:itda.dictionary_size][mask]
+            itda.dictionary_size = itda.xs.shape[0]
+            wandb.log({
+                "pruned_pct": 1 - mask.float().mean().item()
+            }, step=batch_idx)
 except KeyboardInterrupt:
     pass
 wandb.finish()

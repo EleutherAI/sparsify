@@ -113,6 +113,7 @@ class ITDA(nn.Module):
                 },
                 f,
             )
+        return path
     
     @staticmethod
     def load_from_disk(path, device: str | torch.device | None = "cpu"):
@@ -176,7 +177,7 @@ class ITDA(nn.Module):
             skip_y=skip_y if self.config.skip_connection else None
         )
        
-    @torch.inference_mode()
+    @torch.no_grad()
     def step(self, x, y):
         assert x.ndim == y.ndim == 2
         x, y = x.to(self.dtype), y.to(self.dtype)

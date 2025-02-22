@@ -92,6 +92,12 @@ class TrainConfig(Serializable):
     lr: float | None = None
     """Base LR. If None, it is automatically chosen based on the number of latents."""
 
+    sfssgd: bool = False
+    """Schedule-free SignSGD."""
+    
+    sf_momentum: float = 0.9
+    """Momentum for Schedule-Free optimizers."""
+
     lr_warmup_steps: int = 1000
 
     auxk_alpha: float = 0.0
