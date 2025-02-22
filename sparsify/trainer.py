@@ -55,7 +55,7 @@ def gini_coefficient(x: torch.Tensor) -> torch.Tensor:
     return gini
 
 
-class SaeTrainer:
+class Trainer:
     def __init__(
         self,
         cfg: TrainConfig,
@@ -124,7 +124,7 @@ class SaeTrainer:
 
         # Re-initialize the decoder for transcoder training. By default the Sae class
         # initializes the decoder with the transpose of the encoder.
-        if cfg.transcode:
+        if cfg.sae.transcode:
             for sae in self.saes.values():
                 assert sae.W_dec is not None
                 # nn.init.orthogonal_(sae.encoder.weight.data)

@@ -202,7 +202,6 @@ class SparseCoder(nn.Module):
         return nn.functional.relu(out)
 
     def select_topk(self, z: Tensor) -> EncoderOutput:
-    def select_topk(self, z: Tensor) -> EncoderOutput:
         """Select the top-k latents."""
 
         # Use GroupMax activation to get the k "top" latents

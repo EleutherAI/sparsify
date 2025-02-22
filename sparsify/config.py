@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from functools import partial
 from typing import Literal
 
 from simple_parsing import Serializable, list_field
