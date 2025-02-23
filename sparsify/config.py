@@ -22,6 +22,14 @@ class SaeConfig(Serializable):
     monet_config: MonetConfig = MonetConfig()
     """Configuration for the Monet architecture."""
     
+    encoder_monarch: bool = False
+    """Use Monarch matrix for the encoder."""
+    
+    monarch_inner_dim: int = 8
+    """Dimension of the Monarch group."""
+    monarch_mul: int = 32
+    """Dense expansion factor for the Monarch matmul."""
+    
     encoder_mpnet: bool = False
     """MPNet (matching pursuit) encoder."""
     
@@ -59,6 +67,10 @@ class SaeConfig(Serializable):
     
     kron_lora: float = 1.0
     """How much to reduce the dimensionality of the input to the Kronecker product."""
+    
+    @property
+    def encoder_weird(self):
+        return self.encoder_monarch or self.encoder_mpnet or self.encoder_halut or self.encoder_pkm or self.encoder_kron
     
     decoder_xformers: bool = True
     """Xformers implementation for the decoder."""

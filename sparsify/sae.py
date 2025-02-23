@@ -4,6 +4,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import NamedTuple
 import math
+from einops import rearrange
 
 import einops
 import torch
@@ -84,10 +85,7 @@ class PKMLinear(nn.Module):
             x = self.forward(x)
             return x.topk(k, dim=-1)
         orig_batch_size = x.shape[:-1]
-        x = x.view(-1, x.shape[-1])
-        # x1, x2 = torch.chunk(self._weight(x), 2, dim=-1)
-        xs = self._weight(x)
-        x1, x2 = xs[..., :self.pkm_base], xs[..., self.pkm_base:]
+        x1, x2 = torch.chunk(self._weight(x), 2, dim=-1)
         k1, k2 = k, k
         w1, i1 = x1.topk(k1, dim=1)
         w2, i2 = x2.topk(k2, dim=1)
@@ -160,6 +158,52 @@ class KroneckerLinear(nn.Module):
         return mat @ self.pre.weight
 
 
+class MonarchLinear(nn.Module):
+    def __init__(self,
+                 d_in: int, num_latents: int,
+                 group_dim: int, group_mul: int,
+                 device: str | torch.device,
+                 dtype: torch.dtype | None = None,
+                 ):
+        assert d_in % group_dim == 0
+        in_groups = d_in // group_dim
+        assert num_latents % group_dim == 0
+        out_groups = num_latents // group_dim
+        super().__init__()
+        self.d_in = d_in
+        self.num_latents = num_latents
+        self.group_dim = group_dim
+        self.in_groups = in_groups
+        self.group_mul = group_mul
+        self._pre = nn.Linear(d_in, d_in, device=device, dtype=dtype)
+        self._inner = nn.Parameter(torch.randn(group_mul, in_groups, group_dim, group_dim, dtype=dtype, device=device))
+        self._outer = nn.Parameter(torch.randn(out_groups, group_mul, in_groups, dtype=dtype, device=device))
+        self._bias = nn.Parameter(torch.zeros(num_latents, dtype=dtype, device=device))
+
+    @property
+    def weight(self):
+        weight = torch.einsum(
+            "mixy,omi->omyix",
+            self._inner, self._outer
+        )
+        weight = rearrange(
+            weight,
+            "o m y i x -> (o m y) (i x)"
+        )
+        return weight @ self._pre.weight
+    
+    @torch.compile
+    def forward(self, x):
+        x = self._pre(x)
+        x = x.unflatten(-1, (self.in_groups, self.group_dim))
+        x = torch.einsum("...ix,mixy->...miy", x, self._inner)
+        x = torch.einsum("...miy,omi->...oy", x, self._outer)
+        return x.flatten(-2)
+
+    @torch.compile(mode="max-autotune")
+    def topk(self, x, k: int):
+        return self.forward(x).topk(k, dim=-1)
+
 class Sae(nn.Module):
     def __init__(
         self,
@@ -206,6 +250,12 @@ class Sae(nn.Module):
                 in_group=cfg.kron_in_group, out_group=cfg.kron_out_group,
                 u=cfg.kron_u, lora_dim=cfg.kron_lora,
                 device=device, dtype=dtype)
+        elif cfg.encoder_monarch:
+            self.encoder = MonarchLinear(
+                d_in, self.num_latents,
+                group_dim=cfg.monarch_inner_dim, group_mul=cfg.monarch_mul,
+                device=device, dtype=dtype
+            )
         else:
             self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
             self.encoder.bias.data.zero_()
@@ -331,7 +381,7 @@ class Sae(nn.Module):
         """Encode the input and select the top-k latents."""
         if self.cfg.monet:
             return EncoderOutput(self.pre_acts(x), torch.arange(self.num_latents, device=x.device))
-        if self.cfg.encoder_pkm or self.cfg.encoder_kron:
+        if self.cfg.encoder_weird:
             return self.encoder.topk(x, self.cfg.k)
         return self.select_topk(self.pre_acts(x))
 
