@@ -61,13 +61,16 @@ class PKMLinear(nn.Module):
         else:
             self.pkm_base = int(math.ceil(math.sqrt(num_latents)))
         self.cfg = cfg
-        self._weight = nn.Linear(d_in, 2 * self.pkm_base, device=device, dtype=dtype)
+        self.num_heads = cfg.pkm_heads
+        self._weight = nn.Linear(d_in, cfg.pkm_heads * 2 * self.pkm_base, device=device, dtype=dtype)
         self._weight.weight.data *= cfg.pkm_init_scale / 4
         # Orthogonal matrices have the same FVU  as /4, but produce more dead latents
         # torch.nn.init.orthogonal_(self._weight.weight, gain=0.5 / math.sqrt(self.d_in))
         self._scale = nn.Parameter(torch.zeros(1, dtype=dtype, device=device))
         if cfg.pkm_bias:
             self.bias = nn.Parameter(torch.zeros(self.pkm_base**2, dtype=dtype, device=device))
+        if cfg.pkm_softmax:
+            self.scaling = nn.Parameter(torch.zeros(1, dtype=dtype, device=device))
 
     @torch.compile(mode="max-autotune")
     def forward(self, x):
@@ -85,35 +88,48 @@ class PKMLinear(nn.Module):
             x = self.forward(x)
             return x.topk(k, dim=-1)
         orig_batch_size = x.shape[:-1]
-        x1, x2 = torch.chunk(self._weight(x), 2, dim=-1)
-        k1, k2 = k, k
-        w1, i1 = x1.topk(k1, dim=1)
-        w2, i2 = x2.topk(k2, dim=1)
-        w = torch.nn.functional.relu(w1[:, :, None] + w2[:, None, :]).clone()
-        i = i1[:, :, None] * self.pkm_base + i2[:, None, :]
+        x1, x2 = torch.chunk(
+            self._weight(x).unflatten(
+                -1, (self.num_heads, self.pkm_base * 2)
+            ), 2, dim=-1)
+        k_head = k // self.num_heads
+        k1, k2 = k_head, k_head
+        w1, i1 = x1.topk(k1, dim=-1)
+        w2, i2 = x2.topk(k2, dim=-1)
+        w = torch.nn.functional.relu(w1[..., :, None] + w2[..., None, :]).clone()
+        i = i1[..., :, None] * self.pkm_base + i2[..., None, :]
         mask = i >= self.num_latents
         if self.cfg.pkm_bias:
             w = w + self.bias[i] * mask
         w[mask] = -1
-        w = w.view(-1, k1 * k2)
-        w, i = w.topk(k, dim=-1, sorted=False)
-        i1 = torch.gather(i1, 1, i // k2)
-        i2 = torch.gather(i2, 1, i % k2)
+        w = w.view(-1, self.num_heads, k1 * k2)
+        w, i = w.topk(k_head, dim=-1, sorted=True)
+        i1 = torch.gather(i1, -1, i // k2)
+        i2 = torch.gather(i2, -1, i % k2)
         i = i1 * self.pkm_base + i2
         w = w * (i < self.num_latents)
         i = i.clamp_max(self.num_latents - 1)
+        if self.cfg.pkm_softmax:
+            # w = torch.nn.functional.softmax(w, dim=-1)
+            w = torch.nn.functional.sigmoid(w)
+            w = w * torch.nn.functional.softplus(self.scaling)#[i])
+        else:
+            w, i = w[..., :k_head], i[..., :k_head]
+            w, i = w.contiguous(), i.contiguous()
         return w.view(*orig_batch_size, k), i.reshape(*orig_batch_size, k)
 
     @property
     def weight(self):
-        w1, w2 = torch.chunk(self._weight.weight, 2, dim=0)
+        w = self._weight.weight
+        w = w.reshape(self.num_heads, self.pkm_base * 2, self.d_in).transpose(0, 1)
+        w1, w2 = torch.chunk(w, 2, dim=0)
         pkm_trim = math.ceil(self.num_latents / self.pkm_base)
         w1 = w1[:pkm_trim]
-        w1 = w1[:, None, :]
-        w2 = w2[None, :, :]
-        w1 = w1.expand(-1, w2.shape[1], -1)
-        w2 = w2.expand(w1.shape[0], -1, -1)
-        return (w1 + w2).reshape(self.pkm_base * pkm_trim, self.d_in)[:self.num_latents] * torch.exp(self._scale)
+        w1 = w1[:, None, ...]
+        w2 = w2[None, :, ...]
+        w1 = w1.expand(-1, w2.shape[1], -1, -1)
+        w2 = w2.expand(w1.shape[0], -1, -1, -1)
+        return (w1 + w2).reshape(self.pkm_base * pkm_trim, self.num_heads, self.d_in)[:self.num_latents].sum(1)
 
 
 class KroneckerLinear(nn.Module):
@@ -260,7 +276,10 @@ class Sae(nn.Module):
             self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
             self.encoder.bias.data.zero_()
 
-        self.W_dec = nn.Parameter(self.encoder.weight.clone()) if decoder else None
+        if False:
+            self.W_dec = nn.Parameter(torch.randn(self.num_latents, d_in, device=device, dtype=dtype)) if decoder else None
+        else:
+            self.W_dec = nn.Parameter(self.encoder.weight.clone()) if decoder else None
         if decoder and self.cfg.normalize_decoder:
             self.set_decoder_norm_to_unit_norm()
 
@@ -422,6 +441,8 @@ class Sae(nn.Module):
                 pre_acts = self.pre_acts(x)
                 # Decode
                 top_acts, top_indices = self.select_topk(pre_acts)
+            # if self.cfg.encoder_pkm and self.cfg.pkm_softmax:
+                # top_acts = torch.einsum("...d,...kd,...k->...k", x, self.W_dec[top_indices], top_acts)
             sae_out = self.decode(top_acts, top_indices)
             
         if self.W_skip is not None:

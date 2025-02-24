@@ -37,7 +37,7 @@ class SaeConfig(Serializable):
     """Whether to use hashed lookup tables for the encoder weights."""
     
     # uv run python -m sparsify EleutherAI/pythia-160m togethercomputer/RedPajama-Data-1T-Sample --encoder_pkm=True --transcode=True --run_name pkm_saes/with_pkm_transcoder
-    # uv run python -m sparsify "HuggingFaceTB/SmolLM2-135M" "HuggingFaceFW/fineweb" --subset sample-10BT --transcode=True --skip_connection=True --layers 3 6 9
+    # uv run python -m sparsify "HuggingFaceTB/SmolLM2-135M" "HuggingFaceFW/fineweb" --subset sample-10BT --transcode=True --skip_connection=True --layers 9
     encoder_pkm: bool = False
     """Whether to use Product Key Memory for the encoder weights."""
 
@@ -46,6 +46,12 @@ class SaeConfig(Serializable):
 
     topk_separate: bool = True
     """Faster top-k for PKM by separating the top-k operation."""
+
+    pkm_softmax: bool = False
+    """Apply softmax to PKM outputs."""
+    
+    pkm_heads: int = 1
+    """Number of heads for PKM."""
 
     pkm_bias: bool = True
     """Non-decomposed bias for PKM."""
