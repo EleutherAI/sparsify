@@ -10,7 +10,7 @@ import torch.distributed as dist
 from datasets import Dataset as HfDataset
 from natsort import natsorted
 from safetensors.torch import load_model
-from schedulefree import ScheduleFreeWrapper
+from schedulefree import ScheduleFreeWrapper, AdamWScheduleFree
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
@@ -22,6 +22,7 @@ from .data import MemmapDataset
 from .sign_sgd import SignSGD
 from .sparse_coder import SparseCoder
 from .utils import get_layer_list, resolve_widths
+
 
 
 class Trainer:
@@ -119,9 +120,25 @@ class Trainer:
                 self.optimizer, cfg.lr_warmup_steps, num_examples // cfg.batch_size
             )
         else:
-            self.optimizer = ScheduleFreeWrapper(SignSGD(pgs), momentum=0.95)
-            self.optimizer.train()
+            from muon import Muon
+            from torch.optim import Adam
+            muon_params = [p for sae in self.saes.values() for p in sae.parameters() if p.ndim >= 2]
+            adam_params = [p for sae in self.saes.values() for p in sae.parameters() if p.ndim < 2]
+            self.optimizers = [
+                ScheduleFreeWrapper(Muon(muon_params, lr=1, momentum=0.), momentum=0.95),
+                AdamWScheduleFree(adam_params, lr=2e-4, warmup_steps=cfg.lr_warmup_steps)
+            ]
+
+            for optimizer in self.optimizers:
+                optimizer.train()
             self.lr_scheduler = None
+
+
+            # TODO comment out allocation buffer
+            params = [p for pg in pgs for p in pg["params"]] 
+            self.optimizer = ScheduleFreeWrapper(Muon(params, momentum=0., lr=pgs[0]["lr"], world_size=dist.get_world_size(), rank=dist.get_rank()), momentum=0.95)
+            # self.optimizer.train()
+            # self.lr_scheduler = None
             
         self.global_step = 0
         self.num_tokens_since_fired = {
@@ -169,9 +186,13 @@ class Trainer:
         opt_state = torch.load(
             f"{path}/optimizer.pt", map_location=device, weights_only=True
         )
-        self.optimizer.load_state_dict(opt_state)
+        for i, optimizer in enumerate(self.optimizers):
+            optimizer.load_state_dict(opt_state[f"optimizer_{i}"])
+        # self.optimizer.load_state_dict(opt_state)
         if self.cfg.optimizer == "signum":
-            self.optimizer.train()
+            for optimizer in self.optimizers:
+                optimizer.train()
+            # self.optimizer.train()
 
         for name, sae in self.saes.items():
             load_model(sae, f"{path}/{name}/sae.safetensors", device=str(device))
@@ -376,8 +397,11 @@ class Trainer:
                     for sae in self.saes.values():
                         sae.remove_gradient_parallel_to_decoder_directions()
 
-                self.optimizer.step()
-                self.optimizer.zero_grad()
+                for optimizer in self.optimizers:
+                    optimizer.step()
+                    optimizer.zero_grad()
+                # self.optimizer.step()
+                # self.optimizer.zero_grad()
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step()
 
@@ -556,9 +580,15 @@ class Trainer:
                 torch.save(self.lr_scheduler.state_dict(), f"{path}/lr_scheduler.pt")
             
             if self.cfg.optimizer == "signum":
-                self.optimizer.eval()
-                torch.save(self.optimizer.state_dict(), f"{path}/optimizer.pt")
-                self.optimizer.train()
+                # self.optimizer.eval()
+                for i, optimizer in enumerate(self.optimizers):
+                    optimizer.eval()
+                    torch.save(optimizer.state_dict(), f"{path}/optimizer_{i}.pt")
+
+                # torch.save(self.optimizer.state_dict(), f"{path}/optimizer.pt")
+                for optimizer in self.optimizers:
+                    optimizer.train()
+                # self.optimizer.train()
             else:
                 torch.save(self.optimizer.state_dict(), f"{path}/optimizer.pt")
             
