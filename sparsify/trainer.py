@@ -13,7 +13,7 @@ from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-from transformers import PreTrainedModel
+from transformers import PreTrainedModel, get_linear_schedule_with_warmup
 
 from .config import TrainConfig
 from .data import MemmapDataset
@@ -129,17 +129,58 @@ class Trainer:
         lrs = [f"{lr:.2e}" for lr in sorted(set(pg["lr"] for pg in pgs))]
         print(f"Learning rates: {lrs}" if len(lrs) > 1 else f"Learning rate: {lrs[0]}")
 
+        if cfg.optimizer == "adam":
+            try:
+                from bitsandbytes.optim import Adam8bit as Adam
+
+                print("Using 8-bit Adam from bitsandbytes")
+            except ImportError:
+                from torch.optim import Adam
+
+                print("bitsandbytes 8-bit Adam not available, using torch.optim.Adam")
+                print("Run `pip install bitsandbytes` for less memory usage.")
+
+            steps = len(dataset) // (cfg.batch_size * cfg.grad_acc_steps)
+
+            self.optimizer = Adam(pgs, betas=(0.0, 0.95))
+            self.lr_scheduler = get_linear_schedule_with_warmup(
+                self.optimizer, 40, steps
+            )
+        elif cfg.optimizer == "muon":
+            from torch.optim import Adam
+
+            from .muon import Muon
+
+            muon_params = [
+                p for sae in self.saes.values() for p in sae.parameters() if p.ndim >= 2
+            ]
+            adam_params = [
+                p for sae in self.saes.values() for p in sae.parameters() if p.ndim < 2
+            ]
+            self.optimizers = [
+                Muon(muon_params, lr=1.5e-3),
+                Adam(adam_params, lr=1.5e-3),
+            ]
+
+            # for optimizer in self.optimizers:
+            #     optimizer.train()
+            steps = len(dataset) // (cfg.batch_size * cfg.grad_acc_steps)
+            self.lr_schedulers = [
+                get_linear_schedule_with_warmup(self.optimizers[0], 0, steps),
+                get_linear_schedule_with_warmup(self.optimizers[1], 0, steps),
+            ]
+        else:
+            self.optimizer = ScheduleFreeWrapper(SignSGD(pgs), momentum=0.95)
+            self.optimizer.train()
+            self.lr_scheduler = None
+
         self.global_step = 0
         self.num_tokens_since_fired = {
             name: torch.zeros(sae.num_latents, device=device, dtype=torch.long)
             for name, sae in self.saes.items()
         }
-        self.optimizer = ScheduleFreeWrapper(SignSGD(pgs), momentum=0.95)
-        self.optimizer.train()
-
-        num_latents = list(self.saes.values())[0].num_latents
-        self.initial_k = min(num_latents, round(list(input_widths.values())[0] * 10))
-        self.final_k = self.cfg.sae.k
+        # self.optimizer = ScheduleFreeWrapper(SignSGD(pgs), momentum=0.95)
+        # self.optimizer.train()
 
         num_latents = list(self.saes.values())[0].num_latents
         self.initial_k = min(num_latents, round(list(input_widths.values())[0] * 10))
@@ -171,8 +212,8 @@ class Trainer:
         )
         torch.load(f"{path}/optimizer.pt", map_location=device, weights_only=True)
         # self.optimizer.load_state_dict(opt_state)
-        for pg in self.optimizer.param_groups:
-            pg["lr"] *= 0.1
+        # for pg in self.optimizer.param_groups:
+        #     pg["lr"] = 2e-6#0.005
 
         for name, sae in self.saes.items():
             load_model(sae, f"{path}/{name}/sae.safetensors", device=str(device))
@@ -418,8 +459,13 @@ class Trainer:
                     for sae in self.saes.values():
                         sae.remove_gradient_parallel_to_decoder_directions()
 
-                self.optimizer.step()
-                self.optimizer.zero_grad()
+                # self.optimizer.step()
+                # self.optimizer.zero_grad()
+                for optimizer in self.optimizers:
+                    optimizer.step()
+                    optimizer.zero_grad()
+                for lr_scheduler in self.lr_schedulers:
+                    lr_scheduler.step()
 
                 k = self.get_current_k()
                 for name, sae in self.saes.items():
@@ -456,9 +502,9 @@ class Trainer:
                                 f"dead_pct/{name}": mask.mean(
                                     dtype=torch.float32
                                 ).item(),
-                                f"gini/{name}": gini_coefficient(
-                                    fire_counts[name]
-                                ).item(),
+                                # f"gini/{name}": gini_coefficient(
+                                #     fire_counts[name]
+                                # ).item(),
                             }
                         )
                         if not self.cfg.end_to_end:
@@ -579,7 +625,10 @@ class Trainer:
 
         path = self.cfg.run_name or "sae-ckpts"
         rank_zero = not dist.is_initialized() or dist.get_rank() == 0
-        self.optimizer.eval()
+        for optimizer in self.optimizers:
+            optimizer.eval()
+        # if isinstance(self.optimizer, ScheduleFreeWrapper):
+        #     self.optimizer.eval()
 
         if rank_zero or self.cfg.distribute_modules:
             print("Saving checkpoint")
@@ -596,7 +645,13 @@ class Trainer:
             )
 
         if rank_zero:
-            torch.save(self.optimizer.state_dict(), f"{path}/optimizer.pt")
+            for i, optimizer in enumerate(self.optimizers):
+                # optimizer.eval()
+                torch.save(optimizer.state_dict(), f"{path}/optimizer_{i}.pt")
+                # optimizer.train()
+
+            # self.optimizer.train()
+            # torch.save(self.optimizer.state_dict(), f"{path}/optimizer.pt")
             torch.save({"global_step": self.global_step}, f"{path}/state.pt")
 
             self.cfg.save_json(f"{path}/config.json")
@@ -605,7 +660,10 @@ class Trainer:
         if dist.is_initialized():
             dist.barrier()
 
-        self.optimizer.train()
+        # for optimizer in self.optimizers:
+        #    optimizer.train()
+        # if isinstance(self.optimizer, ScheduleFreeWrapper):
+        #     self.optimizer.train()
 
 
 # Support old name for compatibility
