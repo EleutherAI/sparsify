@@ -142,10 +142,10 @@ class Trainer:
 
             steps = len(dataset) // (cfg.batch_size * cfg.grad_acc_steps)
 
-            self.optimizer = Adam(pgs, betas=(0.0, 0.95))
-            self.lr_scheduler = get_linear_schedule_with_warmup(
-                self.optimizer, 40, steps
-            )
+            self.optimizers = [Adam(pgs, betas=(0.0, 0.95))]
+            self.lr_schedulers = [
+                get_linear_schedule_with_warmup(self.optimizers[0], 40, steps)
+            ]
         elif cfg.optimizer == "muon":
             from torch.optim import Adam
 
@@ -170,9 +170,9 @@ class Trainer:
                 get_linear_schedule_with_warmup(self.optimizers[1], 0, steps),
             ]
         else:
-            self.optimizer = ScheduleFreeWrapper(SignSGD(pgs), momentum=0.95)
-            self.optimizer.train()
-            self.lr_scheduler = None
+            self.optimizers = [ScheduleFreeWrapper(SignSGD(pgs), momentum=0.95)]
+            self.optimizers[0].train()
+            self.lr_schedulers = []
 
         self.global_step = 0
         self.num_tokens_since_fired = {
@@ -212,8 +212,6 @@ class Trainer:
         )
         torch.load(f"{path}/optimizer.pt", map_location=device, weights_only=True)
         # self.optimizer.load_state_dict(opt_state)
-        # for pg in self.optimizer.param_groups:
-        #     pg["lr"] = 2e-6#0.005
 
         for name, sae in self.saes.items():
             load_model(sae, f"{path}/{name}/sae.safetensors", device=str(device))
@@ -625,18 +623,22 @@ class Trainer:
 
         path = self.cfg.run_name or "sae-ckpts"
         rank_zero = not dist.is_initialized() or dist.get_rank() == 0
-        for optimizer in self.optimizers:
-            optimizer.eval()
-        # if isinstance(self.optimizer, ScheduleFreeWrapper):
-        #     self.optimizer.eval()
 
         if rank_zero or self.cfg.distribute_modules:
             print("Saving checkpoint")
+
+            for optimizer in self.optimizers:
+                if isinstance(optimizer, ScheduleFreeWrapper):
+                    optimizer.eval()
 
             for name, sae in self.saes.items():
                 assert isinstance(sae, SparseCoder)
 
                 sae.save_to_disk(f"{path}/{name}")
+
+            for optimizer in self.optimizers:
+                if isinstance(optimizer, ScheduleFreeWrapper):
+                    optimizer.train()
 
             rank = 0 if rank_zero else dist.get_rank()
             torch.save(
@@ -646,12 +648,8 @@ class Trainer:
 
         if rank_zero:
             for i, optimizer in enumerate(self.optimizers):
-                # optimizer.eval()
                 torch.save(optimizer.state_dict(), f"{path}/optimizer_{i}.pt")
-                # optimizer.train()
 
-            # self.optimizer.train()
-            # torch.save(self.optimizer.state_dict(), f"{path}/optimizer.pt")
             torch.save({"global_step": self.global_step}, f"{path}/state.pt")
 
             self.cfg.save_json(f"{path}/config.json")
@@ -659,11 +657,6 @@ class Trainer:
         # Barrier to ensure all ranks have saved before continuing
         if dist.is_initialized():
             dist.barrier()
-
-        # for optimizer in self.optimizers:
-        #    optimizer.train()
-        # if isinstance(self.optimizer, ScheduleFreeWrapper):
-        #     self.optimizer.train()
 
 
 # Support old name for compatibility
