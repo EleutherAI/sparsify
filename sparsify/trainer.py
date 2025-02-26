@@ -158,8 +158,8 @@ class Trainer:
                 p for sae in self.saes.values() for p in sae.parameters() if p.ndim < 2
             ]
             self.optimizers = [
-                Muon(muon_params, lr=1.5e-3),
-                Adam(adam_params, lr=1.5e-3),
+                Muon(muon_params, lr=2e-3),
+                Adam(adam_params, lr=2e-3),
             ]
 
             # for optimizer in self.optimizers:
