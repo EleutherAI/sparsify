@@ -18,14 +18,17 @@ def embedding_bag_k(
 ):
     out_idx = tl.program_id(axis=0).to(tl.int64)
     out_value = tl.zeros([dim_padded], dtype=tl.float32)
-    dim_mask =  (tl.arange(0, dim_padded) < dim)
+    dim_mask = tl.arange(0, dim_padded) < dim
     for bag in range(0, bag_size):
         my_index = tl.load(indices_ptr + out_idx * bag_size + bag).to(tl.int64)
         my_scaling = tl.load(per_sample_weights + out_idx * bag_size + bag)
-        my_weight = tl.load(weight_ptr + tl.arange(0, dim_padded) + my_index * dim, mask=dim_mask)
+        my_weight = tl.load(
+            weight_ptr + tl.arange(0, dim_padded) + my_index * dim, mask=dim_mask
+        )
         out_value = out_value + my_weight.to(tl.float32) * my_scaling
-    tl.store(out_ptr + out_idx * dim + tl.arange(0, dim_padded), out_value,
-             mask=dim_mask)
+    tl.store(
+        out_ptr + out_idx * dim + tl.arange(0, dim_padded), out_value, mask=dim_mask
+    )
 
 
 def embedding_bag_triton(
@@ -115,18 +118,22 @@ def aggregate_gradient_for_embedding_k(
         for idx in range(begin, end):
             output_indice_id = tl.load(reverse_mapping_ptr + idx).to(tl.int64)
             batch_id = output_indice_id // bag_size
-            bag_id = output_indice_id % bag_size
+            output_indice_id % bag_size
             per_sample_w = tl.load(per_sample_weights_ptr + output_indice_id)
-            gradient = tl.load(gradient_ptr + batch_id * dim + tl.arange(0, dim_padded), mask=dim_mask).to(
-                tl.float32
-            )
+            gradient = tl.load(
+                gradient_ptr + batch_id * dim + tl.arange(0, dim_padded), mask=dim_mask
+            ).to(tl.float32)
             weight_grad = weight_grad + per_sample_w * gradient
             per_sample_weights_grad = gradient * weight
             per_sample_weights_grad = tl.sum(per_sample_weights_grad)
             tl.store(
                 per_sample_weights_grad_ptr + output_indice_id, per_sample_weights_grad
             )
-        tl.store(weight_grad_ptr + embedding_id * dim + tl.arange(0, dim_padded), weight_grad, mask=dim_mask)
+        tl.store(
+            weight_grad_ptr + embedding_id * dim + tl.arange(0, dim_padded),
+            weight_grad,
+            mask=dim_mask,
+        )
 
 
 def embedding_bag_bw_rev_indices(
