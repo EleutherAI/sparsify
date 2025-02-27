@@ -122,9 +122,11 @@ class Muon(torch.optim.Optimizer):
                 for p in params:
                     p.mul_(1 - group["lr"] * group["weight_decay"])
 
+            # These will be None / empty list if we're not using DDP
+            update_buffer: Tensor | None = group.get("update_buffer", None)
+            update_buffer_views: list[Tensor] = group.get("update_buffer_views", [])
+
             beta = group["momentum"]
-            update_buffer: Tensor = group["update_buffer"]
-            update_buffer_views: list[Tensor] = group["update_buffer_views"]
             handle = None
             params_world = None
 
@@ -157,7 +159,7 @@ class Muon(torch.optim.Optimizer):
                     if g.ndim == 4:  # for the case of conv filters
                         g = g.view(len(g), -1)
 
-                    g = quintic_newtonschulz(g, steps=group["ns_steps"]).flatten()
+                    g = quintic_newtonschulz(g, steps=group["ns_steps"])
                 else:
                     g = update_buffer_views[self.rank]
 
@@ -165,8 +167,9 @@ class Muon(torch.optim.Optimizer):
                     # async all_gather instead of sync all_reduce by @YouJiacheng
                     if base_i > 0:
                         update_prev()
+
                     handle = dist.all_gather_into_tensor(
-                        update_buffer, g, async_op=True
+                        update_buffer, g.flatten(), async_op=True
                     )
                     params_world = params[base_i : base_i + self.world_size]
                 else:
