@@ -48,14 +48,19 @@ class TrainConfig(Serializable):
     batch_size: int = 32
     """Batch size measured in sequences."""
 
-    end_to_end: bool = False
-    """Train all the sparse coders end-to-end."""
-
     grad_acc_steps: int = 1
     """Number of steps over which to accumulate gradients."""
 
     micro_acc_steps: int = 1
     """Chunk the activations into this number of microbatches for training."""
+
+    loss_fn: Literal["ce", "fvu", "kl"] = "fvu"
+    """Loss function to use for training the sparse coders.
+
+    - `ce`: Cross-entropy loss of the final model logits.
+    - `fvu`: Fraction of variance explained.
+    - `kl`: KL divergence of the final model logits w.r.t. the original logits.
+    """
 
     optimizer: Literal["adam", "muon", "signum"] = "signum"
     """Optimizer to use."""

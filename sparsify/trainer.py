@@ -328,9 +328,10 @@ class Trainer:
         avg_auxk_loss = defaultdict(float)
         avg_fvu = defaultdict(float)
         avg_multi_topk_fvu = defaultdict(float)
-        aux_loss = 0.0
+        avg_ce = 0.0
+        avg_kl = 0.0
 
-        if self.cfg.end_to_end:
+        if self.cfg.loss_fn == "ce":
             batch = next(iter(dl))
             x = batch["input_ids"].to(device)
 
@@ -353,7 +354,6 @@ class Trainer:
         module_to_name = {v: k for k, v in name_to_module.items()}
 
         def hook(module: nn.Module, inputs, outputs):
-            nonlocal aux_loss
             aux_out = None
 
             # Maybe unpack tuple inputs and outputs
@@ -411,7 +411,7 @@ class Trainer:
             did_fire[name][out.latent_indices.flatten()] = True
             self.maybe_all_reduce(did_fire[name], "max")  # max is boolean "any"
 
-            if self.cfg.end_to_end:
+            if self.cfg.loss_fn in ("ce", "kl"):
                 # Replace the normal output with the SAE output
                 output = out.sae_out.reshape(out_shape).type_as(outputs)
                 return (output, *aux_out) if aux_out is not None else output
@@ -449,7 +449,7 @@ class Trainer:
                         name: DDP(
                             sae,
                             device_ids=[dist.get_rank()],
-                            find_unused_parameters=self.cfg.end_to_end,
+                            find_unused_parameters=self.cfg.loss_fn in ("ce", "kl"),
                         )
                         for name, sae in self.saes.items()
                     }
@@ -461,21 +461,35 @@ class Trainer:
             N = x.numel()
             num_tokens_in_step += N
 
+            # Compute clean logits if using KL loss
+            clean_probs = (
+                self.model(x).logits.softmax(dim=-1)
+                if self.cfg.loss_fn == "kl"
+                else None
+            )
+
             # Forward pass on the model to get the next batch of activations
             handles = [
                 mod.register_forward_hook(hook) for mod in name_to_module.values()
             ]
             try:
-                # If we're training end-to-end, we need to pass the labels to the model
-                # and do a backward pass through the entire model.
-                if self.cfg.end_to_end:
-                    ce_loss = self.model(x, labels=x).loss
-                    ce_loss.div(acc_steps).backward()
-                else:
-                    ce_loss = None
-                    self.model(x)
+                match self.cfg.loss_fn:
+                    case "ce":
+                        ce = self.model(x, labels=x).loss
+                        ce.div(acc_steps).backward()
+
+                        avg_ce += float(self.maybe_all_reduce(ce.detach()) / denom)
+                    case "kl":
+                        dirty_lps = self.model(x).logits.log_softmax(dim=-1)
+                        kl = -torch.sum(clean_probs * dirty_lps, dim=-1).mean()
+                        kl.div(acc_steps).backward()
+
+                        avg_kl += float(self.maybe_all_reduce(kl.detach()) / denom)
+                    case "fvu":
+                        self.model(x)
+                    case other:
+                        raise ValueError(f"Unknown loss function '{other}'")
             finally:
-                aux_loss = 0.0
                 for handle in handles:
                     handle.remove()
 
@@ -518,8 +532,11 @@ class Trainer:
                     and (step + 1) % self.cfg.wandb_log_frequency == 0
                 ):
                     info = {}
-                    if ce_loss is not None:
-                        info["ce_loss"] = ce_loss.item()
+                    match self.cfg.loss_fn:
+                        case "ce":
+                            info["ce_loss"] = avg_ce
+                        case "kl":
+                            info["kl_loss"] = avg_kl
 
                     for name in self.saes:
                         mask = (
@@ -527,17 +544,9 @@ class Trainer:
                             > self.cfg.dead_feature_threshold
                         )
 
-                        info.update(
-                            {
-                                f"dead_pct/{name}": mask.mean(
-                                    dtype=torch.float32
-                                ).item(),
-                                # f"gini/{name}": gini_coefficient(
-                                #     fire_counts[name]
-                                # ).item(),
-                            }
-                        )
-                        if not self.cfg.end_to_end:
+                        ratio = mask.mean(dtype=torch.float32).item()
+                        info.update({f"dead_pct/{name}": ratio})
+                        if self.cfg.loss_fn == "fvu":
                             info[f"fvu/{name}"] = avg_fvu[name]
 
                         fire_counts[name].zero_()
@@ -549,6 +558,8 @@ class Trainer:
                     avg_auxk_loss.clear()
                     avg_fvu.clear()
                     avg_multi_topk_fvu.clear()
+                    avg_ce = 0.0
+                    avg_kl = 0.0
 
                     if self.cfg.distribute_modules:
                         outputs = [{} for _ in range(dist.get_world_size())]
