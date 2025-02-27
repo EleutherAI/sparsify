@@ -307,10 +307,11 @@ class Trainer:
             if rank_zero:
                 print(f"Initial CE loss: {clean_loss.item():.4f}")
 
-            # If doing end-to-end, then we don't actually want to run the modules that
-            # we're replacing
-            for point in self.cfg.hookpoints:
-                set_submodule(self.model.base_model, point, nn.Identity())
+            # If doing end-to-end transcoders, then we don't actually want to run the
+            # modules that we're replacing
+            if self.cfg.sae.transcode:
+                for point in self.cfg.hookpoints:
+                    set_submodule(self.model.base_model, point, nn.Identity())
 
         name_to_module = {
             name: self.model.base_model.get_submodule(name)
