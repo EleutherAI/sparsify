@@ -1,15 +1,14 @@
 from collections import defaultdict
 from dataclasses import asdict
 from fnmatch import fnmatchcase
-from typing import Sized
 from glob import glob
+from typing import Sized
 
 import torch
 import torch.distributed as dist
 from datasets import Dataset as HfDataset
 from natsort import natsorted
 from safetensors.torch import load_model
-from schedulefree import ScheduleFreeWrapper
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
@@ -18,6 +17,7 @@ from transformers import PreTrainedModel, get_linear_schedule_with_warmup
 
 from .config import TrainConfig
 from .data import MemmapDataset
+from .muon import Muon
 from .sign_sgd import SignSGD
 from .sparse_coder import SparseCoder
 from .utils import get_layer_list, resolve_widths
@@ -55,7 +55,7 @@ class Trainer:
 
         self.cfg = cfg
         self.dataset = dataset
-        self.distribute_modules()   
+        self.distribute_modules()
 
         device = model.device
         input_widths = resolve_widths(model, cfg.hookpoints)
@@ -82,46 +82,107 @@ class Trainer:
                 self.saes[name] = SparseCoder(
                     input_widths[hook], cfg.sae, device, dtype=torch.float32
                 )
-        base_lr = {
-            'signum': 5e-3,
-            'adam': 2e-4,
-        }[cfg.optimizer]
 
-        pgs = [
-            {
-                "params": sae.parameters(),
-                # Auto-select LR using 1 / sqrt(d) scaling law from Fig 3 of the paper
-                "lr": cfg.lr or base_lr / (sae.num_latents / (2**14)) ** 0.5,
-            }
-            for sae in self.saes.values()
-        ]
+        pgs = []
+        for sae in self.saes.values():
+            # Adam and Signum need a 1 / sqrt(d) scaling law
+            scale = (sae.num_latents / (2**14)) ** 0.5
+
+            match cfg.optimizer:
+                case "adam":
+                    lr = 2e-4 / scale
+                case "muon":  # Muon LR is independent of the number of latents
+                    lr = 1e-3
+                case "signum":
+                    lr = 5e-3 / scale
+                case other:
+                    raise ValueError(f"Unknown optimizer '{other}'")
+
+            # Override the learning rate if it's specified in the config
+            lr = cfg.lr or lr
+            pgs.append({"params": sae.parameters(), "lr": lr})
+
         # Dedup the learning rates we're using, sort them, round to 2 decimal places
         lrs = [f"{lr:.2e}" for lr in sorted(set(pg["lr"] for pg in pgs))]
         print(f"Learning rates: {lrs}" if len(lrs) > 1 else f"Learning rate: {lrs[0]}")
 
-        if cfg.optimizer == 'adam':
-            try:
-                from bitsandbytes.optim import Adam8bit as Adam
+        assert isinstance(dataset, Sized)
+        num_batches = len(dataset) // cfg.batch_size
 
-                print("Using 8-bit Adam from bitsandbytes")
-            except ImportError:
-                from torch.optim import Adam
+        match cfg.optimizer:
+            case "adam":
+                try:
+                    from bitsandbytes.optim import Adam8bit as Adam
 
-                print("bitsandbytes 8-bit Adam not available, using torch.optim.Adam")
-                print("Run `pip install bitsandbytes` for less memory usage.")
+                    print("Using 8-bit Adam from bitsandbytes")
+                except ImportError:
+                    from torch.optim import Adam
 
-            assert isinstance(dataset, Sized)
-            num_examples = len(dataset)
+                    print(
+                        "bitsandbytes 8-bit Adam not available, using torch.optim.Adam"
+                    )
+                    print("Run `pip install bitsandbytes` for less memory usage.")
 
-            self.optimizer = Adam(pgs)
-            self.lr_scheduler = get_linear_schedule_with_warmup(
-                self.optimizer, cfg.lr_warmup_steps, num_examples // cfg.batch_size
-            )
-        else:
-            self.optimizer = ScheduleFreeWrapper(SignSGD(pgs), momentum=0.95)
-            self.optimizer.train()
-            self.lr_scheduler = None
-            
+                adam = Adam(
+                    [
+                        dict(
+                            params=sae.parameters(),
+                            lr=cfg.lr or 2e-4 / (sae.num_latents / (2**14)) ** 0.5,
+                        )
+                        for sae in self.saes.values()
+                    ]
+                )
+                self.optimizers = [adam]
+                self.lr_schedulers = [
+                    get_linear_schedule_with_warmup(
+                        adam, cfg.lr_warmup_steps, num_batches
+                    )
+                ]
+            case "muon":  # Muon LR is independent of the number of latents
+                muon_params = [
+                    p
+                    for sae in self.saes.values()
+                    for p in sae.parameters()
+                    if p.ndim >= 2
+                ]
+                adam_params = [
+                    p
+                    for sae in self.saes.values()
+                    for p in sae.parameters()
+                    if p.ndim < 2
+                ]
+                self.optimizers = [
+                    Muon(muon_params, lr=2e-3),
+                    torch.optim.Adam(adam_params, lr=2e-3),
+                ]
+                self.lr_schedulers = [
+                    get_linear_schedule_with_warmup(
+                        self.optimizers[0], 0, num_batches // cfg.batch_size
+                    )
+                ]
+            case "signum":
+                from schedulefree import ScheduleFreeWrapper
+
+                opt = ScheduleFreeWrapper(
+                    SignSGD(
+                        [
+                            dict(
+                                params=sae.parameters(),
+                                lr=cfg.lr
+                                or 5e-3 / (sae.num_latents / (2**14)) ** 0.5,
+                            )
+                            for sae in self.saes.values()
+                        ]
+                    ),
+                    momentum=0.95,
+                )
+                opt.train()
+
+                self.optimizers = [opt]
+                self.lr_schedulers = []
+            case other:
+                raise ValueError(f"Unknown optimizer '{other}'")
+
         self.global_step = 0
         self.num_tokens_since_fired = {
             name: torch.zeros(sae.num_latents, device=device, dtype=torch.long)
@@ -131,8 +192,7 @@ class Trainer:
         num_latents = list(self.saes.values())[0].num_latents
         self.initial_k = min(num_latents, round(list(input_widths.values())[0] * 10))
         self.final_k = self.cfg.sae.k
-        self.best_loss = float('inf')
-
+        self.best_loss = float("inf")
 
     def load_state(self, path: str):
         """Load the trainer state from disk."""
@@ -159,18 +219,17 @@ class Trainer:
             f"\033[92mResuming training at step {self.global_step} from '{path}'\033[0m"
         )
 
-        if self.lr_scheduler is not None:
+        for i, scheduler in enumerate(self.lr_schedulers):
             lr_state = torch.load(
-                f"{path}/lr_scheduler.pt", map_location=device, weights_only=True
+                f"{path}/lr_scheduler_{i}.pt", map_location=device, weights_only=True
             )
-            self.lr_scheduler.load_state_dict(lr_state)
+            scheduler.load_state_dict(lr_state)
 
-        opt_state = torch.load(
-            f"{path}/optimizer.pt", map_location=device, weights_only=True
-        )
-        self.optimizer.load_state_dict(opt_state)
-        if self.cfg.optimizer == "signum":
-            self.optimizer.train()
+        for i, optimizer in enumerate(self.optimizers):
+            opt_state = torch.load(
+                f"{path}/optimizer_{i}.pt", map_location=device, weights_only=True
+            )
+            optimizer.load_state_dict(opt_state)
 
         for name, sae in self.saes.items():
             load_model(sae, f"{path}/{name}/sae.safetensors", device=str(device))
@@ -179,10 +238,10 @@ class Trainer:
         """Get the current k value based on a linear decay schedule."""
         if self.global_step >= self.cfg.k_decay_steps:
             return self.final_k
-        
+
         progress = self.global_step / self.cfg.k_decay_steps
         return round(self.initial_k * (1 - progress) + self.final_k * progress)
-    
+
     def fit(self):
         # Use Tensor Cores even for fp32 matmuls
         torch.set_float32_matmul_precision("high")
@@ -190,6 +249,7 @@ class Trainer:
         rank_zero = not dist.is_initialized() or dist.get_rank() == 0
         ddp = dist.is_initialized() and not self.cfg.distribute_modules
 
+        wandb = None
         if self.cfg.log_to_wandb and rank_zero:
             try:
                 import wandb
@@ -200,7 +260,7 @@ class Trainer:
                     config=asdict(self.cfg),
                     save_code=True,
                 )
-            except ImportError:
+            except (AttributeError, ImportError):
                 print("Weights & Biases not installed, skipping logging.")
                 self.cfg.log_to_wandb = False
 
@@ -239,6 +299,7 @@ class Trainer:
             name: torch.zeros(sae.num_latents, device=device, dtype=torch.bool)
             for name, sae in self.saes.items()
         }
+        loss = torch.inf
         num_tokens_in_step = 0
 
         # For logging purposes
@@ -375,10 +436,12 @@ class Trainer:
                     for sae in self.saes.values():
                         sae.remove_gradient_parallel_to_decoder_directions()
 
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-                if self.lr_scheduler is not None:
-                    self.lr_scheduler.step()
+                for optimizer in self.optimizers:
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                for scheduler in self.lr_schedulers:
+                    scheduler.step()
 
                 k = self.get_current_k()
                 for name, sae in self.saes.items():
@@ -433,12 +496,10 @@ class Trainer:
                     if rank_zero:
                         info["k"] = k
 
-                        wandb.log(info, step=step)
+                        if wandb is not None:
+                            wandb.log(info, step=step)
 
-                if (
-                    (step + 1) % self.cfg.save_every == 0
-                    and loss < self.best_loss
-                ):
+                if (step + 1) % self.cfg.save_every == 0 and loss < self.best_loss:
                     self.best_loss = loss
                     self.save()
 
@@ -538,6 +599,10 @@ class Trainer:
         path = self.cfg.run_name or "sae-ckpts"
         rank_zero = not dist.is_initialized() or dist.get_rank() == 0
 
+        for optimizer in self.optimizers:
+            if hasattr(optimizer, "eval"):
+                optimizer.eval()  # type: ignore
+
         if rank_zero or self.cfg.distribute_modules:
             print("Saving checkpoint")
 
@@ -547,19 +612,18 @@ class Trainer:
                 sae.save_to_disk(f"{path}/{name}")
 
             rank = 0 if rank_zero else dist.get_rank()
-            torch.save({"num_tokens_since_fired": self.num_tokens_since_fired}, f"{path}/rank_{rank}_state.pt")
+            torch.save(
+                {"num_tokens_since_fired": self.num_tokens_since_fired},
+                f"{path}/rank_{rank}_state.pt",
+            )
 
         if rank_zero:
-            if self.lr_scheduler is not None:
-                torch.save(self.lr_scheduler.state_dict(), f"{path}/lr_scheduler.pt")
-            
-            if self.cfg.optimizer == "signum":
-                self.optimizer.eval()
-                torch.save(self.optimizer.state_dict(), f"{path}/optimizer.pt")
-                self.optimizer.train()
-            else:
-                torch.save(self.optimizer.state_dict(), f"{path}/optimizer.pt")
-            
+            for i, scheduler in enumerate(self.lr_schedulers):
+                torch.save(scheduler.state_dict(), f"{path}/lr_scheduler_{i}.pt")
+
+            for i, optimizer in enumerate(self.optimizers):
+                torch.save(optimizer.state_dict(), f"{path}/optimizer_{i}.pt")
+
             torch.save({"global_step": self.global_step}, f"{path}/state.pt")
 
             self.cfg.save_json(f"{path}/config.json")
@@ -567,6 +631,7 @@ class Trainer:
         # Barrier to ensure all ranks have saved before continuing
         if dist.is_initialized():
             dist.barrier()
+
 
 # Support old name for compatibility
 SaeTrainer = Trainer

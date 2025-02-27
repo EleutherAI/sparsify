@@ -54,7 +54,7 @@ class TrainConfig(Serializable):
     micro_acc_steps: int = 1
     """Chunk the activations into this number of microbatches for training."""
 
-    optimizer: Literal["adam", "signum"] = "signum"
+    optimizer: Literal["adam", "muon", "signum"] = "signum"
     """Optimizer to use."""
 
     lr: float | None = None
