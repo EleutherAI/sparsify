@@ -83,29 +83,6 @@ class Trainer:
                     input_widths[hook], cfg.sae, device, dtype=torch.float32
                 )
 
-        pgs = []
-        for sae in self.saes.values():
-            # Adam and Signum need a 1 / sqrt(d) scaling law
-            scale = (sae.num_latents / (2**14)) ** 0.5
-
-            match cfg.optimizer:
-                case "adam":
-                    lr = 2e-4 / scale
-                case "muon":  # Muon LR is independent of the number of latents
-                    lr = 1e-3
-                case "signum":
-                    lr = 5e-3 / scale
-                case other:
-                    raise ValueError(f"Unknown optimizer '{other}'")
-
-            # Override the learning rate if it's specified in the config
-            lr = cfg.lr or lr
-            pgs.append({"params": sae.parameters(), "lr": lr})
-
-        # Dedup the learning rates we're using, sort them, round to 2 decimal places
-        lrs = [f"{lr:.2e}" for lr in sorted(set(pg["lr"] for pg in pgs))]
-        print(f"Learning rates: {lrs}" if len(lrs) > 1 else f"Learning rate: {lrs[0]}")
-
         assert isinstance(dataset, Sized)
         num_batches = len(dataset) // cfg.batch_size
 
@@ -123,37 +100,32 @@ class Trainer:
                     )
                     print("Run `pip install bitsandbytes` for less memory usage.")
 
-                adam = Adam(
-                    [
-                        dict(
-                            params=sae.parameters(),
-                            lr=cfg.lr or 2e-4 / (sae.num_latents / (2**14)) ** 0.5,
-                        )
-                        for sae in self.saes.values()
-                    ]
-                )
+                pgs = [
+                    dict(
+                        params=sae.parameters(),
+                        lr=cfg.lr or 2e-4 / (sae.num_latents / (2**14)) ** 0.5,
+                    )
+                    for sae in self.saes.values()
+                ]
+                # For logging purposes
+                lrs = [f"{lr:.2e}" for lr in sorted(set(pg["lr"] for pg in pgs))]
+
+                adam = Adam(pgs)
                 self.optimizers = [adam]
                 self.lr_schedulers = [
                     get_linear_schedule_with_warmup(
                         adam, cfg.lr_warmup_steps, num_batches
                     )
                 ]
-            case "muon":  # Muon LR is independent of the number of latents
-                muon_params = [
-                    p
-                    for sae in self.saes.values()
-                    for p in sae.parameters()
-                    if p.ndim >= 2
-                ]
-                adam_params = [
-                    p
-                    for sae in self.saes.values()
-                    for p in sae.parameters()
-                    if p.ndim < 2
-                ]
+            case "muon":
+                params = {p for sae in self.saes.values() for p in sae.parameters()}
+                muon_params = {p for p in params if p.ndim >= 2}
+                lrs = [f"{cfg.lr or 2e-3:.2e}"]
+
                 self.optimizers = [
-                    Muon(muon_params, lr=2e-3),
-                    torch.optim.Adam(adam_params, lr=2e-3),
+                    # Muon LR is independent of the number of latents
+                    Muon(muon_params, lr=cfg.lr or 2e-3),
+                    torch.optim.Adam(params - muon_params, lr=cfg.lr or 2e-3),
                 ]
                 self.lr_schedulers = [
                     get_linear_schedule_with_warmup(
@@ -163,19 +135,16 @@ class Trainer:
             case "signum":
                 from schedulefree import ScheduleFreeWrapper
 
-                opt = ScheduleFreeWrapper(
-                    SignSGD(
-                        [
-                            dict(
-                                params=sae.parameters(),
-                                lr=cfg.lr
-                                or 5e-3 / (sae.num_latents / (2**14)) ** 0.5,
-                            )
-                            for sae in self.saes.values()
-                        ]
-                    ),
-                    momentum=0.95,
-                )
+                pgs = [
+                    dict(
+                        params=sae.parameters(),
+                        lr=cfg.lr or 5e-3 / (sae.num_latents / (2**14)) ** 0.5,
+                    )
+                    for sae in self.saes.values()
+                ]
+                lrs = [f"{lr:.2e}" for lr in sorted(set(pg["lr"] for pg in pgs))]
+
+                opt = ScheduleFreeWrapper(SignSGD(pgs), momentum=0.95)
                 opt.train()
 
                 self.optimizers = [opt]
@@ -183,6 +152,7 @@ class Trainer:
             case other:
                 raise ValueError(f"Unknown optimizer '{other}'")
 
+        print(f"Learning rates: {lrs}" if len(lrs) > 1 else f"Learning rate: {lrs[0]}")
         self.global_step = 0
         self.num_tokens_since_fired = {
             name: torch.zeros(sae.num_latents, device=device, dtype=torch.long)
