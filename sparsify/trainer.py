@@ -123,8 +123,15 @@ class Trainer:
                 lrs = [f"{cfg.lr or 2e-3:.2e}"]
 
                 self.optimizers = [
-                    # Muon LR is independent of the number of latents
-                    Muon(muon_params, lr=cfg.lr or 2e-3),
+                    Muon(
+                        muon_params,
+                        # Muon LR is independent of the number of latents
+                        lr=cfg.lr or 2e-3,
+                        # Muon distributes the work of the Newton-Schulz iterations
+                        # across all ranks for DDP but this doesn't make sense when
+                        # we're distributing modules across ranks
+                        ddp=not cfg.distribute_modules,
+                    ),
                     torch.optim.Adam(params - muon_params, lr=cfg.lr or 2e-3),
                 ]
                 self.lr_schedulers = [
@@ -597,6 +604,10 @@ class Trainer:
             torch.save({"global_step": self.global_step}, f"{path}/state.pt")
 
             self.cfg.save_json(f"{path}/config.json")
+
+        for optimizer in self.optimizers:
+            if hasattr(optimizer, "train"):
+                optimizer.train()  # type: ignore
 
         # Barrier to ensure all ranks have saved before continuing
         if dist.is_initialized():

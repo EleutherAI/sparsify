@@ -139,14 +139,14 @@ class Muon(torch.optim.Optimizer):
                     scale = 0.2 * max(p_world.shape) ** 0.5
                     p_world.add_(g_world.view_as(p_world), alpha=-group["lr"] * scale)
 
-            for base_i in range(0, len(params), self.world_size):
-                p = params[base_i + self.rank]
-
+            for i in range(0, len(params), self.world_size):
                 # Compute Muon update
-                if base_i + self.rank < len(params):
+                if i + self.rank < len(params):
+                    p = params[i + self.rank]
+                    state = self.state[p]
+
                     g = p.grad
                     assert g is not None
-                    state = self.state[p]
 
                     # Apply momentum
                     if beta > 0.0:
@@ -165,16 +165,16 @@ class Muon(torch.optim.Optimizer):
 
                 if self.world_size > 1:
                     # async all_gather instead of sync all_reduce by @YouJiacheng
-                    if base_i > 0:
+                    if i > 0:
                         update_prev()
 
                     handle = dist.all_gather_into_tensor(
                         update_buffer, g.flatten(), async_op=True
                     )
-                    params_world = params[base_i : base_i + self.world_size]
+                    params_world = params[i : i + self.world_size]
                 else:
-                    scale = 0.2 * max(p.shape) ** 0.5
-                    p.add_(g, alpha=-group["lr"] * scale)
+                    scale = 0.2 * max(params[i].shape) ** 0.5
+                    params[i].add_(g, alpha=-group["lr"] * scale)
 
             if self.world_size > 1:
                 update_prev()
