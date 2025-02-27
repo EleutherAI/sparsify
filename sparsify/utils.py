@@ -94,10 +94,10 @@ try:
     from .xformers import xformers_embedding_bag
 except ImportError:
     decoder_impl = eager_decode
-    print("Triton not installed, using eager implementation of SAE decoder.")
+    print("Triton not installed, using eager implementation of sparse decoder.")
 else:
     if os.environ.get("SPARSIFY_DISABLE_TRITON") == "1":
-        print("Triton disabled, using eager implementation of SAE decoder.")
+        print("Triton disabled, using eager implementation of sparse decoder.")
         decoder_impl = eager_decode
     else:
         decoder_impl = triton_decode

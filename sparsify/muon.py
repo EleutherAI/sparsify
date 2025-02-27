@@ -114,12 +114,19 @@ class Muon(torch.optim.Optimizer):
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
-            beta = group["momentum"]
-
-            update_buffer: Tensor = group["update_buffer"]
-            update_buffer_views: list[Tensor] = group["update_buffer_views"]
-            # generate weight updates in distributed fashion
             params: list[Tensor] = group["params"]
+
+            # Apply decoupled weight decay to all parameters. This doesn't require any
+            # communication, since it's a simple element-wise operation.
+            if group["weight_decay"] > 0.0:
+                for p in params:
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+
+            # These will be None / empty list if we're not using DDP
+            update_buffer: Tensor | None = group.get("update_buffer", None)
+            update_buffer_views: list[Tensor] = group.get("update_buffer_views", [])
+
+            beta = group["momentum"]
             handle = None
             params_world = None
 
@@ -130,15 +137,16 @@ class Muon(torch.optim.Optimizer):
                 for p_world, g_world in zip(params_world, update_buffer_views):
                     # Heuristic from <https://arxiv.org/abs/2502.16982>
                     scale = 0.2 * max(p_world.shape) ** 0.5
-                    p_world.mul_(1 - group["lr"] * group["weight_decay"])
                     p_world.add_(g_world.view_as(p_world), alpha=-group["lr"] * scale)
 
-            for base_i in range(0, len(params), self.world_size):
-                if base_i + self.rank < len(params):
-                    p = params[base_i + self.rank]
+            for i in range(0, len(params), self.world_size):
+                # Compute Muon update
+                if i + self.rank < len(params):
+                    p = params[i + self.rank]
+                    state = self.state[p]
+
                     g = p.grad
                     assert g is not None
-                    state = self.state[p]
 
                     # Apply momentum
                     if beta > 0.0:
@@ -151,14 +159,22 @@ class Muon(torch.optim.Optimizer):
                     if g.ndim == 4:  # for the case of conv filters
                         g = g.view(len(g), -1)
 
-                    g = quintic_newtonschulz(g, steps=group["ns_steps"]).flatten()
+                    g = quintic_newtonschulz(g, steps=group["ns_steps"])
                 else:
                     g = update_buffer_views[self.rank]
 
-                # async all_gather instead of sync all_reduce by @YouJiacheng
-                if base_i > 0:
-                    update_prev()
-                handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
-                params_world = params[base_i : base_i + self.world_size]
+                if self.world_size > 1:
+                    # async all_gather instead of sync all_reduce by @YouJiacheng
+                    if i > 0:
+                        update_prev()
 
-            update_prev()
+                    handle = dist.all_gather_into_tensor(
+                        update_buffer, g.flatten(), async_op=True
+                    )
+                    params_world = params[i : i + self.world_size]
+                else:
+                    scale = 0.2 * max(params[i].shape) ** 0.5
+                    params[i].add_(g, alpha=-group["lr"] * scale)
+
+            if self.world_size > 1:
+                update_prev()
