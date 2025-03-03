@@ -24,39 +24,6 @@ from .sparse_coder import SparseCoder
 from .utils import get_layer_list, resolve_widths, set_submodule
 
 
-def gini_coefficient(x: torch.Tensor) -> torch.Tensor:
-    """
-    Compute the Gini coefficient for a 1D non-negative tensor.
-
-    Args:
-        x (torch.Tensor): A 1D tensor containing non-negative values.
-
-    Returns:
-        torch.Tensor: A scalar tensor containing the Gini coefficient.
-    """
-    assert torch.all(x >= 0)
-
-    # Ensure x is 1D
-    if x.dim() != 1:
-        raise ValueError("Input must be a 1D tensor.")
-
-    # Sort the tensor
-    x_sorted, _ = torch.sort(x)
-    n = x.numel()
-
-    # Handle the edge case of all zeros or empty tensor
-    total = x_sorted.sum()
-
-    # Create an index tensor [1, 2, ..., n]
-    indices = torch.arange(1, n + 1, dtype=x.dtype, device=x.device)
-
-    # Compute Gini using the formula:
-    # G = (2 * sum(i * x_i_sorted) / (n * sum(x_i))) - (n+1)/n
-    gini = (2.0 * (indices * x_sorted).sum() / (n * total)) - (n + 1.0) / n
-
-    return gini
-
-
 class Trainer:
     def __init__(
         self,
@@ -271,7 +238,7 @@ class Trainer:
 
                 wandb.init(
                     name=self.cfg.run_name,
-                    project="sae",
+                    project="sparsify",
                     config=asdict(self.cfg),
                     save_code=True,
                 )
@@ -312,10 +279,6 @@ class Trainer:
 
         did_fire = {
             name: torch.zeros(sae.num_latents, device=device, dtype=torch.bool)
-            for name, sae in self.saes.items()
-        }
-        fire_counts = {
-            name: torch.zeros(sae.num_latents, device=device, dtype=torch.long)
             for name, sae in self.saes.items()
         }
 
@@ -364,24 +327,44 @@ class Trainer:
 
             # Name may optionally contain a suffix of the form /seedN where N is an
             # integer. We only care about the part before the slash.
-            name = module_to_name[module]
+            name, _, _ = module_to_name[module].partition("/")
 
             # Remember the original output shape since we'll need it for e2e training
             out_shape = outputs.shape
 
+            # Scatter and gather the hidden states across ranks if necessary
+            if self.cfg.distribute_modules:
+                world_outputs = outputs.new_empty(
+                    outputs.shape[0] * dist.get_world_size(), *outputs.shape[1:]
+                )
+                dist.all_gather_into_tensor(world_outputs, outputs)
+                outputs = world_outputs
+
+                # Don't bother with the communication overhead if we're autoencoding
+                if self.cfg.sae.transcode:
+                    world_inputs = inputs.new_empty(
+                        inputs.shape[0] * dist.get_world_size(), *inputs.shape[1:]
+                    )
+                    dist.all_gather_into_tensor(world_inputs, inputs)
+                    inputs = world_inputs
+
+                if name not in self.module_plan[dist.get_rank()]:
+                    return
+
             # Flatten the batch and sequence dimensions
             outputs = outputs.flatten(0, 1)
             inputs = inputs.flatten(0, 1) if self.cfg.sae.transcode else outputs
-            raw = self.saes[name]
 
             # On the first iteration, initialize the encoder and decoder biases
+            raw = self.saes[name]
             if self.global_step == 0:
                 # Ensure the preactivations are centered at initialization
                 # This is mathematically equivalent to Anthropic's proposal of
                 # subtracting the decoder bias
-                mean = self.maybe_all_reduce(inputs.mean(0)).to(raw.dtype)
-                mean_image = -mean @ raw.encoder.weight.data.T
-                raw.encoder.bias.data = mean_image
+                if self.cfg.sae.transcode:
+                    mean = self.maybe_all_reduce(inputs.mean(0)).to(raw.dtype)
+                    mean_image = -mean @ raw.encoder.weight.data.T
+                    raw.encoder.bias.data = mean_image
 
                 mean = self.maybe_all_reduce(outputs.mean(0))
                 raw.b_dec.data = mean.to(raw.dtype)
@@ -400,12 +383,6 @@ class Trainer:
                     else None
                 ),
             )
-
-            counts = fire_counts[name]
-            counts += torch.bincount(
-                out.latent_indices.flatten(), minlength=len(counts)
-            )
-            self.maybe_all_reduce(counts, "sum")
 
             # Update the did_fire mask
             did_fire[name][out.latent_indices.flatten()] = True
@@ -446,11 +423,7 @@ class Trainer:
                 # gradients flowing to the bias after the first step.
                 maybe_wrapped = (
                     {
-                        name: DDP(
-                            sae,
-                            device_ids=[dist.get_rank()],
-                            find_unused_parameters=self.cfg.loss_fn in ("ce", "kl"),
-                        )
+                        name: DDP(sae, device_ids=[dist.get_rank()])
                         for name, sae in self.saes.items()
                     }
                     if ddp
@@ -484,7 +457,13 @@ class Trainer:
                         kl = -torch.sum(clean_probs * dirty_lps, dim=-1).mean()
                         kl.div(acc_steps).backward()
 
-                        avg_kl += float(self.maybe_all_reduce(kl.detach()) / denom)
+                        # Also compute the cross entropy loss for logging purposes
+                        with torch.inference_mode():
+                            ce = nn.functional.cross_entropy(
+                                dirty_lps[:, :-1].flatten(0, 1), x[:, 1:].flatten()
+                            )
+                            avg_ce += float(self.maybe_all_reduce(ce) / denom)
+                            avg_kl += float(self.maybe_all_reduce(kl) / denom)
                     case "fvu":
                         self.model(x)
                     case other:
@@ -492,10 +471,6 @@ class Trainer:
             finally:
                 for handle in handles:
                     handle.remove()
-
-            # if self.cfg.distribute_modules:
-            #    input_dict = self.scatter_hiddens(input_dict)
-            #    output_dict = self.scatter_hiddens(output_dict)
 
             # Check if we need to actually do a training step
             step, substep = divmod(self.global_step + 1, self.cfg.grad_acc_steps)
@@ -532,11 +507,9 @@ class Trainer:
                     and (step + 1) % self.cfg.wandb_log_frequency == 0
                 ):
                     info = {}
-                    match self.cfg.loss_fn:
-                        case "ce":
-                            info["ce_loss"] = avg_ce
-                        case "kl":
-                            info["kl_loss"] = avg_kl
+                    if self.cfg.loss_fn in ("ce", "kl"):
+                        info["ce_loss"] = avg_ce
+                        info["kl_loss"] = avg_kl
 
                     for name in self.saes:
                         mask = (
@@ -549,7 +522,6 @@ class Trainer:
                         if self.cfg.loss_fn == "fvu":
                             info[f"fvu/{name}"] = avg_fvu[name]
 
-                        fire_counts[name].zero_()
                         if self.cfg.auxk_alpha > 0:
                             info[f"auxk/{name}"] = avg_auxk_loss[name]
                         if self.cfg.sae.multi_topk:
@@ -634,37 +606,6 @@ class Trainer:
         ]
         for rank, modules in enumerate(self.module_plan):
             print(f"Rank {rank} modules: {modules}")
-
-    def scatter_hiddens(self, hidden_dict: dict[str, Tensor]) -> dict[str, Tensor]:
-        """Scatter & gather the hidden states across ranks."""
-        # Short-circuit if we have no data
-        if not hidden_dict:
-            return hidden_dict
-
-        outputs = [
-            # Add a new leading "layer" dimension to each tensor
-            torch.stack([hidden_dict[hook] for hook in hookpoints], dim=1)
-            for hookpoints in self.module_plan
-        ]
-        local_hooks = self.module_plan[dist.get_rank()]
-        shape = next(iter(hidden_dict.values())).shape
-
-        # Allocate one contiguous buffer to minimize memcpys
-        buffer = outputs[0].new_empty(
-            # The (micro)batch size times the world size
-            shape[0] * dist.get_world_size(),
-            # The number of layers we expect to receive
-            len(local_hooks),
-            # All other dimensions
-            *shape[1:],
-        )
-
-        # Perform the all-to-all scatter
-        inputs = buffer.split([len(output) for output in outputs])
-        dist.all_to_all([x for x in inputs], outputs)
-
-        # Return a list of results, one for each layer
-        return {hook: buffer[:, i] for i, hook in enumerate(local_hooks)}
 
     def save(self):
         """Save the SAEs to disk."""
