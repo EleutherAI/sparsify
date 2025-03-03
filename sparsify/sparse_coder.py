@@ -59,6 +59,10 @@ class SparseCoder(nn.Module):
         self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
         self.encoder.bias.data.zero_()
 
+        # JumpReLU initialization
+        if cfg.activation == "jumprelu":
+            self.threshold = nn.Parameter(torch.zeros(self.num_latents, device=device))
+
         if decoder:
             # Transcoder initialization: use zeros
             if cfg.transcode:
@@ -213,6 +217,14 @@ class SparseCoder(nn.Module):
         # Use TopK activation
         return EncoderOutput(*z.topk(self.cfg.k, sorted=False))
 
+    def jump_encode(self, acts: Tensor):
+        pre_acts = self.pre_acts(acts)
+        return pre_acts * (pre_acts > self.threshold)
+
+    def jump_decode(self, acts: Tensor) -> Tensor:
+        assert self.W_dec is not None, "Decoder weight was not initialized."        
+        return acts @ self.W_dec + self.b_dec
+
     def encode(self, x: Tensor) -> EncoderOutput:
         """Encode the input and select the top-k latents."""
         return self.select_topk(self.pre_acts(x))
@@ -230,17 +242,27 @@ class SparseCoder(nn.Module):
     def forward(
         self, x: Tensor, y: Tensor | None = None, *, dead_mask: Tensor | None = None
     ) -> ForwardOutput:
-        pre_acts = self.pre_acts(x)
-
         # If we aren't given a distinct target, we're autoencoding
         if y is None:
             y = x
 
-        # Decode
-        top_acts, top_indices = self.select_topk(pre_acts)
-        sae_out = self.decode(top_acts, top_indices)
-        if self.W_skip is not None:
-            sae_out += x.to(self.dtype) @ self.W_skip.mT
+        if self.cfg.activation == "jumprelu":
+            acts = self.jump_encode(x)
+            sae_out = self.jump_decode(acts)
+
+            # Select the >= latents for the AuxK loss (this shouldn't be used in practice)
+            top_indices = torch.where(acts > 0)[0].cpu()
+            top_acts = acts.cpu()[top_indices]
+            
+        else:
+            pre_acts = self.pre_acts(x)
+
+            # Decode
+            top_acts, top_indices = self.select_topk(pre_acts)
+            sae_out = self.decode(top_acts, top_indices)
+
+            if self.W_skip is not None:
+                sae_out += x.to(self.dtype) @ self.W_skip.mT
 
         # Compute the residual
         e = y - sae_out
@@ -284,8 +306,8 @@ class SparseCoder(nn.Module):
 
         return ForwardOutput(
             sae_out,
-            top_acts,
-            top_indices,
+            top_acts if self.cfg.activation != "jumprelu" else None,
+            top_indices if self.cfg.activation != "jumprelu" else None,
             fvu,
             auxk_loss,
             multi_topk_fvu,

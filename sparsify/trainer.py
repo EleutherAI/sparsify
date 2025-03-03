@@ -53,6 +53,12 @@ class Trainer:
 
         cfg.hookpoints = cfg.hookpoints[:: cfg.layer_stride]
 
+        if not cfg.hookpoints:
+            raise ValueError(
+                f"""No valid hookpoints specified, available hookpoints:"""
+                f"""\n {[item[0] for item in model.named_modules()]}"""
+            )
+
         self.cfg = cfg
         self.dataset = dataset
         self.distribute_modules()
