@@ -1,3 +1,5 @@
+# CUDA_VISIBLE_DEVICES=1 python -m sparsify EleutherAI/pythia-160m togethercomputer/RedPajama-Data-1T-Sample --layers 6 --e2e_mse_hookpoints gpt_neox.layers.6 gpt_neox.layers.7 gpt_neox.layers.8 gpt_neox.layers.9 gpt_neox.layers.10 gpt_neox.layers.11 --e2e_start 0 --e2e_mse_coeff 1e-9
+
 import os
 from contextlib import nullcontext, redirect_stdout
 from dataclasses import dataclass

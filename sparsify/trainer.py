@@ -423,7 +423,7 @@ class SaeTrainer:
                             logits_replaced, e2e_rep_dict = model_logit_fn(hookpoint, input_id_chunks[chunk_idx], out.sae_out, *checkpoint_arg)
                         e2e_rep_loss = torch.zeros((), device=device, dtype=torch.float32)
                         for hookpoint, e2e_rep in e2e_rep_dict.items():
-                            e2e_rep_loss += torch.nn.functional.mse_loss(e2e_rep, e2e_ref_chunks[hookpoint][chunk_idx], reduce="mean") / len(e2e_rep_dict)
+                            e2e_rep_loss += torch.nn.functional.mse_loss(e2e_rep, e2e_ref_chunks[hookpoint][chunk_idx], reduction="mean") / len(e2e_rep_dict)
                         kl_loss = nn.functional.kl_div(
                             nn.functional.log_softmax(logits_replaced, dim=-1),
                             logit_chunks[chunk_idx],
@@ -440,7 +440,7 @@ class SaeTrainer:
                             del e2e_rep
                         del kl_loss, e2e_rep_loss, logits_replaced, e2e_rep_dict
 
-                    loss.div(acc_steps).backward(retain_graph=True)
+                    loss.div(acc_steps).backward()
 
                     # Update the did_fire mask
                     did_fire[name][out.latent_indices.flatten()] = True

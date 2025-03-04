@@ -28,14 +28,13 @@ class SaeConfig(Serializable):
     skip_connection: bool = False
     """Include a linear skip connection."""
     
-    e2e_kl_coeff: float = 1e-5
-    # e2e_kl_coeff: float = 0.0
+    e2e_kl_coeff: float = 0.0
     """End-to-end KL loss weight. Turns off KL loss if set to 0."""
     
     e2e_mse_coeff: float = 1e-1
     """End-to-end MSE loss weight."""
     
-    e2e_start: int = 500  # float("inf")
+    e2e_start: int = 5000  # float("inf")
     """When to turn on the end-to-end loss."""
     
     @property
@@ -92,7 +91,8 @@ class TrainConfig(Serializable):
     distribute_modules: bool = False
     """Store a single copy of each SAE, instead of copying them across devices."""
 
-    save_every: int = 1000
+    # save_every: int = 5000
+    save_every: int = 1e9
     """Save SAEs every `save_every` steps."""
     
     use_causal_lm: bool = True
