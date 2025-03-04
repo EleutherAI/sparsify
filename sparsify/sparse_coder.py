@@ -11,7 +11,7 @@ from safetensors.torch import load_model, save_model
 from torch import Tensor, nn
 
 from .config import SparseCoderConfig
-from .utils import decoder_impl
+from .step import Step, JumpReLU
 
 
 class EncoderOutput(NamedTuple):
@@ -25,11 +25,10 @@ class EncoderOutput(NamedTuple):
 class ForwardOutput(NamedTuple):
     sae_out: Tensor
 
-    latent_acts: Tensor
-    """Activations of the top-k latents."""
+    did_fire: Tensor
 
-    latent_indices: Tensor
-    """Indices of the top-k features."""
+    l0: Tensor
+    """Number of latents fired."""
 
     fvu: Tensor
     """Fraction of variance unexplained."""
@@ -59,10 +58,6 @@ class SparseCoder(nn.Module):
         self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
         self.encoder.bias.data.zero_()
 
-        # JumpReLU initialization
-        if cfg.activation == "jumprelu":
-            self.threshold = nn.Parameter(torch.zeros(self.num_latents, device=device))
-
         if decoder:
             # Transcoder initialization: use zeros
             if cfg.transcode:
@@ -82,6 +77,13 @@ class SparseCoder(nn.Module):
             if cfg.skip_connection
             else None
         )
+
+        if self.cfg.activation == "jumprelu":
+            # 0.001 is the default threshold for JumpReLU 
+            # -3 because log(0.001) = -3, check if this is right
+            self.log_threshold = nn.Parameter(torch.full((self.num_latents,), -3., device=device))
+            self.jump_relu = JumpReLU.apply
+            self.step = Step.apply
 
     @staticmethod
     def load_many(
@@ -198,42 +200,10 @@ class SparseCoder(nn.Module):
 
         out = self.encoder(sae_in)
         return nn.functional.relu(out)
-
-    def select_topk(self, z: Tensor) -> EncoderOutput:
-        """Select the top-k latents."""
-
-        # Use GroupMax activation to get the k "top" latents
-        if self.cfg.activation == "groupmax":
-            values, indices = z.unflatten(-1, (self.cfg.k, -1)).max(dim=-1)
-
-            # torch.max gives us indices into each group, but we want indices into the
-            # flattened tensor. Add the offsets to get the correct indices.
-            offsets = torch.arange(
-                0, self.num_latents, self.num_latents // self.cfg.k, device=z.device
-            )
-            indices = offsets + indices
-            return EncoderOutput(values, indices)
-
-        # Use TopK activation
-        return EncoderOutput(*z.topk(self.cfg.k, sorted=False))
-
-    def jump_encode(self, acts: Tensor):
-        pre_acts = self.pre_acts(acts)
-        return pre_acts * (pre_acts > self.threshold)
-
+    
     def jump_decode(self, acts: Tensor) -> Tensor:
         assert self.W_dec is not None, "Decoder weight was not initialized."        
         return acts @ self.W_dec + self.b_dec
-
-    def encode(self, x: Tensor) -> EncoderOutput:
-        """Encode the input and select the top-k latents."""
-        return self.select_topk(self.pre_acts(x))
-
-    def decode(self, top_acts: Tensor, top_indices: Tensor) -> Tensor:
-        assert self.W_dec is not None, "Decoder weight was not initialized."
-
-        y = decoder_impl(top_indices, top_acts.to(self.dtype), self.W_dec.mT)
-        return y + self.b_dec
 
     # Wrapping the forward in bf16 autocast improves performance by almost 2x
     @torch.autocast(
@@ -246,23 +216,11 @@ class SparseCoder(nn.Module):
         if y is None:
             y = x
 
-        if self.cfg.activation == "jumprelu":
-            acts = self.jump_encode(x)
-            sae_out = self.jump_decode(acts)
+        pre_acts = self.pre_acts(x)
+        acts, did_fire = self.jump_relu(pre_acts, self.log_threshold.exp()) # type: ignore
+        l0 = self.step(pre_acts, self.log_threshold.exp()) # type: ignore
 
-            # Select the >= latents for the AuxK loss (this shouldn't be used in practice)
-            top_indices = torch.where(acts > 0)[0].cpu()
-            top_acts = acts.cpu()[top_indices]
-            
-        else:
-            pre_acts = self.pre_acts(x)
-
-            # Decode
-            top_acts, top_indices = self.select_topk(pre_acts)
-            sae_out = self.decode(top_acts, top_indices)
-
-            if self.W_skip is not None:
-                sae_out += x.to(self.dtype) @ self.W_skip.mT
+        sae_out = self.jump_decode(acts)
 
         # Compute the residual
         e = y - sae_out
@@ -271,46 +229,48 @@ class SparseCoder(nn.Module):
         total_variance = (y - y.mean(0)).pow(2).sum()
 
         # Second decoder pass for AuxK loss
-        if dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
-            # Heuristic from Appendix B.1 in the paper
-            k_aux = y.shape[-1] // 2
+        # if dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
+        #     # Heuristic from Appendix B.1 in the paper
+        #     k_aux = y.shape[-1] // 2
 
-            # Reduce the scale of the loss if there are a small number of dead latents
-            scale = min(num_dead / k_aux, 1.0)
-            k_aux = min(k_aux, num_dead)
+        #     # Reduce the scale of the loss if there are a small number of dead latents
+        #     scale = min(num_dead / k_aux, 1.0)
+        #     k_aux = min(k_aux, num_dead)
 
-            # Don't include living latents in this loss
-            auxk_latents = torch.where(dead_mask[None], pre_acts, -torch.inf)
+        #     # Don't include living latents in this loss
+        #     auxk_latents = torch.where(dead_mask[None], pre_acts, -torch.inf)
 
-            # Top-k dead latents
-            auxk_acts, auxk_indices = auxk_latents.topk(k_aux, sorted=False)
+        #     # Top-k dead latents
+        #     auxk_acts, auxk_indices = auxk_latents.topk(k_aux, sorted=False)
 
-            # Encourage the top ~50% of dead latents to predict the residual of the
-            # top k living latents
-            e_hat = self.decode(auxk_acts, auxk_indices)
-            auxk_loss = (e_hat - e).pow(2).sum()
-            auxk_loss = scale * auxk_loss / total_variance
-        else:
-            auxk_loss = sae_out.new_tensor(0.0)
+        #     # Encourage the top ~50% of dead latents to predict the residual of the
+        #     # top k living latents
+        #     e_hat = self.decode(auxk_acts, auxk_indices)
+        #     auxk_loss = (e_hat - e).pow(2).sum()
+        #     auxk_loss = scale * auxk_loss / total_variance
+        # else:
+        auxk_loss = sae_out.new_tensor(0.0)
 
         l2_loss = e.pow(2).sum()
         fvu = l2_loss / total_variance
 
-        if self.cfg.multi_topk:
-            top_acts, top_indices = pre_acts.topk(4 * self.cfg.k, sorted=False)
-            sae_out = self.decode(top_acts, top_indices)
+        # if self.cfg.multi_topk:
+        #     raise NotImplementedError("Not implemented")
+            # assert not self.cfg.activation == "jumprelu", "Multi-TopK is not supported for JumpReLU."
+            # top_acts, top_indices = pre_acts.topk(4 * self.cfg.k, sorted=False)
+            # sae_out = self.decode(top_acts, top_indices)
 
-            multi_topk_fvu = (sae_out - y).pow(2).sum() / total_variance
-        else:
-            multi_topk_fvu = sae_out.new_tensor(0.0)
+            # multi_topk_fvu = (sae_out - y).pow(2).sum() / total_variance
+        # else:
+        multi_topk_fvu = sae_out.new_tensor(0.0)
 
         return ForwardOutput(
             sae_out,
-            top_acts if self.cfg.activation != "jumprelu" else None,
-            top_indices if self.cfg.activation != "jumprelu" else None,
+            did_fire,
+            l0,
             fvu,
             auxk_loss,
-            multi_topk_fvu,
+            multi_topk_fvu
         )
 
     @torch.no_grad()

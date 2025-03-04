@@ -145,8 +145,10 @@ class Trainer:
                         self.optimizers[0], 0, num_batches // cfg.batch_size
                     ),
                     get_linear_schedule_with_warmup(
-                        self.optimizers[1], cfg.lr_warmup_steps, num_batches // cfg.batch_size
-                    )
+                        self.optimizers[1],
+                        cfg.lr_warmup_steps,
+                        num_batches // cfg.batch_size,
+                    ),
                 ]
             case "signum":
                 from schedulefree import ScheduleFreeWrapper
@@ -351,6 +353,13 @@ class Trainer:
                 outputs = output_dict[hookpoint]
                 inputs = input_dict.get(name, outputs)
 
+                if self.cfg.sae.activation == "jumprelu":
+                    # normalize activations to mean squared L2 norm of 1
+                    scaling_factor = torch.rsqrt(inputs.pow(2).sum(-1).mean(0))
+                    # TODO use correct scaling factor for outputs when transcoding
+                    inputs = inputs * scaling_factor
+                    outputs = outputs * scaling_factor
+
                 # On the first iteration, initialize the decoder bias
                 if self.global_step == 0:
                     mean = self.maybe_all_reduce(outputs.mean(0))
@@ -395,30 +404,26 @@ class Trainer:
                     avg_fvu[name] += float(
                         self.maybe_all_reduce(out.fvu.detach()) / denom
                     )
-                    if self.cfg.auxk_alpha > 0:
-                        avg_auxk_loss[name] += float(
-                            self.maybe_all_reduce(out.auxk_loss.detach()) / denom
-                        )
-                    if self.cfg.sae.multi_topk:
-                        avg_multi_topk_fvu[name] += float(
-                            self.maybe_all_reduce(out.multi_topk_fvu.detach()) / denom
-                        )
 
                     loss = (
-                        out.fvu
-                        + self.cfg.auxk_alpha * out.auxk_loss
-                        + out.multi_topk_fvu / 8
+                        out.fvu # rescaled MSE
+                        + 0.1 * out.l0
                     )
+
                     loss.div(acc_steps).backward()
 
                     # Update the did_fire mask
-                    did_fire[name][out.latent_indices.flatten()] = True
+                    did_fire[name][out.did_fire] = True
                     self.maybe_all_reduce(did_fire[name], "max")  # max is boolean "any"
 
             # Check if we need to actually do a training step
             step, substep = divmod(self.global_step + 1, self.cfg.grad_acc_steps)
             if substep == 0:
-                if self.cfg.sae.normalize_decoder and not self.cfg.sae.transcode:
+                if (
+                    self.cfg.sae.normalize_decoder
+                    and not self.cfg.sae.transcode
+                    and not self.cfg.sae.activation == "jumprelu"
+                ):
                     for sae in self.saes.values():
                         sae.remove_gradient_parallel_to_decoder_directions()
 
@@ -582,7 +587,7 @@ class Trainer:
     def save(self):
         """Save the SAEs to disk."""
 
-        path = f'checkpoints/{self.cfg.run_name}' or "checkpoints/unnamed"
+        path = f"checkpoints/{self.cfg.run_name}" or "checkpoints/unnamed"
         rank_zero = not dist.is_initialized() or dist.get_rank() == 0
 
         for optimizer in self.optimizers:
