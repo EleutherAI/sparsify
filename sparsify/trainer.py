@@ -415,6 +415,14 @@ class Trainer:
         for name, sae in self.saes.items():
             sae.cfg.k = k
 
+        @torch.compile(mode="reduce-overhead", fullgraph=True)
+        def kl_loss(clean_logits, dirty_lps):
+            return torch.sum(
+                torch.softmax(clean_logits, dim=-1)
+                * (torch.log_softmax(clean_logits, dim=-1) - dirty_lps),
+                dim=-1,
+            ).mean()
+
         for batch in dl:
             torch.compiler.cudagraph_mark_step_begin()
 
@@ -438,11 +446,10 @@ class Trainer:
             num_tokens_in_step += N
 
             # Compute clean logits if using KL loss
-            clean_probs = (
-                self.model(x).logits.softmax(dim=-1)
-                if self.cfg.loss_fn == "kl"
-                else None
-            )
+            with torch.inference_mode():
+                clean_logits = (
+                    self.model(x).logits if self.cfg.loss_fn == "kl" else None
+                )
 
             # Forward pass on the model to get the next batch of activations
             handles = [
@@ -456,9 +463,11 @@ class Trainer:
 
                         avg_ce += float(self.maybe_all_reduce(ce.detach()) / denom)
                     case "kl":
+                        assert clean_logits is not None
                         dirty_lps = self.model(x).logits.log_softmax(dim=-1)
-                        kl = -torch.sum(clean_probs * dirty_lps, dim=-1).mean()
+                        kl = kl_loss(clean_logits.clone().detach(), dirty_lps)
                         kl.div(acc_steps).backward()
+                        del clean_logits
 
                         # Also compute the cross entropy loss for logging purposes
                         with torch.inference_mode():

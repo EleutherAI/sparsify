@@ -56,10 +56,7 @@ class SparseCoder(nn.Module):
         self.d_in = d_in
         self.num_latents = cfg.num_latents or d_in * cfg.expansion_factor
 
-        if self.cfg.optimized_encoder_config is None:
-            self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
-            self.encoder.bias.data.zero_()
-        else:
+        if self.cfg.optimized_encoder_config.is_not_none:
             self.encoder = self.cfg.optimized_encoder_config.build_encoder(
                 d_in,
                 self.num_latents,
@@ -68,6 +65,9 @@ class SparseCoder(nn.Module):
                 pkm_config=self.cfg.pkm_config,
                 kron_config=self.cfg.kronecker_config,
             )
+        else:
+            self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
+            self.encoder.bias.data.zero_()
 
         if decoder:
             # Transcoder initialization: use zeros
@@ -228,7 +228,7 @@ class SparseCoder(nn.Module):
 
     def encode(self, x: Tensor) -> EncoderOutput:
         """Encode the input and select the top-k latents."""
-        if self.cfg.optimized_encoder_config is not None:
+        if self.cfg.optimized_encoder_config.is_not_none:
             sae_in = self.input_preprocess(x)
             return self.encoder.topk(sae_in, self.cfg.k)
         return self.select_topk(self.pre_acts(x))

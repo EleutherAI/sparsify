@@ -226,6 +226,10 @@ class OptimizedEncoderConfig(Enum):
         elif self is OptimizedEncoderConfig.Kronecker:
             return KroneckerLinear(d_in, num_latents, device, dtype, cfg=kron_config)
         elif self is OptimizedEncoderConfig.None_:
-            return None
+            raise ValueError("No encoder specified.")
         else:
             raise ValueError(f"Unknown encoder type {self}")
+
+    @property
+    def is_not_none(self):
+        return self is not OptimizedEncoderConfig.None_
