@@ -21,7 +21,7 @@ from .data import MemmapDataset
 from .muon import Muon
 from .sign_sgd import SignSGD
 from .sparse_coder import SparseCoder
-from .utils import get_layer_list, resolve_widths, set_submodule
+from .utils import KeywordIdentity, get_layer_list, resolve_widths, set_submodule
 
 
 class Trainer:
@@ -238,7 +238,7 @@ class Trainer:
 
                 wandb.init(
                     name=self.cfg.run_name,
-                    project="sparsify",
+                    project=self.cfg.wandb_project,
                     config=asdict(self.cfg),
                     save_code=True,
                 )
@@ -307,7 +307,7 @@ class Trainer:
             # modules that we're replacing
             if self.cfg.sae.transcode:
                 for point in self.cfg.hookpoints:
-                    set_submodule(self.model.base_model, point, nn.Identity())
+                    set_submodule(self.model.base_model, point, KeywordIdentity())
 
         name_to_module = {
             name: self.model.base_model.get_submodule(name)
@@ -324,6 +324,7 @@ class Trainer:
                 inputs = inputs[0]
             if isinstance(outputs, tuple):
                 outputs, *aux_out = outputs
+            assert inputs.ndim == outputs.ndim == 3, "Expected 3D inputs and outputs"
 
             # Name may optionally contain a suffix of the form /seedN where N is an
             # integer. We only care about the part before the slash.
@@ -415,6 +416,8 @@ class Trainer:
             sae.cfg.k = k
 
         for batch in dl:
+            torch.compiler.cudagraph_mark_step_begin()
+
             x = batch["input_ids"].to(device)
 
             if not maybe_wrapped:

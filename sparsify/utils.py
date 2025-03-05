@@ -9,6 +9,11 @@ from transformers import PreTrainedModel
 T = TypeVar("T")
 
 
+class KeywordIdentity(nn.Identity):
+    def forward(self, x, *args, **kwargs):
+        return (super().forward(x),)
+
+
 def assert_type(typ: Type[T], obj: Any) -> T:
     """Assert that an object is of a given type at runtime and return it."""
     if not isinstance(obj, typ):
@@ -22,7 +27,7 @@ def get_layer_list(model: PreTrainedModel) -> tuple[str, nn.ModuleList]:
     N = assert_type(int, model.config.num_hidden_layers)
     candidates = [
         (name, mod)
-        for (name, mod) in model.named_modules()
+        for (name, mod) in model.base_model.named_modules()
         if isinstance(mod, nn.ModuleList) and len(mod) == N
     ]
     assert len(candidates) == 1, "Could not find the list of layers."

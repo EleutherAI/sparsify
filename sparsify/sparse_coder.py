@@ -56,8 +56,18 @@ class SparseCoder(nn.Module):
         self.d_in = d_in
         self.num_latents = cfg.num_latents or d_in * cfg.expansion_factor
 
-        self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
-        self.encoder.bias.data.zero_()
+        if self.cfg.optimized_encoder_config is None:
+            self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
+            self.encoder.bias.data.zero_()
+        else:
+            self.encoder = self.cfg.optimized_encoder_config.build_encoder(
+                d_in,
+                self.num_latents,
+                device,
+                dtype,
+                pkm_config=self.cfg.pkm_config,
+                kron_config=self.cfg.kronecker_config,
+            )
 
         if decoder:
             # Transcoder initialization: use zeros
@@ -183,7 +193,7 @@ class SparseCoder(nn.Module):
     def dtype(self):
         return self.encoder.weight.dtype
 
-    def pre_acts(self, x: Tensor) -> Tensor:
+    def input_preprocess(self, x: Tensor) -> Tensor:
         sae_in = x.to(self.dtype)
 
         # Remove decoder bias as per Anthropic if we're autoencoding. This doesn't
@@ -191,7 +201,10 @@ class SparseCoder(nn.Module):
         # different.
         if not self.cfg.transcode:
             sae_in -= self.b_dec
+        return sae_in
 
+    def pre_acts(self, x: Tensor) -> Tensor:
+        sae_in = self.input_preprocess(x)
         out = self.encoder(sae_in)
         return nn.functional.relu(out)
 
@@ -215,6 +228,9 @@ class SparseCoder(nn.Module):
 
     def encode(self, x: Tensor) -> EncoderOutput:
         """Encode the input and select the top-k latents."""
+        if self.cfg.optimized_encoder_config is not None:
+            sae_in = self.input_preprocess(x)
+            return self.encoder.topk(sae_in, self.cfg.k)
         return self.select_topk(self.pre_acts(x))
 
     def decode(self, top_acts: Tensor, top_indices: Tensor) -> Tensor:
@@ -232,14 +248,19 @@ class SparseCoder(nn.Module):
     def forward(
         self, x: Tensor, y: Tensor | None = None, *, dead_mask: Tensor | None = None
     ) -> ForwardOutput:
-        pre_acts = self.pre_acts(x)
+        activate_auxk = dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0
+
+        if activate_auxk or self.cfg.multi_topk:
+            pre_acts = self.pre_acts(x)
+            top_acts, top_indices = self.select_topk(pre_acts)
+        else:
+            top_acts, top_indices = self.encode(x)
 
         # If we aren't given a distinct target, we're autoencoding
         if y is None:
             y = x
 
         # Decode
-        top_acts, top_indices = self.select_topk(pre_acts)
         sae_out = self.decode(top_acts, top_indices)
         if self.W_skip is not None:
             sae_out += x.to(self.dtype) @ self.W_skip.mT
@@ -251,7 +272,7 @@ class SparseCoder(nn.Module):
         total_variance = (y - y.mean(0)).pow(2).sum()
 
         # Second decoder pass for AuxK loss
-        if dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
+        if activate_auxk:
             # Heuristic from Appendix B.1 in the paper
             k_aux = y.shape[-1] // 2
 
