@@ -4,10 +4,11 @@ from enum import Enum
 
 import torch
 import torch.nn as nn
+from simple_parsing import Serializable
 
 
 @dataclass
-class PKMConfig:
+class PKMConfig(Serializable):
     pad: bool = False
     """Pad the PKM encoder to a power of 2."""
 
@@ -22,6 +23,18 @@ class PKMConfig:
 
     init_scale: float = 1.0
     """Scale factor for PKM encoder initialization."""
+
+
+@dataclass
+class KroneckerConfig(Serializable):
+    in_group: int = 2
+    """Kronecker factorization input group size."""
+    out_group: int = 4
+    """Kronecker factorization output group size."""
+    u: int = 4
+    """Number of matrices to mix for the Kronecker product."""
+    lora_dim: float = 1.0
+    """How much to reduce the dimensionality of the input to the Kronecker product."""
 
 
 class PKMLinear(nn.Module):
@@ -81,6 +94,13 @@ class PKMLinear(nn.Module):
 
     @torch.compile(mode="max-autotune")
     def topk(self, x, k: int):
+        if self.bias.shape != (self.num_heads * self.pkm_base**2,):
+            self.bias.data = torch.nn.functional.pad(
+                self.bias,
+                (0, self.num_heads * self.pkm_base**2 - self.bias.shape[0]),
+                mode="constant",
+                value=0,
+            )
         orig_batch_size = x.shape[:-1]
         x1, x2 = torch.chunk(
             self._weight(x).unflatten(-1, (self.num_heads, self.pkm_base * 2)),
@@ -142,18 +162,6 @@ class PKMLinear(nn.Module):
             ]
             .sum(1)
         )
-
-
-@dataclass
-class KroneckerConfig:
-    in_group: int = 2
-    """Kronecker factorization input group size."""
-    out_group: int = 4
-    """Kronecker factorization output group size."""
-    u: int = 4
-    """Number of matrices to mix for the Kronecker product."""
-    lora_dim: float = 1.0
-    """How much to reduce the dimensionality of the input to the Kronecker product."""
 
 
 class KroneckerLinear(nn.Module):

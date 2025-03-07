@@ -65,6 +65,9 @@ class TrainConfig(Serializable):
     micro_acc_steps: int = 1
     """Chunk the activations into this number of microbatches for training."""
 
+    stop_steps: int | None = None
+    """Number of steps to train for. If None, train indefinitely."""
+
     loss_fn: Literal["ce", "fvu", "kl"] = "fvu"
     """Loss function to use for training the sparse coders.
 

@@ -4,6 +4,7 @@ from fnmatch import fnmatchcase
 from glob import glob
 from typing import Sized
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from datasets import Dataset as HfDataset
@@ -253,12 +254,16 @@ class Trainer:
         print(f"Number of SAE parameters: {num_sae_params:_}")
         print(f"Number of model parameters: {num_model_params:_}")
 
-        num_batches = len(self.dataset) // self.cfg.batch_size
+        num_batches = min(
+            len(self.dataset) // self.cfg.batch_size,
+            self.cfg.stop_steps or float("inf"),
+        )
         if self.global_step > 0:
             assert hasattr(self.dataset, "select"), "Dataset must implement `select`"
 
             n = self.global_step * self.cfg.batch_size
-            ds = self.dataset.select(range(n, len(self.dataset)))  # type: ignore
+            k = num_batches * self.cfg.batch_size
+            ds = self.dataset.select(range(n, k))  # type: ignore
         else:
             ds = self.dataset
 
@@ -423,6 +428,8 @@ class Trainer:
                 dim=-1,
             ).mean()
 
+        can_save = True
+
         for batch in dl:
             torch.compiler.cudagraph_mark_step_begin()
 
@@ -514,6 +521,21 @@ class Trainer:
                     for mask in did_fire.values():
                         mask.zero_()
 
+                match self.cfg.loss_fn:
+                    case "fvu":
+                        loss = np.array([avg_fvu[name] for name in self.saes]).mean()
+                    case "kl":
+                        loss = avg_ce + avg_kl
+                    case "ce":
+                        loss = avg_ce
+
+                if (step + 1) % self.cfg.save_every == 0:
+                    can_save = True
+                if can_save and np.all(loss < self.best_loss):
+                    can_save = False
+                    self.best_loss = loss
+                    self.save()
+
                 if (
                     self.cfg.log_to_wandb
                     and (step + 1) % self.cfg.wandb_log_frequency == 0
@@ -555,10 +577,6 @@ class Trainer:
 
                         if wandb is not None:
                             wandb.log(info, step=step)
-
-                if (step + 1) % self.cfg.save_every == 0 and loss < self.best_loss:
-                    self.best_loss = loss
-                    self.save()
 
             self.global_step += 1
             pbar.update()
@@ -630,7 +648,7 @@ class Trainer:
                 optimizer.eval()  # type: ignore
 
         if rank_zero or self.cfg.distribute_modules:
-            print("Saving checkpoint")
+            print("Saving checkpoint to", path)
 
             for optimizer in self.optimizers:
                 if isinstance(optimizer, ScheduleFreeWrapper):
