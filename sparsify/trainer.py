@@ -403,7 +403,7 @@ class Trainer:
                     loss.div(acc_steps).backward()
 
                     # Update the did_fire mask
-                    did_fire[name][out.latent_indices.flatten()] = True
+                    # did_fire[name][out.latent_indices.flatten()] = True
                     self.maybe_all_reduce(did_fire[name], "max")  # max is boolean "any"
 
             # Check if we need to actually do a training step

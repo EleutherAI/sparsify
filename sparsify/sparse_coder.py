@@ -231,14 +231,33 @@ class SparseCoder(nn.Module):
         self, x: Tensor, y: Tensor | None = None, *, dead_mask: Tensor | None = None
     ) -> ForwardOutput:
         pre_acts = self.pre_acts(x)
+        num_examples = pre_acts.shape[0]
 
         # If we aren't given a distinct target, we're autoencoding
         if y is None:
             y = x
 
-        # Decode
-        top_acts, top_indices = self.select_topk(pre_acts)
-        sae_out = self.decode(top_acts, top_indices)
+        total_k = self.cfg.k * num_examples
+        flat_top_acts, flat_top_indices = pre_acts.flatten().topk(total_k, sorted=False)
+        
+        example_indices = flat_top_indices // pre_acts.shape[1]
+        feature_indices = flat_top_indices % pre_acts.shape[1]
+        
+        unique_examples, counts = torch.unique(example_indices, return_counts=True)
+        max_activations_per_example = counts.max().item()
+        
+        padded_indices = torch.zeros(num_examples, max_activations_per_example, dtype=torch.long, device=pre_acts.device)
+        padded_acts = torch.zeros(num_examples, max_activations_per_example, dtype=pre_acts.dtype, device=pre_acts.device)
+        
+        for count, example_idx in zip(counts, unique_examples):
+            mask = (example_indices == example_idx)
+            
+            padded_indices[example_idx, :count] = feature_indices[mask]
+            padded_acts[example_idx, :count] = flat_top_acts[mask]
+        
+        y = decoder_impl(padded_indices, padded_acts.to(self.dtype), self.W_dec.mT)
+        sae_out = y + self.b_dec
+
         if self.W_skip is not None:
             sae_out += x.to(self.dtype) @ self.W_skip.mT
 
@@ -246,7 +265,8 @@ class SparseCoder(nn.Module):
         e = y - sae_out
 
         # Used as a denominator for putting everything on a reasonable scale
-        total_variance = (y - y.mean(0)).pow(2).sum()
+        # total_variance = (y - y.mean(0)).pow(2).sum()
+        total_variance = 1
 
         # Second decoder pass for AuxK loss
         if dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
@@ -271,8 +291,10 @@ class SparseCoder(nn.Module):
         else:
             auxk_loss = sae_out.new_tensor(0.0)
 
-        l2_loss = e.pow(2).sum()
-        fvu = l2_loss / total_variance
+        fvu = e.pow(2).sum()
+
+        # l2_loss = e.pow(2).sum()
+        # fvu = l2_loss / total_variance
 
         if self.cfg.multi_topk:
             top_acts, top_indices = pre_acts.topk(4 * self.cfg.k, sorted=False)
@@ -284,8 +306,8 @@ class SparseCoder(nn.Module):
 
         return ForwardOutput(
             sae_out,
-            top_acts,
-            top_indices,
+            None,
+            None,
             fvu,
             auxk_loss,
             multi_topk_fvu,
