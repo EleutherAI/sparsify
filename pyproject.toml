@@ -17,9 +17,11 @@ dependencies = [
     "natsort", # For sorting module names
     "safetensors",
     "schedulefree>=1.4",
+    "scipy>=1.15.2",
+    "sentencepiece>=0.2.0",
     "simple-parsing",
     "torch",
-    "transformers",
+    "transformers<4.48.0",
     "wandb>=0.19.6",
 ]
 version = "0.1.0"

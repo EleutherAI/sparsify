@@ -68,9 +68,14 @@ class PKMLinear(nn.Module):
         # torch.nn.init.orthogonal_(self._weight.weight, gain=0.5 / math.sqrt(self.d_in))
         self._scale = nn.Parameter(torch.zeros(1, dtype=dtype, device=device))
         if cfg.pkm_bias:
-            self.bias = nn.Parameter(torch.zeros(self.pkm_base**2, dtype=dtype, device=device))
+            self.bias = nn.Parameter(torch.zeros(self.num_heads * self.pkm_base**2, dtype=dtype, device=device))
         if cfg.pkm_softmax:
             self.scaling = nn.Parameter(torch.zeros(1, dtype=dtype, device=device))
+        if cfg.pkm_rand:
+            self.ordering = torch.stack([
+                torch.randperm(self.pkm_base ** 2, device=device, dtype=torch.int64)
+                for _ in range(self.num_heads)
+            ], dim=0)
 
     @torch.compile(mode="max-autotune")
     def forward(self, x):
@@ -92,7 +97,7 @@ class PKMLinear(nn.Module):
             self._weight(x).unflatten(
                 -1, (self.num_heads, self.pkm_base * 2)
             ), 2, dim=-1)
-        k_head = k // self.num_heads
+        k_head = max(1, k // self.num_heads)
         k1, k2 = k_head, k_head
         w1, i1 = x1.topk(k1, dim=-1)
         w2, i2 = x2.topk(k2, dim=-1)
@@ -100,7 +105,11 @@ class PKMLinear(nn.Module):
         i = i1[..., :, None] * self.pkm_base + i2[..., None, :]
         mask = i >= self.num_latents
         if self.cfg.pkm_bias:
-            w = w + self.bias[i] * mask
+            bias_i = i + torch.arange(self.num_heads, device=i.device, dtype=i.dtype)[:, None, None] * self.pkm_base**2
+            w = w + self.bias[bias_i] * mask
+        if self.cfg.pkm_rand:
+            i_i = self.ordering[:, None, :] * 0 + torch.arange(self.num_heads, device=i.device, dtype=i.dtype)[:, None, None]
+            i = i[i_i, :, self.ordering[:, None, :]]
         w[mask] = -1
         w = w.view(-1, self.num_heads, k1 * k2)
         w, i = w.topk(k_head, dim=-1, sorted=True)
@@ -115,6 +124,10 @@ class PKMLinear(nn.Module):
             w = w * torch.nn.functional.softplus(self.scaling)#[i])
         else:
             w, i = w[..., :k_head], i[..., :k_head]
+            w, i = w.flatten(-2), i.flatten(-2)
+            w_, i_ = w.topk(k, dim=-1)
+            w = torch.gather(w, -1, i_)
+            i = torch.gather(i, -1, i_)
             w, i = w.contiguous(), i.contiguous()
         return w.view(*orig_batch_size, k), i.reshape(*orig_batch_size, k)
 

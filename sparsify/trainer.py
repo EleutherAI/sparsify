@@ -253,7 +253,10 @@ class SaeTrainer:
             if self.cfg.transcode:
                 input_dict[name] = inputs.flatten(0, 1)
 
-        for batch in dl:
+        for batch_idx, batch in enumerate(dl):
+            if batch_idx >= self.cfg.stop_steps:
+                break
+            
             torch.compiler.cudagraph_mark_step_begin()
             
             input_dict.clear()

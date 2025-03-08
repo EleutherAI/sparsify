@@ -43,6 +43,9 @@ class SaeConfig(Serializable):
 
     pkm_pad: bool = False
     """Pad the PKM encoder to a power of 2."""
+    
+    pkm_rand: bool = False
+    """Randomize the PKM encoder orderings."""
 
     topk_separate: bool = True
     """Faster top-k for PKM by separating the top-k operation."""
@@ -145,6 +148,9 @@ class TrainConfig(Serializable):
 
     save_every: int = 1000
     """Save SAEs every `save_every` steps."""
+    
+    stop_steps: int = 1_000_000
+    """Number of steps to train the SAEs for."""
 
     log_to_wandb: bool = True
     run_name: str | None = None
