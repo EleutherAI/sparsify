@@ -6,6 +6,7 @@ from typing import Sized
 
 import torch
 import torch.distributed as dist
+import numpy as np
 from datasets import Dataset as HfDataset
 from natsort import natsorted
 from safetensors.torch import load_model
@@ -285,6 +286,7 @@ class Trainer:
         acc_steps = self.cfg.grad_acc_steps * self.cfg.micro_acc_steps
         denom = acc_steps * self.cfg.wandb_log_frequency
         loss = torch.inf
+        can_save = False
         num_tokens_in_step = 0
 
         # For logging purposes
@@ -502,6 +504,16 @@ class Trainer:
                     for mask in did_fire.values():
                         mask.zero_()
 
+                match self.cfg.loss_fn:
+                    case "fvu":
+                        # Save parameters if any of the SAEs improved
+                        # TODO only save the key that improved?
+                        loss = np.array([avg_fvu[name] for name in self.saes]).mean()
+                    case "kl":
+                        loss = avg_ce + avg_kl
+                    case "ce":
+                        loss = avg_ce
+
                 if (
                     self.cfg.log_to_wandb
                     and (step + 1) % self.cfg.wandb_log_frequency == 0
@@ -544,7 +556,10 @@ class Trainer:
                         if wandb is not None:
                             wandb.log(info, step=step)
 
-                if (step + 1) % self.cfg.save_every == 0 and loss < self.best_loss:
+                if (step + 1) % self.cfg.save_every == 0:
+                    can_save = True
+                if can_save and np.any(loss < self.best_loss):
+                    can_save = False
                     self.best_loss = loss
                     self.save()
 
