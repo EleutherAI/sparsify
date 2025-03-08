@@ -34,7 +34,7 @@ for hookpoint in hookpoints:
 dataset = load_dataset("roneneldan/TinyStories", split="train[:1%]")
 
 # Tokenize the first 3 samples
-prefixes = tokenizer(dataset.shuffle(seed=0)["text"][-8192:], return_tensors="pt", padding=True)['input_ids'][:, :15]
+prefixes = tokenizer(dataset.shuffle(seed=42)["text"][-8192:], return_tensors="pt", padding=True)['input_ids'][:, :15]
 
 for temperature in [0.1]: #  0.7
     print(f"\n\033[1m=== With sparsification (temperature {temperature}) ===\033[0m")

@@ -189,7 +189,8 @@ class Trainer:
 
         self.global_step = train_state["global_step"]
         self.num_tokens_since_fired = {
-            k: train_state["num_tokens_since_fired"][k] for k in self.local_hookpoints()
+            # k: 0 # train_state["num_tokens_since_fired"][k] 
+            # for k in self.local_hookpoints()
         }
 
         print(
@@ -443,17 +444,17 @@ class Trainer:
                     info = {}
 
                     for name in self.saes:
-                        mask = (
-                            self.num_tokens_since_fired[name]
-                            > self.cfg.dead_feature_threshold
-                        )
+                        # mask = (
+                        #     self.num_tokens_since_fired[name]
+                        #     > self.cfg.dead_feature_threshold
+                        # )
 
                         info.update(
                             {
                                 f"fvu/{name}": avg_fvu[name],
-                                f"dead_pct/{name}": mask.mean(
-                                    dtype=torch.float32
-                                ).item(),
+                                # f"dead_pct/{name}": mask.mean(
+                                #     dtype=torch.float32
+                                # ).item(),
                             }
                         )
                         if self.cfg.auxk_alpha > 0:
