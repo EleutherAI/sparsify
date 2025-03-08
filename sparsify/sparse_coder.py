@@ -255,8 +255,8 @@ class SparseCoder(nn.Module):
             padded_indices[example_idx, :count] = feature_indices[mask]
             padded_acts[example_idx, :count] = flat_top_acts[mask]
         
-        y = decoder_impl(padded_indices, padded_acts.to(self.dtype), self.W_dec.mT)
-        sae_out = y + self.b_dec
+        y_decoded = decoder_impl(padded_indices, padded_acts.to(self.dtype), self.W_dec.mT)
+        sae_out = y_decoded + self.b_dec
 
         if self.W_skip is not None:
             sae_out += x.to(self.dtype) @ self.W_skip.mT
