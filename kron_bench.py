@@ -73,11 +73,11 @@ def timing(name, fn, *args):
 @torch.compile(mode="max-autotune")
 def unified(vals, matrix_inner, matrix_outer):
     vals_inner = vals.reshape(B, N_n, N_b)
-    # vals_inner = torch.einsum("bnd,umd->bum", vals_inner, matrix_inner)
-    # vals_outer = torch.einsum('bun,mun->bdm', vals_inner, matrix_outer)
     a = torch.einsum("bnd,cud->bnuc", vals_inner, matrix_inner)
     b = torch.einsum("bnuc,mun->bcm", a, matrix_outer)
     return b.reshape(B, M)
+    # vals_inner = torch.einsum("bnd,umd->bum", vals_inner, matrix_inner)
+    # vals_outer = torch.einsum('bun,mun->bdm', vals_inner, matrix_outer)
     # return torch.einsum(
     #     "bnx,yx,mn->bym",
     #     vals_inner, matrix_inner.view(M_b, N_b), matrix_outer.view(M_n, N_n),
