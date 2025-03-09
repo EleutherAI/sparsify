@@ -128,6 +128,9 @@ class Trainer:
                         if i > 0:  # First encoder is Linear, rest are LogicLayers
                             for param in encoder.parameters():
                                 muon_params.discard(param)
+                    for i, decoder in enumerate(sae.W_decs):
+                        if i > 0:
+                            muon_params.discard(decoder)
                 
                 self.optimizers = [
                     Muon(

@@ -62,6 +62,7 @@ class SparseCoder(nn.Module):
         self.encoders = nn.ModuleList()
         self.W_decs = nn.ParameterList()
         self.b_decs = nn.ParameterList()
+        self.s_decs = nn.ParameterList()
 
         # Add top-k encoder
         encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
@@ -88,7 +89,9 @@ class SparseCoder(nn.Module):
             self.encoders.append(encoder)
 
             # For SAEs this was originally the transpose of the encoder weights
-            self.W_decs.append(nn.Parameter(torch.zeros(self.num_latents // 2, self.d_in, device=device, dtype=dtype)))
+            self.W_decs.append(nn.Parameter(torch.randn(self.num_latents // 2, self.d_in, device=device, dtype=dtype)))
+            self.W_decs[-1].data /= self.W_decs[-1].data.norm(dim=1, keepdim=True)
+            self.s_decs.append(nn.Parameter(torch.ones(1, device=device, dtype=dtype)))
             # nn.init.orthogonal_(self.W_decs[-1].data, gain=1)
             self.b_decs.append(nn.Parameter(torch.zeros(self.d_in, device=device, dtype=dtype)))
 
@@ -284,7 +287,9 @@ class SparseCoder(nn.Module):
             )
             binary_topk.scatter_(1, top_indices, 1)
             pre_acts = encoder(binary_topk)
-            sae_out += pre_acts @ self.W_decs[i] # + self.b_decs[i]
+            if (pre_acts > 0).any():
+                print(pre_acts.sum(-1).mean().item(), pre_acts.var(0).mean().item(), self.s_decs[i-1].item())
+            sae_out += pre_acts @ self.W_decs[i] * self.s_decs[i-1] # + self.b_decs[i]
             # top_acts, top_indices = self.select_topk(pre_acts)
             # non_zero_acts, non_zero_indices = pre_acts.nonzero(as_tuple=True)
             # sae_out = decoder_impl(top_indices, top_acts, self.W_decs[i].mT)
