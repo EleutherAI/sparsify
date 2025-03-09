@@ -35,6 +35,9 @@ class SparseCoderConfig(Serializable):
     transcode: bool = False
     """Whether we want to predict the output of a module given its input."""
 
+    num_layers: int = 1
+    """Number of sparse layers to use."""
+
 
 # Support different naming conventions for the same configuration
 SaeConfig = SparseCoderConfig

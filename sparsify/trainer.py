@@ -137,7 +137,11 @@ class Trainer:
                 self.lr_schedulers = [
                     get_linear_schedule_with_warmup(
                         self.optimizers[0], 0, num_batches // cfg.batch_size
+                    ),
+                    get_linear_schedule_with_warmup(
+                        self.optimizers[1], self.cfg.lr_warmup_steps, num_batches // cfg.batch_size
                     )
+
                 ]
             case "signum":
                 from schedulefree import ScheduleFreeWrapper
@@ -345,7 +349,8 @@ class Trainer:
                 # On the first iteration, initialize the decoder bias
                 if self.global_step == 0:
                     mean = self.maybe_all_reduce(outputs.mean(0))
-                    raw.b_dec.data = mean.to(raw.dtype)
+                    for bias in raw.b_decs:
+                        bias.data = mean.to(bias.dtype)
 
                 if not maybe_wrapped:
                     # Wrap the SAEs with Distributed Data Parallel. We have to do this

@@ -16,7 +16,7 @@ from .utils import decoder_impl
 
 class EncoderOutput(NamedTuple):
     top_acts: Tensor
-    """Activations of the top-k latents."""
+    """Activations of the top-k latents from the final layer."""
 
     top_indices: Tensor
     """Indices of the top-k features."""
@@ -24,9 +24,10 @@ class EncoderOutput(NamedTuple):
 
 class ForwardOutput(NamedTuple):
     sae_out: Tensor
+    """Output of the sparse autoencoder after decoding."""
 
     latent_acts: Tensor
-    """Activations of the top-k latents."""
+    """Activations of the top-k latents from the final layer."""
 
     latent_indices: Tensor
     """Indices of the top-k features."""
@@ -55,24 +56,39 @@ class SparseCoder(nn.Module):
         self.cfg = cfg
         self.d_in = d_in
         self.num_latents = cfg.num_latents or d_in * cfg.expansion_factor
-
-        self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
-        self.encoder.bias.data.zero_()
+        
+        # Support multiple layers
+        if cfg.num_layers <= 0:
+            raise ValueError("num_layers must be at least 1")
+        
+        # Create a ModuleList for the encoders
+        self.encoders = nn.ModuleList()
+        for _ in range(cfg.num_layers):
+            layer = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
+            layer.bias.data.zero_()
+            self.encoders.append(layer)
 
         if decoder:
-            # Transcoder initialization: use zeros
-            if cfg.transcode:
-                self.W_dec = nn.Parameter(torch.zeros_like(self.encoder.weight.data))
-
-            # Sparse autoencoder initialization: use the transpose of encoder weights
-            else:
-                self.W_dec = nn.Parameter(self.encoder.weight.data.clone())
-                if self.cfg.normalize_decoder:
-                    self.set_decoder_norm_to_unit_norm()
+            # Create decoders corresponding to each encoder layer
+            self.W_decs = nn.ParameterList()
+            self.b_decs = nn.ParameterList()
+            
+            # Initialize each decoder
+            for encoder in self.encoders:
+                # Transcoder initialization: use zeros
+                if cfg.transcode:
+                    self.W_decs.append(nn.Parameter(torch.zeros_like(encoder.weight.data)))
+                # SAE initialization: use the transpose of encoder weights
+                else:
+                    self.W_decs.append(nn.Parameter(encoder.weight.data.clone()))
+                self.b_decs.append(nn.Parameter(torch.zeros_like(encoder.bias.data)))
+            # Normalize the final decoder if needed
+            if self.cfg.normalize_decoder and not cfg.transcode:
+                self.set_decoder_norm_to_unit_norm()
         else:
-            self.W_dec = None
-
-        self.b_dec = nn.Parameter(torch.zeros(d_in, dtype=dtype, device=device))
+            self.W_decs = None
+            self.b_decs = None
+        
         self.W_skip = (
             nn.Parameter(torch.zeros(d_in, d_in, device=device, dtype=dtype))
             if cfg.skip_connection
@@ -177,23 +193,28 @@ class SparseCoder(nn.Module):
 
     @property
     def device(self):
-        return self.encoder.weight.device
+        return self.encoders[0].weight.device
 
     @property
     def dtype(self):
-        return self.encoder.weight.dtype
+        return self.encoders[0].weight.dtype
 
-    def pre_acts(self, x: Tensor) -> Tensor:
-        sae_in = x.to(self.dtype)
+    # def pre_acts(self, x: Tensor) -> Tensor:
+    #     sae_in = x.to(self.dtype)
 
-        # Remove decoder bias as per Anthropic if we're autoencoding. This doesn't
-        # really make sense for transcoders because the input and output spaces are
-        # different.
-        if not self.cfg.transcode:
-            sae_in -= self.b_dec
+    #     # Remove decoder bias as per Anthropic if we're autoencoding. This doesn't
+    #     # really make sense for transcoders because the input and output spaces are
+    #     # different.
+    #     if not self.cfg.transcode:
+    #         sae_in -= self.b_dec
 
-        out = self.encoder(sae_in)
-        return nn.functional.relu(out)
+    #     # Process through all encoder layers
+    #     out = sae_in
+    #     for encoder in self.encoders:
+    #         out = encoder(out)
+    #         out = nn.functional.relu(out)
+        
+    #     return out
 
     def select_topk(self, z: Tensor) -> EncoderOutput:
         """Select the top-k latents."""
@@ -213,15 +234,22 @@ class SparseCoder(nn.Module):
         # Use TopK activation
         return EncoderOutput(*z.topk(self.cfg.k, sorted=False))
 
-    def encode(self, x: Tensor) -> EncoderOutput:
-        """Encode the input and select the top-k latents."""
-        return self.select_topk(self.pre_acts(x))
+    # def encode(self, x: Tensor) -> EncoderOutput:
+    #     """Encode the input and select the top-k latents."""
+    #     return self.select_topk(self.pre_acts(x))
 
-    def decode(self, top_acts: Tensor, top_indices: Tensor) -> Tensor:
-        assert self.W_dec is not None, "Decoder weight was not initialized."
+    # def decode(self, top_acts: Tensor, top_indices: Tensor) -> Tensor:
+    #     assert self.W_decs is not None, "Decoder weights were not initialized."
 
-        y = decoder_impl(top_indices, top_acts.to(self.dtype), self.W_dec.mT)
-        return y + self.b_dec
+    #     # Start with the output from the final encoder layer
+    #     y = decoder_impl(top_indices, top_acts.to(self.dtype), self.W_decs[-1].mT)
+        
+    #     # If we have multiple layers, we need to process backward through the decoders
+    #     # Starting from the second-to-last decoder and going backward
+    #     for i in range(len(self.W_decs) - 2, -1, -1):
+    #         y = decoder_impl(top_indices, y, self.W_decs[i].mT)
+            
+    #     return y + self.b_dec
 
     # Wrapping the forward in bf16 autocast improves performance by almost 2x
     @torch.autocast(
@@ -230,15 +258,29 @@ class SparseCoder(nn.Module):
     def forward(
         self, x: Tensor, y: Tensor | None = None, *, dead_mask: Tensor | None = None
     ) -> ForwardOutput:
-        pre_acts = self.pre_acts(x)
+        sae_in = x.to(self.dtype)
+        if not self.cfg.transcode:
+            sae_in -= self.b_decs[0]
+
+        pre_acts = nn.functional.relu(self.encoders[0](sae_in))
+        top_acts, top_indices = self.select_topk(pre_acts)
+        sae_out = decoder_impl(top_indices, top_acts, self.W_decs[0].mT)
+        sae_out += self.b_decs[0]
+        
+        for i, encoder in enumerate(self.encoders[1:], start=1):
+            sae_in = sae_in + sae_out
+            if not self.cfg.transcode:
+                sae_in -= self.b_decs[i]
+
+            encoded = nn.functional.relu(encoder(sae_in))
+            top_acts, top_indices = self.select_topk(encoded)
+            sae_out += decoder_impl(top_indices, top_acts, self.W_decs[i].mT)
+            sae_out += self.b_decs[i]
 
         # If we aren't given a distinct target, we're autoencoding
         if y is None:
             y = x
 
-        # Decode
-        top_acts, top_indices = self.select_topk(pre_acts)
-        sae_out = self.decode(top_acts, top_indices)
         if self.W_skip is not None:
             sae_out += x.to(self.dtype) @ self.W_skip.mT
 
@@ -275,7 +317,7 @@ class SparseCoder(nn.Module):
         fvu = l2_loss / total_variance
 
         if self.cfg.multi_topk:
-            top_acts, top_indices = pre_acts.topk(4 * self.cfg.k, sorted=False)
+            top_acts, top_indices = acts.topk(4 * self.cfg.k, sorted=False)
             sae_out = self.decode(top_acts, top_indices)
 
             multi_topk_fvu = (sae_out - y).pow(2).sum() / total_variance
@@ -293,27 +335,31 @@ class SparseCoder(nn.Module):
 
     @torch.no_grad()
     def set_decoder_norm_to_unit_norm(self):
-        assert self.W_dec is not None, "Decoder weight was not initialized."
+        assert self.W_decs is not None, "Decoder weight was not initialized."
 
-        eps = torch.finfo(self.W_dec.dtype).eps
-        norm = torch.norm(self.W_dec.data, dim=1, keepdim=True)
-        self.W_dec.data /= norm + eps
+        # Normalize each decoder layer
+        for decoder in self.W_decs:
+            eps = torch.finfo(decoder.dtype).eps
+            norm = torch.norm(decoder.data, dim=1, keepdim=True)
+            decoder.data /= norm + eps
 
     @torch.no_grad()
     def remove_gradient_parallel_to_decoder_directions(self):
-        assert self.W_dec is not None, "Decoder weight was not initialized."
-        assert self.W_dec.grad is not None  # keep pyright happy
-
-        parallel_component = einops.einsum(
-            self.W_dec.grad,
-            self.W_dec.data,
-            "d_sae d_in, d_sae d_in -> d_sae",
-        )
-        self.W_dec.grad -= einops.einsum(
-            parallel_component,
-            self.W_dec.data,
-            "d_sae, d_sae d_in -> d_sae d_in",
-        )
+        assert self.W_decs is not None, "Decoder weight was not initialized."
+        
+        # Process each decoder layer
+        for decoder in self.W_decs:
+            if decoder.grad is not None:
+                parallel_component = einops.einsum(
+                    decoder.grad,
+                    decoder.data,
+                    "d_sae d_in, d_sae d_in -> d_sae",
+                )
+                decoder.grad -= einops.einsum(
+                    parallel_component,
+                    decoder.data,
+                    "d_sae, d_sae d_in -> d_sae d_in",
+                )
 
 
 # Allow for alternate naming conventions
