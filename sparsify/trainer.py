@@ -82,6 +82,7 @@ class Trainer:
                 self.saes[name] = SparseCoder(
                     input_widths[hook], cfg.sae, device, dtype=torch.float32
                 )
+                self.saes[name] = self.saes[name].train()
 
         assert isinstance(dataset, Sized)
         num_batches = len(dataset) // cfg.batch_size
@@ -120,8 +121,14 @@ class Trainer:
             case "muon":
                 params = {p for sae in self.saes.values() for p in sae.parameters()}
                 muon_params = {p for p in params if p.ndim >= 2}
-                lrs = [f"{cfg.lr or 2e-3:.2e}"]
+                lrs: list[str] = [f"{cfg.lr or 2e-3:.2e}"]
 
+                for name, sae in self.saes.items():
+                    for i, encoder in enumerate(sae.encoders):
+                        if i > 0:  # First encoder is Linear, rest are LogicLayers
+                            for param in encoder.parameters():
+                                muon_params.discard(param)
+                
                 self.optimizers = [
                     Muon(
                         muon_params,

@@ -9,6 +9,7 @@ from huggingface_hub import snapshot_download
 from natsort import natsorted
 from safetensors.torch import load_model, save_model
 from torch import Tensor, nn
+from difflogic import LogicLayer
 
 from .config import SparseCoderConfig
 from .utils import decoder_impl
@@ -56,39 +57,45 @@ class SparseCoder(nn.Module):
         self.cfg = cfg
         self.d_in = d_in
         self.num_latents = cfg.num_latents or d_in * cfg.expansion_factor
-        
-        # Support multiple layers
-        if cfg.num_layers <= 0:
-            raise ValueError("num_layers must be at least 1")
-        
+
         # Create a ModuleList for the encoders
         self.encoders = nn.ModuleList()
-        for _ in range(cfg.num_layers):
-            layer = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
-            layer.bias.data.zero_()
-            self.encoders.append(layer)
+        self.W_decs = nn.ParameterList()
+        self.b_decs = nn.ParameterList()
 
-        if decoder:
-            # Create decoders corresponding to each encoder layer
-            self.W_decs = nn.ParameterList()
-            self.b_decs = nn.ParameterList()
-            
-            # Initialize each decoder
-            for encoder in self.encoders:
-                # Transcoder initialization: use zeros
-                if cfg.transcode:
-                    self.W_decs.append(nn.Parameter(torch.zeros_like(encoder.weight.data)))
-                # SAE initialization: use the transpose of encoder weights
-                else:
-                    self.W_decs.append(nn.Parameter(encoder.weight.data.clone()))
-                self.b_decs.append(nn.Parameter(torch.zeros_like(encoder.bias.data)))
-            # Normalize the final decoder if needed
-            if self.cfg.normalize_decoder and not cfg.transcode:
-                self.set_decoder_norm_to_unit_norm()
+        # Add top-k encoder
+        encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
+        encoder.bias.data.zero_()
+        self.encoders.append(encoder)
+
+        # Transcoder initialization: use zeros
+        if cfg.transcode:
+            self.W_decs.append(nn.Parameter(torch.zeros_like(encoder.weight.data)))
+        # SAE initialization: use the transpose of encoder weights
         else:
-            self.W_decs = None
-            self.b_decs = None
-        
+            self.W_decs.append(nn.Parameter(encoder.weight.data.clone()))
+        self.b_decs.append(nn.Parameter(torch.zeros_like(encoder.bias.data)))
+
+        # Create encoders and decoders for logic layers
+        for _ in range(cfg.logic_layers):
+            # Add logic encoder
+            encoder = LogicLayer(
+                self.num_latents,
+                self.num_latents // 2,
+                device=str(device),
+                implementation="cuda" if "cuda" in str(device) else "python",
+            )
+            self.encoders.append(encoder)
+
+            # For SAEs this was originally the transpose of the encoder weights
+            self.W_decs.append(nn.Parameter(torch.zeros(self.num_latents // 2, self.d_in, device=device, dtype=dtype)))
+            # nn.init.orthogonal_(self.W_decs[-1].data, gain=1)
+            self.b_decs.append(nn.Parameter(torch.zeros(self.d_in, device=device, dtype=dtype)))
+
+        # Normalize all decoders if needed
+        if self.cfg.normalize_decoder and not cfg.transcode:
+            self.set_decoder_norm_to_unit_norm()
+
         self.W_skip = (
             nn.Parameter(torch.zeros(d_in, d_in, device=device, dtype=dtype))
             if cfg.skip_connection
@@ -243,18 +250,18 @@ class SparseCoder(nn.Module):
 
     #     # Start with the output from the final encoder layer
     #     y = decoder_impl(top_indices, top_acts.to(self.dtype), self.W_decs[-1].mT)
-        
+
     #     # If we have multiple layers, we need to process backward through the decoders
     #     # Starting from the second-to-last decoder and going backward
     #     for i in range(len(self.W_decs) - 2, -1, -1):
     #         y = decoder_impl(top_indices, y, self.W_decs[i].mT)
-            
+
     #     return y + self.b_dec
 
     # Wrapping the forward in bf16 autocast improves performance by almost 2x
-    @torch.autocast(
-        "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_bf16_supported()
-    )
+    # @torch.autocast(
+    #     "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_bf16_supported()
+    # )
     def forward(
         self, x: Tensor, y: Tensor | None = None, *, dead_mask: Tensor | None = None
     ) -> ForwardOutput:
@@ -266,16 +273,25 @@ class SparseCoder(nn.Module):
         top_acts, top_indices = self.select_topk(pre_acts)
         sae_out = decoder_impl(top_indices, top_acts, self.W_decs[0].mT)
         sae_out += self.b_decs[0]
-        
-        for i, encoder in enumerate(self.encoders[1:], start=1):
-            sae_in = sae_in + sae_out
-            if not self.cfg.transcode:
-                sae_in -= self.b_decs[i]
 
-            encoded = nn.functional.relu(encoder(sae_in))
-            top_acts, top_indices = self.select_topk(encoded)
-            sae_out += decoder_impl(top_indices, top_acts, self.W_decs[i].mT)
-            sae_out += self.b_decs[i]
+        for i, encoder in enumerate(self.encoders[1:], start=1):
+            # The logic layer expects 0s and 1s as documented in this random GitHub issue:
+            # https://github.com/Felix-Petersen/difflogic/issues/31
+            binary_topk = torch.zeros(
+                (x.shape[0], self.num_latents), 
+                device=pre_acts.device, 
+                dtype=pre_acts.dtype
+            )
+            binary_topk.scatter_(1, top_indices, 1)
+            pre_acts = encoder(binary_topk)
+            sae_out += pre_acts @ self.W_decs[i] # + self.b_decs[i]
+            # top_acts, top_indices = self.select_topk(pre_acts)
+            # non_zero_acts, non_zero_indices = pre_acts.nonzero(as_tuple=True)
+            # sae_out = decoder_impl(top_indices, top_acts, self.W_decs[i].mT)
+            # sae_out += self.b_decs[i]
+
+            if i > 1:
+                raise NotImplementedError("Logic layers > 1 not implemented")
 
         # If we aren't given a distinct target, we're autoencoding
         if y is None:
@@ -317,7 +333,7 @@ class SparseCoder(nn.Module):
         fvu = l2_loss / total_variance
 
         if self.cfg.multi_topk:
-            top_acts, top_indices = acts.topk(4 * self.cfg.k, sorted=False)
+            top_acts, top_indices = pre_acts.topk(4 * self.cfg.k, sorted=False)
             sae_out = self.decode(top_acts, top_indices)
 
             multi_topk_fvu = (sae_out - y).pow(2).sum() / total_variance
@@ -346,7 +362,7 @@ class SparseCoder(nn.Module):
     @torch.no_grad()
     def remove_gradient_parallel_to_decoder_directions(self):
         assert self.W_decs is not None, "Decoder weight was not initialized."
-        
+
         # Process each decoder layer
         for decoder in self.W_decs:
             if decoder.grad is not None:
