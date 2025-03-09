@@ -20,6 +20,7 @@ from transformers import PreTrainedModel, get_linear_schedule_with_warmup
 from .config import TrainConfig
 from .data import MemmapDataset
 from .muon import Muon
+from .optimized_encoders import OptimizedEncoderConfig
 from .sign_sgd import SignSGD
 from .sparse_coder import SparseCoder
 from .utils import KeywordIdentity, get_layer_list, resolve_widths, set_submodule
@@ -367,7 +368,11 @@ class Trainer:
                 # Ensure the preactivations are centered at initialization
                 # This is mathematically equivalent to Anthropic's proposal of
                 # subtracting the decoder bias
-                if self.cfg.sae.transcode:
+                if (
+                    self.cfg.sae.transcode
+                    and self.cfg.sae.optimized_encoder_config
+                    not in (OptimizedEncoderConfig.PKM,)
+                ):
                     mean = self.maybe_all_reduce(inputs.mean(0)).to(raw.dtype)
                     mean_image = -mean @ raw.encoder.weight.data.T
                     raw.encoder.bias.data = mean_image
@@ -431,6 +436,9 @@ class Trainer:
         can_save = True
 
         for batch in dl:
+            if self.global_step >= num_batches:
+                break
+
             torch.compiler.cudagraph_mark_step_begin()
 
             x = batch["input_ids"].to(device)

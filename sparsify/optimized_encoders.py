@@ -94,13 +94,6 @@ class PKMLinear(nn.Module):
 
     @torch.compile(mode="max-autotune")
     def topk(self, x, k: int):
-        if self.bias.shape != (self.num_heads * self.pkm_base**2,):
-            self.bias.data = torch.nn.functional.pad(
-                self.bias,
-                (0, self.num_heads * self.pkm_base**2 - self.bias.shape[0]),
-                mode="constant",
-                value=0,
-            )
         orig_batch_size = x.shape[:-1]
         x1, x2 = torch.chunk(
             self._weight(x).unflatten(-1, (self.num_heads, self.pkm_base * 2)),
@@ -230,8 +223,10 @@ class OptimizedEncoderConfig(Enum):
         kron_config=None,
     ) -> nn.Module | None:
         if self is OptimizedEncoderConfig.PKM:
+            assert pkm_config is not None
             return PKMLinear(d_in, num_latents, device, dtype, cfg=pkm_config)
         elif self is OptimizedEncoderConfig.Kronecker:
+            assert kron_config is not None
             return KroneckerLinear(d_in, num_latents, device, dtype, cfg=kron_config)
         elif self is OptimizedEncoderConfig.None_:
             raise ValueError("No encoder specified.")
