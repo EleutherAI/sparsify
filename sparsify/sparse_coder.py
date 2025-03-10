@@ -87,8 +87,9 @@ class SparseCoder(nn.Module):
                     self.W_decs.append(nn.Parameter(encoder.weight.data.clone()))
                 self.b_decs.append(nn.Parameter(torch.zeros_like(encoder.bias.data)))
                 if cfg.residual_mode == "densenet":
-                    self.out_projections.append(nn.Linear(d_in, d_in, device=device, dtype=dtype))
-                    for i in range(encoder_idx):
+                    if encoder_idx > 0:
+                        self.out_projections.append(nn.Linear(d_in, d_in, device=device, dtype=dtype))
+                    for i in range(encoder_idx - 1):
                         self.skip_layers.append(nn.Linear(d_in, d_in, device=device, dtype=dtype))
             # Normalize the final decoder if needed
             if self.cfg.normalize_decoder and not cfg.transcode:
@@ -275,13 +276,14 @@ class SparseCoder(nn.Module):
         sae_out = decoder_impl(top_indices, top_acts, self.W_decs[0].mT)
         sae_out += self.b_decs[0]
         
+        sae_out_original = sae_out.clone()
         if self.cfg.residual_mode != "residual":
             sae_in.zero_()
         sae_in += sae_out
         previous_outputs, densenet_index = [], 0
         for encoder_idx, encoder in enumerate(self.encoders[1:], start=1):
             if self.cfg.residual_mode == "densenet":
-                sae_in.zero_()
+                sae_in[:] = sae_out_original
                 for i in range(encoder_idx - 1):
                     sae_in += self.skip_layers[densenet_index](previous_outputs[i])
                     densenet_index += 1
@@ -294,7 +296,7 @@ class SparseCoder(nn.Module):
             most_recent_sae_out += self.b_decs[encoder_idx]
             if self.cfg.residual_mode == "densenet":
                 previous_outputs.append(most_recent_sae_out)
-                sae_out += self.out_projections[encoder_idx](sae_in)
+                sae_out += self.out_projections[encoder_idx - 1](most_recent_sae_out)
             else:
                 sae_out += most_recent_sae_out
                 sae_in += most_recent_sae_out

@@ -10,16 +10,18 @@ requires-python = ">=3.10"
 keywords = ["interpretability", "explainable-ai"]
 license = {text = "MIT License"}
 dependencies = [
-    "accelerate",   # For device_map in from_pretrained
+    "accelerate", # For device_map in from_pretrained
     "datasets",
+    "difflogic>=0.1.0",
     "einops",
     "huggingface-hub",
-    "natsort",  # For sorting module names
+    "natsort", # For sorting module names
     "safetensors",
     "schedulefree",
     "simple-parsing",
     "torch",
     "transformers",
+    "wandb>=0.19.8",
 ]
 version = "0.1.0"
 
@@ -43,3 +45,12 @@ line-length = 88
 # Such imports will be flagged with a dedicated message suggesting
 # that the import is either added to the module's __all__ symbol
 ignore-init-module-imports = true
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu121" },
+]
