@@ -73,8 +73,12 @@ class SparseCoder(nn.Module):
             self.W_decs = nn.ParameterList()
             self.b_decs = nn.ParameterList()
             
+            if cfg.residual_mode == "densenet":
+                self.skip_layers = nn.ModuleList()
+                self.out_projections = nn.ModuleList()
+            
             # Initialize each decoder
-            for encoder in self.encoders:
+            for encoder_idx, encoder in enumerate(self.encoders):
                 # Transcoder initialization: use zeros
                 if cfg.transcode:
                     self.W_decs.append(nn.Parameter(torch.zeros_like(encoder.weight.data)))
@@ -82,6 +86,10 @@ class SparseCoder(nn.Module):
                 else:
                     self.W_decs.append(nn.Parameter(encoder.weight.data.clone()))
                 self.b_decs.append(nn.Parameter(torch.zeros_like(encoder.bias.data)))
+                if cfg.residual_mode == "densenet":
+                    self.out_projections.append(nn.Linear(d_in, d_in, device=device, dtype=dtype))
+                    for i in range(encoder_idx):
+                        self.skip_layers.append(nn.Linear(d_in, d_in, device=device, dtype=dtype))
             # Normalize the final decoder if needed
             if self.cfg.normalize_decoder and not cfg.transcode:
                 self.set_decoder_norm_to_unit_norm()
@@ -267,15 +275,29 @@ class SparseCoder(nn.Module):
         sae_out = decoder_impl(top_indices, top_acts, self.W_decs[0].mT)
         sae_out += self.b_decs[0]
         
-        for i, encoder in enumerate(self.encoders[1:], start=1):
-            sae_in = sae_in + sae_out
+        if self.cfg.residual_mode != "residual":
+            sae_in.zero_()
+        sae_in += sae_out
+        previous_outputs, densenet_index = [], 0
+        for encoder_idx, encoder in enumerate(self.encoders[1:], start=1):
+            if self.cfg.residual_mode == "densenet":
+                sae_in.zero_()
+                for i in range(encoder_idx - 1):
+                    sae_in += self.skip_layers[densenet_index](previous_outputs[i])
+                    densenet_index += 1
             if not self.cfg.transcode:
-                sae_in -= self.b_decs[i]
+                sae_in -= self.b_decs[encoder_idx]
 
             encoded = nn.functional.relu(encoder(sae_in))
             top_acts, top_indices = self.select_topk(encoded)
-            sae_out += decoder_impl(top_indices, top_acts, self.W_decs[i].mT)
-            sae_out += self.b_decs[i]
+            most_recent_sae_out = decoder_impl(top_indices, top_acts, self.W_decs[encoder_idx].mT)
+            most_recent_sae_out += self.b_decs[encoder_idx]
+            if self.cfg.residual_mode == "densenet":
+                previous_outputs.append(most_recent_sae_out)
+                sae_out += self.out_projections[encoder_idx](sae_in)
+            else:
+                sae_out += most_recent_sae_out
+                sae_in += most_recent_sae_out
 
         # If we aren't given a distinct target, we're autoencoding
         if y is None:

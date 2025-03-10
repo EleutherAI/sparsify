@@ -37,6 +37,9 @@ class SparseCoderConfig(Serializable):
 
     num_layers: int = 1
     """Number of sparse layers to use."""
+    
+    residual_mode: Literal["residual", "separate", "densenet"] = "residual"
+    """How to stack the sparse layers."""
 
 
 # Support different naming conventions for the same configuration
