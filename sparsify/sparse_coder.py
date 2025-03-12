@@ -2,6 +2,7 @@ import json
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import NamedTuple
+import math
 
 import einops
 import torch
@@ -11,7 +12,96 @@ from safetensors.torch import load_model, save_model
 from torch import Tensor, nn
 
 from .config import SparseCoderConfig
-from .step import Step, JumpReLU
+# from .step import Step, JumpReLU
+
+import torch
+
+import lovely_tensors as lt
+lt.monkey_patch()
+
+
+def rectangle(x):
+    """Kernel function for straight-through estimator"""
+    return ((x > -0.5) & (x < 0.5)).to(x.dtype)
+
+
+class Step(torch.autograd.Function):
+    """
+    Heaviside step function with custom backwards pass for L0 loss
+    """
+
+    bandwidth = 0.01 # 0.001 in original
+
+    @staticmethod
+    def forward(ctx, pre_acts, threshold):
+        """
+        In the forward pass we receive a Tensor containing the input and return
+        a Tensor containing the output. ctx is a context object that can be used
+        to stash information for backward computation. You can cache arbitrary
+        objects for use in the backward pass using the ctx.save_for_backward method.
+        """
+        ctx.save_for_backward(pre_acts, threshold)
+
+        return (pre_acts > threshold).to(pre_acts.dtype)
+
+    @staticmethod
+    def backward(ctx, output_grad):
+        """
+        In the backward pass we receive a Tensor containing the gradient of the loss
+        with respect to the output, and we need to compute the gradient of the loss
+        with respect to the input.
+        """
+
+        pre_acts, threshold = ctx.saved_tensors
+        
+        # We don’t apply STE to x input
+        pre_acts_grad = 0.0 * output_grad  
+
+        # Pseudo-derivative of the Dirac delta component of the Heaviside function
+        threshold_grad = (
+            -(1.0 / Step.bandwidth)
+            * rectangle((pre_acts - threshold) / Step.bandwidth)
+            * output_grad
+        )
+
+        print("threshold_grad in step", threshold_grad.sum(0))
+        return pre_acts_grad, threshold_grad.sum(0)
+
+
+class JumpReLU(torch.autograd.Function):
+    """
+    JumpReLU function with custom backwards pass
+    """
+
+    bandwidth = 0.01 # 0.001 in original
+
+    @staticmethod
+    def forward(ctx, pre_acts, threshold):
+        mask = (pre_acts > threshold).to(pre_acts.dtype)
+        out = pre_acts * mask
+
+        ctx.save_for_backward(pre_acts, threshold)
+        
+        return out, mask.detach().sum(0) > 0
+
+    @staticmethod
+    def backward(ctx, output_grad, did_fire_grad):
+
+        pre_acts, threshold = ctx.saved_tensors
+
+        # We don’t apply STE to x input
+        pre_acts_grad = (pre_acts > threshold).to(output_grad.dtype) * output_grad
+
+        # Pseudo-derivative of the Dirac delta component of the JumpRelU function
+        threshold_grad = (
+            -(threshold / JumpReLU.bandwidth)
+            * rectangle((pre_acts - threshold) / JumpReLU.bandwidth)
+            * output_grad
+        )
+        print("threshold_grad in jump", threshold_grad.sum(0))
+
+        return pre_acts_grad, threshold_grad.sum(0)
+                 
 
 
 class EncoderOutput(NamedTuple):
@@ -29,6 +119,9 @@ class ForwardOutput(NamedTuple):
 
     l0: Tensor
     """Number of latents fired."""
+
+    per_example_l0: Tensor
+    """Per-example L0 loss."""
 
     fvu: Tensor
     """Fraction of variance unexplained."""
@@ -79,9 +172,11 @@ class SparseCoder(nn.Module):
         )
 
         if self.cfg.activation == "jumprelu":
-            # 0.001 is the default threshold for JumpReLU 
-            # -3 because log(0.001) = -3, check if this is right
-            self.log_threshold = nn.Parameter(torch.full((self.num_latents,), -3., device=device))
+            # 0.001 is the default threshold for JumpReLU in the paper
+            self.log_threshold = nn.Parameter(
+                torch.full((self.num_latents,), math.log(0.01), device=device), 
+                requires_grad=True
+            )
             self.jump_relu = JumpReLU.apply
             self.step = Step.apply
 
@@ -217,8 +312,13 @@ class SparseCoder(nn.Module):
             y = x
 
         pre_acts = self.pre_acts(x)
+        print("log threshold", self.log_threshold)
+        print("threshold", self.log_threshold.exp())
+
         acts, did_fire = self.jump_relu(pre_acts, self.log_threshold.exp()) # type: ignore
-        l0 = self.step(pre_acts, self.log_threshold.exp()) # type: ignore
+        
+        per_example_l0 = self.step(pre_acts, self.log_threshold.exp()).sum(dim=-1) # type: ignore
+        l0_loss = (per_example_l0 / self.cfg.k - 1).pow(2).sum()
 
         sae_out = self.jump_decode(acts)
 
@@ -267,7 +367,8 @@ class SparseCoder(nn.Module):
         return ForwardOutput(
             sae_out,
             did_fire,
-            l0,
+            l0_loss, 
+            per_example_l0.float().mean().item(),
             fvu,
             auxk_loss,
             multi_topk_fvu

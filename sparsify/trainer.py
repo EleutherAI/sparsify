@@ -4,6 +4,7 @@ from fnmatch import fnmatchcase
 from glob import glob
 from typing import Sized
 
+
 import torch
 import torch.distributed as dist
 from datasets import Dataset as HfDataset
@@ -23,6 +24,30 @@ from .sparse_coder import SparseCoder
 from .utils import get_layer_list, resolve_widths
 
 
+class DiagnosticOptimizer(torch.optim.Adam):
+    def step(self, closure=None):
+        # Store old parameter values
+        old_values = {}
+        for group in self.param_groups:
+            for p in group['params']:
+                if len(p) == 16384:
+                    old_values[p] = p.data.clone()
+                    break
+        
+        # Call the original step method
+        super().step(closure)
+        
+        # Check which parameters changed and by how much
+        for group in self.param_groups:
+            for p in group['params']:
+                if p in old_values:
+                    diff = (p.data - old_values[p]).norm().item()
+                    print(f"Parameter norm change: {diff:.8f}")
+                    print(f"  Grad: {p.grad}")
+                    print(f"  New value: {p.data}")
+                    print(f"  Old value: {old_values[p]}")
+                    break
+    
 class Trainer:
     def __init__(
         self,
@@ -138,7 +163,7 @@ class Trainer:
                         # we're distributing modules across ranks
                         ddp=not cfg.distribute_modules,
                     ),
-                    torch.optim.Adam(params - muon_params, lr=cfg.lr or 2e-3),
+                    DiagnosticOptimizer(params - muon_params, lr=cfg.lr or 2e-3),
                 ]
                 self.lr_schedulers = [
                     get_linear_schedule_with_warmup(
@@ -178,6 +203,7 @@ class Trainer:
         }
 
         num_latents = list(self.saes.values())[0].num_latents
+        self.num_latents = num_latents
         self.initial_k = min(num_latents, round(list(input_widths.values())[0] * 10))
         self.final_k = self.cfg.sae.k
         self.best_loss = float("inf")
@@ -405,9 +431,12 @@ class Trainer:
                         self.maybe_all_reduce(out.fvu.detach()) / denom
                     )
 
+                    # print("out.l0", out.l0)
+                    # print("out.fvu", out.fvu)
+
                     loss = (
                         out.fvu # rescaled MSE
-                        + 0.1 * out.l0
+                        + out.l0 * self.get_current_lambda()
                     )
 
                     loss.div(acc_steps).backward()
@@ -485,7 +514,7 @@ class Trainer:
                         info.update({k: v for out in outputs for k, v in out.items()})
 
                     if rank_zero:
-                        info["k"] = k
+                        info["k"] = out.per_example_l0
 
                         if wandb is not None:
                             wandb.log(info, step=step)
@@ -502,6 +531,15 @@ class Trainer:
             self.save()
 
         pbar.close()
+
+    def get_current_lambda(self) -> float:
+        lmda = 1
+
+        if self.global_step >= self.cfg.lambda_warmup_steps:
+            return lmda
+
+        progress = self.global_step / self.cfg.lambda_warmup_steps
+        return lmda * progress
 
     def local_hookpoints(self) -> list[str]:
         return (

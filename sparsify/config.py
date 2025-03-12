@@ -64,6 +64,9 @@ class TrainConfig(Serializable):
     """Number of steps over which to warm up the learning rate. Only used if
     `optimizer` is `adam`."""
 
+    lambda_warmup_steps: int = 1000
+    """Number of steps over which to warm up the lambda parameter."""
+    
     k_decay_steps: int = 0
     """Number of steps over which to decay the number of active latents. Starts at
     input width * 10 and decays to k. Experimental feature."""
