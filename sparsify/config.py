@@ -85,6 +85,9 @@ class TrainConfig(Serializable):
     hookpoints: list[str] = list_field()
     """List of hookpoints to train sparse coders on."""
 
+    unfreeze_after: int = -1
+    """Number of steps to unfreeze the model after (stay frozen by default)"""
+
     init_seeds: list[int] = list_field(0)
     """List of random seeds to use for initialization. If more than one, train a sparse
     coder for each seed."""

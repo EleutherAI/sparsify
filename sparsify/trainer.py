@@ -143,6 +143,7 @@ class Trainer:
                 ]
             case "signum":
                 from schedulefree import ScheduleFreeWrapper
+                from schedulefree import AdamWScheduleFree
 
                 pgs = [
                     dict(
@@ -153,10 +154,13 @@ class Trainer:
                 ]
                 lrs = [f"{lr:.2e}" for lr in sorted(set(pg["lr"] for pg in pgs))]
 
-                opt = ScheduleFreeWrapper(SignSGD(pgs), momentum=0.95)
-                opt.train()
+                sae_opt = ScheduleFreeWrapper(SignSGD(pgs), momentum=0.95)
+                sae_opt.train()
 
-                self.optimizers = [opt]
+                model_opt = AdamWScheduleFree(self.model.parameters(), lr=2e-4)
+                model_opt.train()
+
+                self.optimizers = [sae_opt, model_opt]
                 self.lr_schedulers = []
             case other:
                 raise ValueError(f"Unknown optimizer '{other}'")
@@ -225,8 +229,8 @@ class Trainer:
         # Use Tensor Cores even for fp32 matmuls
         torch.set_float32_matmul_precision("high")
 
-        # Make sure the model is frozen
-        self.model.requires_grad_(False)
+        # Freeze the model to begin (unless unfreeze_after == 0)
+        self.model.requires_grad_(self.cfg.unfreeze_after == 0)
 
         rank_zero = not dist.is_initialized() or dist.get_rank() == 0
         ddp = dist.is_initialized() and not self.cfg.distribute_modules
@@ -415,6 +419,12 @@ class Trainer:
             sae.cfg.k = k
 
         for batch in dl:
+
+            # # Unfreeze model after certain number of steps
+            # if self.global_step >= self.cfg.unfreeze_after:
+            #     self.model.train()
+            # self.model.requires_grad_(self.global_step >= self.cfg.unfreeze_after)
+
             x = batch["input_ids"].to(device)
 
             if not maybe_wrapped:
@@ -479,7 +489,7 @@ class Trainer:
                     for sae in self.saes.values():
                         sae.remove_gradient_parallel_to_decoder_directions()
 
-                for optimizer in self.optimizers:
+                for optimizer in self.optimizers: # potential issue with model optimizer not being updated correctly - might want to only step after unfreezing
                     optimizer.step()
                     optimizer.zero_grad()
 
