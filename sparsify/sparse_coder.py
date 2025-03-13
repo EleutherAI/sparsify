@@ -22,7 +22,7 @@ lt.monkey_patch()
 
 def rectangle(x):
     """Kernel function for straight-through estimator"""
-    return ((x > -0.5) & (x < 0.5)).to(x.dtype)
+    return ((x > -0.5) & (x < 0.5)).type_as(x)
 
 
 class Step(torch.autograd.Function):
@@ -30,7 +30,7 @@ class Step(torch.autograd.Function):
     Heaviside step function with custom backwards pass for L0 loss
     """
 
-    bandwidth = 0.01 # 0.001 in original
+    bandwidth = 2. # 0.001 in original
 
     @staticmethod
     def forward(ctx, pre_acts, threshold):
@@ -42,7 +42,7 @@ class Step(torch.autograd.Function):
         """
         ctx.save_for_backward(pre_acts, threshold)
 
-        return (pre_acts > threshold).to(pre_acts.dtype)
+        return (pre_acts > threshold).type_as(pre_acts)
 
     @staticmethod
     def backward(ctx, output_grad):
@@ -55,9 +55,10 @@ class Step(torch.autograd.Function):
         pre_acts, threshold = ctx.saved_tensors
 
         # Pseudo-derivative of the Dirac delta component of the Heaviside function
+        rectangle_vals = rectangle((pre_acts - threshold) / Step.bandwidth)
         threshold_grad = torch.sum(
             -(1.0 / Step.bandwidth)
-            * rectangle((pre_acts - threshold) / Step.bandwidth)
+            * rectangle_vals
             * output_grad,
             dim=0
         )
@@ -71,11 +72,11 @@ class JumpReLU(torch.autograd.Function):
     JumpReLU function with custom backwards pass
     """
 
-    bandwidth = 0.01 # 0.001 in original
+    bandwidth = 2. # 0.001 in original
 
     @staticmethod
     def forward(ctx, pre_acts, threshold):
-        mask = (pre_acts > threshold).to(pre_acts.dtype)
+        mask = (pre_acts > threshold).type_as(pre_acts)
         out = pre_acts * mask
 
         ctx.save_for_backward(pre_acts, threshold)
@@ -88,12 +89,13 @@ class JumpReLU(torch.autograd.Function):
         pre_acts, threshold = ctx.saved_tensors
 
         # We don’t apply STE to x input
-        pre_acts_grad = (pre_acts > threshold).to(output_grad.dtype) * output_grad
+        pre_acts_grad = (pre_acts > threshold).type_as(output_grad) * output_grad
 
         # Pseudo-derivative of the Dirac delta component of the JumpRelU function
+        rectangle_vals = rectangle((pre_acts - threshold) / JumpReLU.bandwidth)
         threshold_grad = torch.sum(
             -(threshold / JumpReLU.bandwidth)
-            * rectangle((pre_acts - threshold) / JumpReLU.bandwidth)
+            * rectangle_vals
             * output_grad,
             dim=0
         )
@@ -148,6 +150,9 @@ class SparseCoder(nn.Module):
         self.num_latents = cfg.num_latents or d_in * cfg.expansion_factor
 
         self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
+        # import torch.nn.init as init
+        # init.kaiming_normal_(self.encoder.weight)
+
         self.encoder.bias.data.zero_()
 
         if decoder:
@@ -172,7 +177,8 @@ class SparseCoder(nn.Module):
 
         if self.cfg.activation == "jumprelu":
             self.log_threshold = nn.Parameter(
-                torch.full((self.num_latents,), math.log(0.001), device=device), 
+                # 0.05, and lambda from 1-10 is decent
+                torch.full((self.num_latents,), math.log(0.04), device=device), 
                 requires_grad=True
             )
             self.jump_relu = JumpReLU.apply
