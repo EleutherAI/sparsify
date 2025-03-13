@@ -53,19 +53,17 @@ class Step(torch.autograd.Function):
         """
 
         pre_acts, threshold = ctx.saved_tensors
-        
-        # We don’t apply STE to x input
-        pre_acts_grad = 0.0 * output_grad  
 
         # Pseudo-derivative of the Dirac delta component of the Heaviside function
-        threshold_grad = (
+        threshold_grad = torch.sum(
             -(1.0 / Step.bandwidth)
             * rectangle((pre_acts - threshold) / Step.bandwidth)
-            * output_grad
+            * output_grad,
+            dim=0
         )
 
-        print("threshold_grad in step", threshold_grad.sum(0))
-        return pre_acts_grad, threshold_grad.sum(0)
+        print("threshold_grad in step", threshold_grad)
+        return None, threshold_grad
 
 
 class JumpReLU(torch.autograd.Function):
@@ -93,14 +91,15 @@ class JumpReLU(torch.autograd.Function):
         pre_acts_grad = (pre_acts > threshold).to(output_grad.dtype) * output_grad
 
         # Pseudo-derivative of the Dirac delta component of the JumpRelU function
-        threshold_grad = (
+        threshold_grad = torch.sum(
             -(threshold / JumpReLU.bandwidth)
             * rectangle((pre_acts - threshold) / JumpReLU.bandwidth)
-            * output_grad
+            * output_grad,
+            dim=0
         )
-        print("threshold_grad in jump", threshold_grad.sum(0))
+        print("threshold_grad in jump", threshold_grad)
 
-        return pre_acts_grad, threshold_grad.sum(0)
+        return pre_acts_grad, threshold_grad
                  
 
 
@@ -172,9 +171,8 @@ class SparseCoder(nn.Module):
         )
 
         if self.cfg.activation == "jumprelu":
-            # 0.001 is the default threshold for JumpReLU in the paper
             self.log_threshold = nn.Parameter(
-                torch.full((self.num_latents,), math.log(0.01), device=device), 
+                torch.full((self.num_latents,), math.log(0.001), device=device), 
                 requires_grad=True
             )
             self.jump_relu = JumpReLU.apply

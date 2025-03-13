@@ -24,30 +24,6 @@ from .sparse_coder import SparseCoder
 from .utils import get_layer_list, resolve_widths
 
 
-class DiagnosticOptimizer(torch.optim.Adam):
-    def step(self, closure=None):
-        # Store old parameter values
-        old_values = {}
-        for group in self.param_groups:
-            for p in group['params']:
-                if len(p) == 16384:
-                    old_values[p] = p.data.clone()
-                    break
-        
-        # Call the original step method
-        super().step(closure)
-        
-        # Check which parameters changed and by how much
-        for group in self.param_groups:
-            for p in group['params']:
-                if p in old_values:
-                    diff = (p.data - old_values[p]).norm().item()
-                    print(f"Parameter norm change: {diff:.8f}")
-                    print(f"  Grad: {p.grad}")
-                    print(f"  New value: {p.data}")
-                    print(f"  Old value: {old_values[p]}")
-                    break
-    
 class Trainer:
     def __init__(
         self,
@@ -163,7 +139,7 @@ class Trainer:
                         # we're distributing modules across ranks
                         ddp=not cfg.distribute_modules,
                     ),
-                    DiagnosticOptimizer(params - muon_params, lr=cfg.lr or 2e-3),
+                    torch.optim.Adam(params - muon_params, lr=cfg.lr or 2e-3),
                 ]
                 self.lr_schedulers = [
                     get_linear_schedule_with_warmup(
