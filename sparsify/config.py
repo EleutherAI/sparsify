@@ -54,6 +54,14 @@ class TrainConfig(Serializable):
     micro_acc_steps: int = 1
     """Chunk the activations into this number of microbatches for training."""
 
+    loss_fn: Literal["ce", "fvu", "kl"] = "fvu"
+    """Loss function to use for training the sparse coders.
+
+    - `ce`: Cross-entropy loss of the final model logits.
+    - `fvu`: Fraction of variance explained.
+    - `kl`: KL divergence of the final model logits w.r.t. the original logits.
+    """
+
     optimizer: Literal["adam", "muon", "signum"] = "signum"
     """Optimizer to use."""
 
@@ -98,8 +106,15 @@ class TrainConfig(Serializable):
     wandb_log_frequency: int = 1
 
     def __post_init__(self):
-        assert not (
-            self.layers and self.layer_stride != 1
-        ), "Cannot specify both `layers` and `layer_stride`."
+        """Validate the configuration."""
+        if self.layers and self.layer_stride != 1:
+            raise ValueError("Cannot specify both `layers` and `layer_stride`.")
 
-        assert len(self.init_seeds) > 0, "Must specify at least one random seed."
+        if self.distribute_modules and self.loss_fn in ("ce", "kl"):
+            raise ValueError(
+                "Distributing modules across ranks is not compatible with the "
+                "cross-entropy or KL divergence losses."
+            )
+
+        if not self.init_seeds:
+            raise ValueError("Must specify at least one random seed.")
