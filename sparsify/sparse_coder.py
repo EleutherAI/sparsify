@@ -213,8 +213,10 @@ class SparseCoder(nn.Module):
         # Use TopK activation
         return EncoderOutput(*z.topk(self.cfg.k, sorted=False))
 
-    def encode(self, x: Tensor) -> EncoderOutput:
+    def encode(self, x: Tensor, return_all_acts: bool = False) -> EncoderOutput:
         """Encode the input and select the top-k latents."""
+        if return_all_acts:
+            return self.pre_acts(x)
         return self.select_topk(self.pre_acts(x))
 
     def decode(self, top_acts: Tensor, top_indices: Tensor) -> Tensor:
