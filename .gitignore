@@ -166,5 +166,7 @@ wandb/
 run_all
 trae
 trear
-uv.loc
 sae-ckpts
+/stacked-transcoder
+/sae-ckpts
+/idk
