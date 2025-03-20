@@ -214,4 +214,11 @@ def xformers_embedding_bag(
     weight: Tensor,
     per_sample_weights: Tensor,
 ) -> Tensor:
-    return xFormersEmbeddingBag.apply(indices, weight, per_sample_weights)
+    og_shape = indices.shape
+    if len(og_shape) > 2:
+        indices = indices.flatten(0, -2)
+        per_sample_weights = per_sample_weights.flatten(0, -2)
+    result = xFormersEmbeddingBag.apply(indices, weight, per_sample_weights)
+    if len(og_shape) > 2:
+        result = result.view(*og_shape[:-1], -1)
+    return result
