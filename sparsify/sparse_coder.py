@@ -7,7 +7,7 @@ import einops
 import torch
 from huggingface_hub import snapshot_download
 from natsort import natsorted
-from safetensors.torch import load_model, save_model
+from safetensors.torch import load_file, load_model, save_model
 from torch import Tensor, nn
 
 from .config import SparseCoderConfig
@@ -162,13 +162,24 @@ class SparseCoder(nn.Module):
             cfg = SparseCoderConfig.from_dict(cfg_dict, drop_extra_fields=True)
 
         sae = SparseCoder(d_in, cfg, device=device, decoder=decoder)
-        load_model(
-            model=sae,
-            filename=str(path / "sae.safetensors"),
-            device=str(device),
-            # TODO: Maybe be more fine-grained about this in the future?
-            strict=decoder,
-        )
+        try:
+            load_model(
+                model=sae,
+                filename=str(path / "sae.safetensors"),
+                device=str(device),
+                # TODO: Maybe be more fine-grained about this in the future?
+                strict=decoder,
+            )
+        except RuntimeError as e:
+            if "size mismatch" in str(e):
+                st_file = load_file(str(path / "sae.safetensors"), device=str(device))
+                current_state = sae.state_dict()
+                st_file = {
+                    k: trim(v, current_state[k].shape) for k, v in st_file.items()
+                }
+                sae.load_state_dict(st_file)
+            else:
+                raise
         return sae
 
     def save_to_disk(self, path: Path | str):
@@ -208,30 +219,32 @@ class SparseCoder(nn.Module):
         out = self.encoder(sae_in)
         return nn.functional.relu(out)
 
-    def select_topk(self, z: Tensor) -> EncoderOutput:
+    def select_topk(self, z: Tensor, k: int) -> EncoderOutput:
         """Select the top-k latents."""
 
         # Use GroupMax activation to get the k "top" latents
         if self.cfg.activation == "groupmax":
-            values, indices = z.unflatten(-1, (self.cfg.k, -1)).max(dim=-1)
+            values, indices = z.unflatten(-1, (k, -1)).max(dim=-1)
 
             # torch.max gives us indices into each group, but we want indices into the
             # flattened tensor. Add the offsets to get the correct indices.
             offsets = torch.arange(
-                0, self.num_latents, self.num_latents // self.cfg.k, device=z.device
+                0, self.num_latents, self.num_latents // k, device=z.device
             )
             indices = offsets + indices
             return EncoderOutput(values, indices)
 
         # Use TopK activation
-        return EncoderOutput(*z.topk(self.cfg.k, sorted=False))
+        return EncoderOutput(*z.topk(k, sorted=False))
 
-    def encode(self, x: Tensor) -> EncoderOutput:
+    def encode(self, x: Tensor, k=None) -> EncoderOutput:
         """Encode the input and select the top-k latents."""
+        if k is None:
+            k = self.cfg.k
         if self.cfg.optimized_encoder_config.is_not_none:
             sae_in = self.input_preprocess(x)
-            return self.encoder.topk(sae_in, self.cfg.k)
-        return self.select_topk(self.pre_acts(x))
+            return self.encoder.topk(sae_in, k)
+        return self.select_topk(self.pre_acts(x), k)
 
     def decode(self, top_acts: Tensor, top_indices: Tensor) -> Tensor:
         assert self.W_dec is not None, "Decoder weight was not initialized."
@@ -337,6 +350,28 @@ class SparseCoder(nn.Module):
             self.W_dec.data,
             "d_sae, d_sae d_in -> d_sae d_in",
         )
+
+
+@torch.inference_mode()
+def trim(t: Tensor, shape: tuple[int, ...]) -> Tensor:
+    for i, s in enumerate(shape):
+        if s <= t.shape[i]:
+            t = torch.narrow(t, i, 0, s)
+        else:
+            t = torch.cat(
+                [
+                    t,
+                    torch.zeros(
+                        *t.shape[:i],
+                        s - t.shape[i],
+                        *t.shape[i + 1 :],
+                        device=t.device,
+                        dtype=t.dtype,
+                    ),
+                ],
+                dim=i,
+            )
+    return t
 
 
 # Allow for alternate naming conventions

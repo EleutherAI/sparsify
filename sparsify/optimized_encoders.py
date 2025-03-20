@@ -84,13 +84,14 @@ class PKMLinear(nn.Module):
 
     @torch.compile(mode="max-autotune")
     def forward(self, x):
-        xs = self._weight(x)
-        x1, x2 = xs[..., : self.pkm_base], xs[..., self.pkm_base :]
-        y = (x1[..., :, None] + x2[..., None, :]).flatten(-2)
-        if self.cfg.bias:
-            y += self.bias
-        y = y[..., : self.num_latents]
-        return y
+        # xs = self._weight(x)
+        # x1, x2 = xs[..., : self.pkm_base], xs[..., self.pkm_base :]
+        # y = (x1[..., :, None] + x2[..., None, :]).flatten(-2)
+        # if self.cfg.bias:
+        #     y += self.bias
+        # y = y[..., : self.num_latents]
+        # return y
+        raise NotImplementedError
 
     @torch.compile(mode="max-autotune")
     def topk(self, x, k: int):

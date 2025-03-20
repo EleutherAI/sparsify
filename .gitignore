@@ -162,7 +162,7 @@ cython_debug/
 checkpoints/
 wandb/
 
-/sae-pm
+/sae-pkm
 run_all
 trae
 trear
