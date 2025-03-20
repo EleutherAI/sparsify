@@ -209,9 +209,14 @@ class KroneckerLinear(nn.Module):
         return nn.Parameter(mat @ self.pre.weight, requires_grad=False)
 
 
+class FFFConfig(nn.Module):
+    pass
+
+
 class OptimizedEncoderConfig(Enum):
     PKM = "pkm"
     Kronecker = "kron"
+    FFF = "fff"
     None_ = None
 
     def build_encoder(
@@ -222,6 +227,7 @@ class OptimizedEncoderConfig(Enum):
         dtype: torch.dtype | None,
         pkm_config=None,
         kron_config=None,
+        fff_config=None,
     ) -> nn.Module | None:
         if self is OptimizedEncoderConfig.PKM:
             assert pkm_config is not None
