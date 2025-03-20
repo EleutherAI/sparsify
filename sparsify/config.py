@@ -40,6 +40,9 @@ class SparseCoderConfig(Serializable):
     
     residual_mode: Literal["residual", "separate", "densenet"] = "residual"
     """How to stack the sparse layers."""
+    
+    narrowing: float = 1.0
+    """How much to reduce the expansion factor for subsequent sparse layers."""
 
 
 # Support different naming conventions for the same configuration

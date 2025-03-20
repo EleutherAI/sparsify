@@ -63,8 +63,12 @@ class SparseCoder(nn.Module):
         
         # Create a ModuleList for the encoders
         self.encoders = nn.ModuleList()
-        for _ in range(cfg.num_layers):
-            layer = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
+        for i in range(cfg.num_layers):
+            num_latents = self.num_latents
+            if i > 0:
+                num_latents = int(num_latents * cfg.narrowing)
+                num_latents -= num_latents % 64
+            layer = nn.Linear(d_in, num_latents, device=device, dtype=dtype)
             layer.bias.data.zero_()
             self.encoders.append(layer)
 
