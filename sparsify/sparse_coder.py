@@ -63,7 +63,7 @@ class Step(torch.autograd.Function):
             dim=0
         )
 
-        print("threshold_grad in step", threshold_grad)
+        # print("threshold_grad in step", threshold_grad)
         return None, threshold_grad
 
 
@@ -99,7 +99,7 @@ class JumpReLU(torch.autograd.Function):
             * output_grad,
             dim=0
         )
-        print("threshold_grad in jump", threshold_grad)
+        # print("threshold_grad in jump", threshold_grad)
 
         return pre_acts_grad, threshold_grad
                  
@@ -316,8 +316,8 @@ class SparseCoder(nn.Module):
             y = x
 
         pre_acts = self.pre_acts(x)
-        print("log threshold", self.log_threshold)
-        print("threshold", self.log_threshold.exp())
+        # print("log threshold", self.log_threshold)
+        # print("threshold", self.log_threshold.exp())
 
         acts, did_fire = self.jump_relu(pre_acts, self.log_threshold.exp()) # type: ignore
         
