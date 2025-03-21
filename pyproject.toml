@@ -10,16 +10,21 @@ requires-python = ">=3.10"
 keywords = ["interpretability", "explainable-ai"]
 license = {text = "MIT License"}
 dependencies = [
-    "accelerate",   # For device_map in from_pretrained
+    "accelerate", # For device_map in from_pretrained
     "datasets",
     "einops",
     "huggingface-hub",
-    "natsort",  # For sorting module names
+    "natsort",
+    "numpy<2.0", # For sorting module names
+    "protobuf<3.21",
     "safetensors",
     "schedulefree",
+    "scipy>=1.15.2",
+    "sentencepiece>=0.2.0",
     "simple-parsing",
     "torch",
-    "transformers",
+    "transformers==4.47.1",
+    "wandb>=0.12.16",
 ]
 version = "0.1.0"
 

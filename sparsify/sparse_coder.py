@@ -1,7 +1,7 @@
 import json
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import einops
 import torch
@@ -64,6 +64,7 @@ class SparseCoder(nn.Module):
                 dtype,
                 pkm_config=self.cfg.pkm_config,
                 kron_config=self.cfg.kronecker_config,
+                fff_config=self.cfg.fff_config,
             )
         else:
             self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
@@ -267,7 +268,8 @@ class SparseCoder(nn.Module):
             pre_acts = self.pre_acts(x)
             top_acts, top_indices = self.select_topk(pre_acts)
         else:
-            top_acts, top_indices = self.encode(x)
+            top_acts, top_indices, *aux_loss = self.encode(x)
+            aux_loss = ()
 
         # If we aren't given a distinct target, we're autoencoding
         if y is None:
@@ -306,6 +308,9 @@ class SparseCoder(nn.Module):
             auxk_loss = scale * auxk_loss / total_variance
         else:
             auxk_loss = sae_out.new_tensor(0.0)
+        
+        if len(aux_loss):
+            auxk_loss += aux_loss[0]
 
         l2_loss = e.pow(2).sum()
         fvu = l2_loss / total_variance

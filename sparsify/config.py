@@ -4,7 +4,7 @@ from typing import Literal
 
 from simple_parsing import Serializable, list_field
 
-from .optimized_encoders import KroneckerConfig, OptimizedEncoderConfig, PKMConfig
+from .optimized_encoders import KroneckerConfig, OptimizedEncoderConfig, PKMConfig, FFFConfig
 
 
 @dataclass
@@ -45,6 +45,9 @@ class SparseCoderConfig(Serializable):
 
     kronecker_config: KroneckerConfig = KroneckerConfig()
     """Configuration for the Kronecker encoder."""
+
+    fff_config: FFFConfig = FFFConfig()
+    """Configuration for the Fast Feed-Forward encoder."""
 
 
 # Support different naming conventions for the same configuration
@@ -118,7 +121,7 @@ class TrainConfig(Serializable):
     log_to_wandb: bool = True
     run_name: str | None = None
     wandb_log_frequency: int = 1
-    wandb_project: str = "sparsify"
+    wandb_project: str = "optimized-encoder"
 
     def __post_init__(self):
         """Validate the configuration."""

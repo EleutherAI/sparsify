@@ -371,7 +371,7 @@ class Trainer:
                 if (
                     self.cfg.sae.transcode
                     and self.cfg.sae.optimized_encoder_config
-                    not in (OptimizedEncoderConfig.PKM,)
+                    not in (OptimizedEncoderConfig.PKM, OptimizedEncoderConfig.FFF)
                 ):
                     mean = self.maybe_all_reduce(inputs.mean(0)).to(raw.dtype)
                     mean_image = -mean @ raw.encoder.weight.data.T
