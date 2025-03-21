@@ -576,7 +576,7 @@ class Trainer:
     def save(self):
         """Save the SAEs to disk."""
 
-        path = f'checkpoints/{self.cfg.run_name}' or "checkpoints/unnamed"
+        path = f'{self.cfg.save_dir}/{self.cfg.run_name or "unnamed"}'
         rank_zero = not dist.is_initialized() or dist.get_rank() == 0
 
         for optimizer in self.optimizers:
