@@ -243,11 +243,15 @@ class SparseCoder(nn.Module):
             
             num_examples = pre_acts.shape[0]
             flat_top_acts, flat_top_indices = pre_acts.flatten().topk(total_k, sorted=False)
+            # flat_top_acts = pre_acts.flatten()[:total_k]
+            # flat_top_indices = torch.arange(total_k, device=pre_acts.device)
         
             example_indices = flat_top_indices // pre_acts.shape[1]
             feature_indices = flat_top_indices % pre_acts.shape[1]
             
             match "coo":
+                case "zero":
+                    y_decoded = torch.zeros_like(y)
                 case "pad":
                     padded_indices, padded_acts = create_padded_activations(
                         example_indices, feature_indices, flat_top_acts,
@@ -261,7 +265,7 @@ class SparseCoder(nn.Module):
                                                 num_examples)
                 case "flat":
                     y_decoded = (pre_acts * (pre_acts > flat_top_acts.min())) @ self.W_dec
-            
+            # y_decoded = y_decoded.detach()
             sae_out = y_decoded + self.b_dec
         else:
             top_values, top_indices = self.select_topk(pre_acts)
@@ -375,6 +379,14 @@ def create_padded_activations(
     padded_indices.ravel().scatter_add_(0, example_indices * max_activations_per_example + counts * count_valid, feature_indices * count_valid)
     padded_acts.ravel().scatter_add_(0, example_indices * max_activations_per_example + counts * count_valid, flat_top_acts * count_valid)
     return padded_indices, padded_acts
+
+
+def groupmax(z: Tensor, k: int) -> tuple[Tensor, Tensor]:
+    z = z.unflatten(-1, (k, -1))
+    values, indices = z.max(dim=-1)
+    indices = torch.arange(0, k, device=z.device) * z.shape[-1] + indices
+    return values, indices
+    
 
 
 # Allow for alternate naming conventions

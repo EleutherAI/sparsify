@@ -5,10 +5,27 @@ Copied from https://github.com/openai/sparse_autoencoder/blob/main/sparse_autoen
 import torch
 import triton
 import triton.language as tl
+from functools import partial
 import os
 
 
 TRITON_DEBUG = bool(os.environ.get("TRITON_DEBUG", False))
+
+
+def autotune(fn):
+    return triton.autotune(
+        configs=[
+            triton.Config(kwargs=dict(
+                BLOCK_SIZE_AK=block_size_ak,
+                BLOCK_SIZE_B=block_size_b
+            ))
+            # for block_size_ak in [128, 256, 512, 1024]
+            for block_size_ak in [128, 512, 1024]
+            # for block_size_b in [32, 64, 128, 256, 512]
+            for block_size_b in [64, 128, 256]
+        ],
+        key=["A", "B", "N", "AK"], 
+    )(fn)
 
 
 def triton_sparse_transpose_dense_matmul(
@@ -92,8 +109,8 @@ def triton_coo_sparse_dense_matmul(
         B=B,
         N=N,
         AK=AK,
-        BLOCK_SIZE_AK=BLOCK_SIZE_AK,
-        BLOCK_SIZE_B=BLOCK_SIZE_B,
+        # BLOCK_SIZE_AK=BLOCK_SIZE_AK,
+        # BLOCK_SIZE_B=BLOCK_SIZE_B,
         # flip_indices=flip_indices,
     )
     return out
@@ -105,7 +122,7 @@ def maybe_atomic_add(out_ptr, accum, mask):
     # tl.store(out_ptr, tl.load(out_ptr, mask=mask) + accum, mask=mask)
     # tl.store(out_ptr, accum, mask=mask)
 
-
+@autotune
 @triton.jit
 def triton_sparse_transpose_dense_matmul_kernel(
     coo_indices_ptr,
@@ -436,7 +453,6 @@ def triton_dense_dense_sparseout_matmul_kernel(
     tl.store(out_ptr + pid * K + offsets_k, accum, mask=offsets_k < K)
 
 
-
 def dense_dense_cooout_matmul(
     dense1: torch.Tensor,
     dense2: torch.Tensor,
@@ -457,8 +473,9 @@ def dense_dense_cooout_matmul(
     # assert B < BLOCK_SIZE_B or B % BLOCK_SIZE_B == 0
 
     out = torch.zeros(AK, device=dense1.device, dtype=dense1.dtype)
+    grid = lambda META: (triton.cdiv(AK, META["BLOCK_SIZE_AK"]),)
 
-    triton_dense_dense_cooout_matmul_kernel[(AK // BLOCK_SIZE_AK,)](
+    triton_dense_dense_cooout_matmul_kernel[grid](
         dense1,
         dense2,
         at_indices,
@@ -471,14 +488,15 @@ def dense_dense_cooout_matmul(
         B=B,
         N=N,
         AK=AK,
-        BLOCK_SIZE_AK=BLOCK_SIZE_AK,
-        BLOCK_SIZE_B=BLOCK_SIZE_B,
-        K=triton.cdiv(B, BLOCK_SIZE_B)
+        # BLOCK_SIZE_AK=BLOCK_SIZE_AK,
+        # BLOCK_SIZE_B=BLOCK_SIZE_B,
+        # K=triton.cdiv(B, BLOCK_SIZE_B)
     )
 
     return out
 
 
+@autotune
 @triton.jit
 def triton_dense_dense_cooout_matmul_kernel(
     dense1_ptr,
@@ -495,7 +513,7 @@ def triton_dense_dense_cooout_matmul_kernel(
     AK,
     BLOCK_SIZE_AK: tl.constexpr,
     BLOCK_SIZE_B: tl.constexpr,
-    K
+    # K
 ):
     """
     dense1: shape (A, B)
@@ -503,6 +521,7 @@ def triton_dense_dense_cooout_matmul_kernel(
     at_indices: shape (2, AK)
     out values: shape (AK,)
     """
+    K: tl.constexpr = tl.cdiv(B, BLOCK_SIZE_B)
     
     pid = tl.program_id(0)
 
@@ -589,6 +608,7 @@ class COODecoder(torch.autograd.Function):
             None,
             feature_grad,
             decoder_grad,
+            None,
             None,
         )
 
