@@ -179,7 +179,7 @@ class SparseCoder(nn.Module):
     def encode(self, x: Tensor) -> EncoderOutput:
         """Encode the input and select the top-k latents."""
         if not self.cfg.transcode:
-            x -= self.b_dec
+            x = x - self.b_dec
 
         return fused_encoder(
             x, self.encoder.weight, self.encoder.bias, self.cfg.k, self.cfg.activation

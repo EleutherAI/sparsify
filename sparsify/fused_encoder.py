@@ -3,6 +3,8 @@ from typing import Literal, NamedTuple
 import torch
 import torch.nn.functional as F
 
+from .xformers import embedding_bag_triton
+
 
 class EncoderOutput(NamedTuple):
     top_acts: torch.Tensor
@@ -56,9 +58,7 @@ class FusedEncoder(torch.autograd.Function):
 
         # --- Grad w.r.t. input ---
         if ctx.needs_input_grad[0]:
-            grad_input = F.embedding_bag(
-                indices, weight, per_sample_weights=grad_values, mode="sum"
-            )
+            grad_input = embedding_bag_triton(indices, weight, grad_values)
 
         # --- Grad w.r.t. weight ---
         if ctx.needs_input_grad[1]:
@@ -71,12 +71,14 @@ class FusedEncoder(torch.autograd.Function):
             contributions = contributions.reshape(-1, D)
 
             # Accumulate contributions into the correct rows of grad_weight.
-            grad_weight.index_add_(0, indices.flatten(), contributions)
+            grad_weight.index_add_(0, indices.flatten(), contributions.type_as(weight))
 
         # --- Grad w.r.t. bias ---
         if bias is not None and ctx.needs_input_grad[2]:
             grad_bias = torch.zeros_like(bias)
-            grad_bias.index_add_(0, indices.flatten(), grad_values.flatten())
+            grad_bias.index_add_(
+                0, indices.flatten(), grad_values.flatten().type_as(bias)
+            )
 
         # The k parameter is an int, so return None for its gradient.
         return grad_input, grad_weight, grad_bias, None, None
