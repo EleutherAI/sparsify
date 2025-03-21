@@ -3,8 +3,6 @@ from typing import Literal, NamedTuple
 import torch
 import torch.nn.functional as F
 
-from .xformers import embedding_bag_triton
-
 
 class EncoderOutput(NamedTuple):
     top_acts: torch.Tensor
@@ -58,7 +56,12 @@ class FusedEncoder(torch.autograd.Function):
 
         # --- Grad w.r.t. input ---
         if ctx.needs_input_grad[0]:
-            grad_input = embedding_bag_triton(indices, weight, grad_values)
+            grad_input = F.embedding_bag(
+                indices,
+                weight,
+                mode="sum",
+                per_sample_weights=grad_values.type_as(weight),
+            )
 
         # --- Grad w.r.t. weight ---
         if ctx.needs_input_grad[1]:
@@ -66,7 +69,7 @@ class FusedEncoder(torch.autograd.Function):
             # Compute contributions from each top-k element:
             # computed as grad_values * input for each top-k location.
             contributions = grad_values.unsqueeze(2) * input.unsqueeze(1)
-            N, _, D = contributions.shape
+            _, _, D = contributions.shape
             # Flatten contributions to shape (N*k, D)
             contributions = contributions.reshape(-1, D)
 
