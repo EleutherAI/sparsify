@@ -238,22 +238,14 @@ class SparseCoder(nn.Module):
             y = x
 
         total_k = self.cfg.k * num_examples
-        flat_top_acts, flat_top_indices = pre_acts.flatten().topk(total_k, sorted=False)
-        
-        example_indices = flat_top_indices // pre_acts.shape[1]
-        feature_indices = flat_top_indices % pre_acts.shape[1]
-        
-        unique_examples, counts = torch.unique(example_indices, return_counts=True)
-        max_activations_per_example = counts.max().item()
-        
-        padded_indices = torch.zeros(num_examples, max_activations_per_example, dtype=torch.long, device=pre_acts.device)
-        padded_acts = torch.zeros(num_examples, max_activations_per_example, dtype=pre_acts.dtype, device=pre_acts.device)
-        
-        for count, example_idx in zip(counts, unique_examples):
-            mask = (example_indices == example_idx)
-            
-            padded_indices[example_idx, :count] = feature_indices[mask]
-            padded_acts[example_idx, :count] = flat_top_acts[mask]
+        padded_indices, padded_acts = create_padded_activations(pre_acts, total_k)
+
+        # for count, example_idx in zip(counts, unique_examples):
+        #     mask = (example_indices == example_idx)
+
+        #     count = min(count, max_activations_per_example)            
+        #     padded_indices[example_idx, :count] = feature_indices[mask][:count]
+        #     padded_acts[example_idx, :count] = flat_top_acts[mask][:count]
         
         y_decoded = decoder_impl(padded_indices, padded_acts.to(self.dtype), self.W_dec.mT)
         sae_out = y_decoded + self.b_dec
@@ -265,8 +257,8 @@ class SparseCoder(nn.Module):
         e = y - sae_out
 
         # Used as a denominator for putting everything on a reasonable scale
-        # total_variance = (y - y.mean(0)).pow(2).sum()
-        total_variance = 1
+        total_variance = (y - y.mean(0)).pow(2).sum()
+        # total_variance = 1
 
         # Second decoder pass for AuxK loss
         if dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
@@ -291,10 +283,10 @@ class SparseCoder(nn.Module):
         else:
             auxk_loss = sae_out.new_tensor(0.0)
 
-        fvu = e.pow(2).sum()
+        # fvu = e.pow(2).sum()
 
-        # l2_loss = e.pow(2).sum()
-        # fvu = l2_loss / total_variance
+        l2_loss = e.pow(2).sum()
+        fvu = l2_loss / total_variance
 
         if self.cfg.multi_topk:
             top_acts, top_indices = pre_acts.topk(4 * self.cfg.k, sorted=False)
@@ -336,6 +328,33 @@ class SparseCoder(nn.Module):
             self.W_dec.data,
             "d_sae, d_sae d_in -> d_sae d_in",
         )
+
+
+def create_padded_activations(pre_acts: Tensor, total_k: int) -> tuple[Tensor, Tensor]:
+    num_examples = pre_acts.shape[0]
+    flat_top_acts, flat_top_indices = pre_acts.flatten().topk(total_k, sorted=False)
+    
+    example_indices = flat_top_indices // pre_acts.shape[1]
+    feature_indices = flat_top_indices % pre_acts.shape[1]
+    
+    unique_examples, counts = torch.unique(example_indices, return_counts=True)
+    max_activations_per_example = 128  # counts.max().item()
+    
+    padded_indices = torch.zeros(num_examples, max_activations_per_example, dtype=torch.long, device=pre_acts.device)
+    padded_acts = torch.zeros(num_examples, max_activations_per_example, dtype=pre_acts.dtype, device=pre_acts.device)
+    
+    example_sorting_order = torch.argsort(example_indices, stable=True)
+    reverse_example_sorting_order = torch.argsort(example_sorting_order, stable=True)
+    consecutive_examples = example_indices[example_sorting_order]
+    unique_examples_consecutive, inverse_indices, counts = torch.unique_consecutive(consecutive_examples, return_inverse=True, return_counts=True)
+    counts_cumsum = torch.nn.functional.pad(counts, (1, 0)).cumsum(0)
+    consecutive_examples_sum = torch.arange(len(example_indices), device=example_indices.device)
+    consecutive_examples_sum -= counts_cumsum[inverse_indices]
+    counts = consecutive_examples_sum[reverse_example_sorting_order]
+    count_valid = counts < max_activations_per_example
+    padded_indices.ravel().scatter_add_(0, example_indices * max_activations_per_example + counts * count_valid, feature_indices * count_valid)
+    padded_acts.ravel().scatter_add_(0, example_indices * max_activations_per_example + counts * count_valid, flat_top_acts * count_valid)
+    return padded_indices, padded_acts
 
 
 # Allow for alternate naming conventions
