@@ -10,6 +10,7 @@ from natsort import natsorted
 from safetensors.torch import load_model, save_model
 from torch import Tensor, nn
 
+from .kernels import COODecoder
 from .config import SparseCoderConfig
 from .utils import decoder_impl
 
@@ -237,18 +238,30 @@ class SparseCoder(nn.Module):
         if y is None:
             y = x
 
-        total_k = self.cfg.k * num_examples
-        padded_indices, padded_acts = create_padded_activations(pre_acts, total_k)
-
-        # for count, example_idx in zip(counts, unique_examples):
-        #     mask = (example_indices == example_idx)
-
-        #     count = min(count, max_activations_per_example)            
-        #     padded_indices[example_idx, :count] = feature_indices[mask][:count]
-        #     padded_acts[example_idx, :count] = flat_top_acts[mask][:count]
+        if 1:
+            total_k = self.cfg.k * num_examples
+            
+            num_examples = pre_acts.shape[0]
+            flat_top_acts, flat_top_indices = pre_acts.flatten().topk(total_k, sorted=False)
         
-        y_decoded = decoder_impl(padded_indices, padded_acts.to(self.dtype), self.W_dec.mT)
-        sae_out = y_decoded + self.b_dec
+            example_indices = flat_top_indices // pre_acts.shape[1]
+            feature_indices = flat_top_indices % pre_acts.shape[1]
+            
+            padded_indices, padded_acts = create_padded_activations(
+                example_indices, feature_indices, flat_top_acts,
+                num_examples=num_examples, total_k=total_k,
+                device=pre_acts.device, dtype=pre_acts.dtype
+            )
+            # y_decoded_ = decoder_impl(padded_indices, padded_acts.to(self.dtype), self.W_dec.mT)
+            
+            y_decoded = COODecoder.apply(example_indices, feature_indices,
+                                        flat_top_acts, self.W_dec.mT,
+                                        num_examples)
+            # y_decoded = y_decoded_.detach() + y_decoded_ - y_decoded_.detach()
+            sae_out = y_decoded + self.b_dec
+        else:
+            top_values, top_indices = self.select_topk(pre_acts)
+            sae_out = self.decode(top_values, top_indices)
 
         if self.W_skip is not None:
             sae_out += x.to(self.dtype) @ self.W_skip.mT
@@ -330,18 +343,21 @@ class SparseCoder(nn.Module):
         )
 
 
-def create_padded_activations(pre_acts: Tensor, total_k: int) -> tuple[Tensor, Tensor]:
-    num_examples = pre_acts.shape[0]
-    flat_top_acts, flat_top_indices = pre_acts.flatten().topk(total_k, sorted=False)
-    
-    example_indices = flat_top_indices // pre_acts.shape[1]
-    feature_indices = flat_top_indices % pre_acts.shape[1]
-    
+def create_padded_activations(
+    example_indices: Tensor,
+    feature_indices: Tensor,
+    flat_top_acts: Tensor,
+    *,
+    num_examples: int,
+    total_k: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[Tensor, Tensor]:
     unique_examples, counts = torch.unique(example_indices, return_counts=True)
-    max_activations_per_example = 128  # counts.max().item()
+    max_activations_per_example = int(total_k / num_examples * 2)  # counts.max().item()
     
-    padded_indices = torch.zeros(num_examples, max_activations_per_example, dtype=torch.long, device=pre_acts.device)
-    padded_acts = torch.zeros(num_examples, max_activations_per_example, dtype=pre_acts.dtype, device=pre_acts.device)
+    padded_indices = torch.zeros(num_examples, max_activations_per_example, dtype=torch.long, device=device)
+    padded_acts = torch.zeros(num_examples, max_activations_per_example, dtype=dtype, device=device)
     
     example_sorting_order = torch.argsort(example_indices, stable=True)
     reverse_example_sorting_order = torch.argsort(example_sorting_order, stable=True)
