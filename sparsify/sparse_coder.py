@@ -247,17 +247,21 @@ class SparseCoder(nn.Module):
             example_indices = flat_top_indices // pre_acts.shape[1]
             feature_indices = flat_top_indices % pre_acts.shape[1]
             
-            padded_indices, padded_acts = create_padded_activations(
-                example_indices, feature_indices, flat_top_acts,
-                num_examples=num_examples, total_k=total_k,
-                device=pre_acts.device, dtype=pre_acts.dtype
-            )
-            # y_decoded_ = decoder_impl(padded_indices, padded_acts.to(self.dtype), self.W_dec.mT)
+            match "coo":
+                case "pad":
+                    padded_indices, padded_acts = create_padded_activations(
+                        example_indices, feature_indices, flat_top_acts,
+                        num_examples=num_examples, total_k=total_k,
+                        device=pre_acts.device, dtype=pre_acts.dtype
+                    )
+                    y_decoded = decoder_impl(padded_indices, padded_acts.to(self.dtype), self.W_dec.mT)
+                case "coo":
+                    y_decoded = COODecoder.apply(example_indices, feature_indices,
+                                                flat_top_acts, self.W_dec.mT,
+                                                num_examples)
+                case "flat":
+                    y_decoded = (pre_acts * (pre_acts > flat_top_acts.min())) @ self.W_dec
             
-            y_decoded = COODecoder.apply(example_indices, feature_indices,
-                                        flat_top_acts, self.W_dec.mT,
-                                        num_examples)
-            # y_decoded = y_decoded_.detach() + y_decoded_ - y_decoded_.detach()
             sae_out = y_decoded + self.b_dec
         else:
             top_values, top_indices = self.select_topk(pre_acts)
