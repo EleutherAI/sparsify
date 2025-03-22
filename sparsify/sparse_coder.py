@@ -59,6 +59,7 @@ class SparseCoder(nn.Module):
         if self.cfg.optimized_encoder_config.is_not_none:
             self.encoder = self.cfg.optimized_encoder_config.build_encoder(
                 d_in,
+                cfg.k,
                 self.num_latents,
                 device,
                 dtype,
@@ -250,7 +251,14 @@ class SparseCoder(nn.Module):
     def decode(self, top_acts: Tensor, top_indices: Tensor) -> Tensor:
         assert self.W_dec is not None, "Decoder weight was not initialized."
 
-        y = decoder_impl(top_indices, top_acts.to(self.dtype), self.W_dec.mT)
+        full_decoder = False
+        if top_indices.shape[-1] > 512:
+            if (top_indices == torch.arange(top_indices.shape[-1], device=top_indices.device)).all():
+                full_decoder = True
+        if full_decoder:
+            y = top_acts @ self.W_dec
+        else:
+            y = decoder_impl(top_indices, top_acts.to(self.dtype), self.W_dec.mT)
         return y + self.b_dec
 
     # Wrapping the forward in bf16 autocast improves performance by almost 2x

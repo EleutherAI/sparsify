@@ -216,6 +216,7 @@ class FFFConfig(Serializable):
     reinmax: bool = False
     n_samples: int = 1
     full_fff: bool = False
+    cheating: bool = False
 
 
 class FFFLinear(nn.Module):
@@ -246,35 +247,50 @@ class FFFLinear(nn.Module):
     def forward(self, x):
         raise NotImplementedError
 
-    # @torch.compile
+    # @torch.compile(mode="reduce-overhead")
     def topk(self, x, k: int):
         pre_acts = self._weight(x)
+        # pre_acts = torch.nn.functional.relu(pre_acts)
         
         decisions = self._decisions(x)
         if self.cfg.full_fff:
             assert self.cfg.n_samples == 1, "Full FFF does not support multiple samples."
-            # decisions: tensor of decisions at each tree level
-            decisions = torch.stack([log_sigmoid(decisions), log_sigmoid(-decisions)], dim=-1)
-            probs = torch.zeros(x.shape[:-1] + (self.num_latents,), device=x.device, dtype=x.dtype)
-            for level_width in range(self.n_levels):
-                probs = probs.unflatten(-1, (-1, 2, 2 ** level_width))
-                probs = probs + decisions[..., level_width, None, :, None]
-                probs = probs.flatten(-3, -1)
-            probs = torch.nn.functional.softmax(probs, dim=-1)
+            if not self.cfg.cheating:
+                # decisions: tensor of decisions at each tree level
+                decisions = torch.stack([log_sigmoid(decisions), log_sigmoid(-decisions)], dim=-1)
+                probs = torch.zeros(x.shape[:-1] + (self.num_latents,), device=x.device, dtype=x.dtype)
+                for level_width in range(self.n_levels):
+                    probs = probs.unflatten(-1, (-1, 2, 2 ** level_width))
+                    probs = probs + decisions[..., level_width, None, :, None]
+                    probs = probs.flatten(-3, -1)
+            else:
+                probs = torch.nn.functional.pad(decisions, (0, 1 + self.num_latents // 2), value=-100)
             if self.cfg.reinmax:
                 grouped = probs.unflatten(-1, (self.cfg.fff_k, -1))
-                hard_decisions, soft_decisions = reinmax(grouped, 1.0)
-                indices_per_group = hard_decisions.argmax(-1)
-                decision_values = torch.gather(hard_decisions, -1, indices_per_group.unsqueeze(-1))[..., 0]
-                indices = (
-                    indices_per_group
-                    + torch.arange(0, self.cfg.fff_k,
-                                device=indices_per_group.device,
-                                dtype=indices_per_group.dtype)
-                    * probs.shape[-2]
-                ).flatten(0, -2)
-                return torch.gather(pre_acts, -1, indices) * decision_values, indices
+                hard_decisions, soft_decisions = reinmax(grouped, 1.1)
+                # hard_decisions = torch.nn.functional.gumbel_softmax(grouped, tau=0.1, hard=False,)
+                # hard_decisions = torch.nn.functional.softmax(grouped, dim=-1)
+                # open("sparsities.txt", "a").write(str((
+                #     hard_decisions.sum(dim=-1).mean().item(),
+                #     self.cfg.fff_k, self.num_latents, self.num_latents // self.cfg.fff_k,
+                # )) + "\n")
+                hard_decisions = hard_decisions.flatten(-2, -1)
+                # * hard_decisions, \
+                return pre_acts * hard_decisions, \
+                    torch.arange(0, self.num_latents, device=x.device, dtype=torch.int32)[None, :].expand(x.shape[:-1] + (self.num_latents,))
+                # indices_per_group = hard_decisions.argmax(-1)
+                # decision_values = torch.gather(hard_decisions, -1, indices_per_group.unsqueeze(-1))[..., 0]
+                # indices = (
+                #     indices_per_group
+                #     + torch.arange(0, self.cfg.fff_k,
+                #                 device=indices_per_group.device,
+                #                 dtype=indices_per_group.dtype)
+                #     * probs.shape[-2]
+                # ).flatten(0, -2)
+                # print(indices.max(), pre_acts.shape[-1])
+                # return torch.gather(pre_acts, -1, indices) * decision_values, indices
             else:
+                probs = torch.nn.functional.softmax(probs, dim=-1)
                 values, indices = groupmax_random(probs, k)
                 return torch.gather(pre_acts, -1, indices) * values, indices
         else:
@@ -465,6 +481,7 @@ class OptimizedEncoderConfig(Enum):
     def build_encoder(
         self,
         d_in: int,
+        k: int,
         num_latents: int,
         device: str | torch.device,
         dtype: torch.dtype | None,
@@ -481,7 +498,7 @@ class OptimizedEncoderConfig(Enum):
         elif self is OptimizedEncoderConfig.FFF:
             assert fff_config is not None
             if fff_config.fff_k is None:
-                fff_config = replace(fff_config, fff_k=num_latents)
+                fff_config = replace(fff_config, fff_k=k)
             return FFFLinear(d_in, num_latents, device, dtype, cfg=fff_config)
         elif self is OptimizedEncoderConfig.None_:
             raise ValueError("No encoder specified.")
