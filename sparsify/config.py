@@ -34,6 +34,9 @@ class SparseCoderConfig(Serializable):
 
     transcode: bool = False
     """Whether we want to predict the output of a module given its input."""
+    
+    post_neurons: int = 0
+    """Number of neurons in the post-activation layer. If 0, don't use a post-activation layer."""
 
 
 # Support different naming conventions for the same configuration

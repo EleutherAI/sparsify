@@ -64,6 +64,11 @@ class SparseCoder(nn.Module):
                     self.set_decoder_norm_to_unit_norm()
         else:
             self.W_dec = None
+        
+        if cfg.post_neurons:
+            self.post_enc1 = nn.Linear(self.d_in, cfg.post_neurons, device=device, dtype=dtype)
+            self.post_enc2 = nn.Linear(self.d_in, cfg.post_neurons, device=device, dtype=dtype)
+            self.post_dec = nn.Linear(cfg.post_neurons, self.d_in, device=device, dtype=dtype)
 
         self.b_dec = nn.Parameter(torch.zeros(d_in, dtype=dtype, device=device))
         self.W_skip = (
@@ -189,7 +194,10 @@ class SparseCoder(nn.Module):
         assert self.W_dec is not None, "Decoder weight was not initialized."
 
         y = decoder_impl(top_indices, top_acts.to(self.dtype), self.W_dec.mT)
-        return y + self.b_dec
+        decoded = y + self.b_dec
+        if self.cfg.post_neurons:
+            decoded = decoded + self.post_dec(self.post_enc1(decoded) * self.post_enc2(decoded))
+        return decoded
 
     # Wrapping the forward in bf16 autocast improves performance by almost 2x
     @torch.autocast(
