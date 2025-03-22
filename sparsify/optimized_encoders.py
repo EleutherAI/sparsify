@@ -215,6 +215,7 @@ class FFFConfig(Serializable):
     fff_k: Optional[int] = None
     reinmax: bool = False
     n_samples: int = 1
+    full_fff: bool = False
 
 
 class FFFLinear(nn.Module):
@@ -232,48 +233,87 @@ class FFFLinear(nn.Module):
         self.d_in = d_in
         self.num_latents = num_latents
         self._weight = nn.Linear(d_in, num_latents, device=device, dtype=dtype)
-        self.n_decisions = int(math.log2(num_latents // cfg.fff_k))
-        self._decisions = nn.Linear(d_in, self.n_decisions * cfg.fff_k, device=device, dtype=dtype)
+        if cfg.full_fff:
+            self.n_levels = int(math.log2(num_latents)) - 1
+            self.n_decisions = 2 ** self.n_levels - 1
+            self._decisions = nn.Linear(d_in, self.n_decisions, device=device, dtype=dtype)
+            assert num_latents == 2 ** (self.n_levels + 1), \
+                f"Number of latents must be a power of 2 ({2 ** (self.n_levels+1)}), got {num_latents}"
+        else:
+            self.n_decisions = int(math.log2(num_latents // cfg.fff_k))
+            self._decisions = nn.Linear(d_in, self.n_decisions * cfg.fff_k, device=device, dtype=dtype)
 
     def forward(self, x):
         raise NotImplementedError
 
-    @torch.compile
+    # @torch.compile
     def topk(self, x, k: int):
         pre_acts = self._weight(x)
         
-        decisions = self._decisions(x).unflatten(-1, (self.cfg.fff_k, self.n_decisions))
-        decisions = expand_probabilities(torch.nn.LogSigmoid()(decisions))
-        if self.cfg.reinmax:
-            if self.cfg.n_samples > 1:
-                raise ValueError("Reinmax does not support multiple samples.")
-            aux_loss = 0.0  # -(decisions.exp() * decisions).sum(-1).mean()
-            hard_decisions, soft_decisions = reinmax(decisions, 1.0)
-            indices_per_group = hard_decisions.argmax(-1)
-            decision_values = torch.gather(hard_decisions * soft_decisions, -1, indices_per_group.unsqueeze(-1))[..., 0]
-            indices = (
-                indices_per_group
-                + torch.arange(0, k,
-                            device=indices_per_group.device,
-                            dtype=indices_per_group.dtype)
-                * decisions.shape[-2]
-            ).flatten(0, -2)
-            return torch.gather(pre_acts, -1, indices) * decision_values, indices, aux_loss
+        decisions = self._decisions(x)
+        if self.cfg.full_fff:
+            assert self.cfg.n_samples == 1, "Full FFF does not support multiple samples."
+            # decisions: tensor of decisions at each tree level
+            decisions = torch.stack([log_sigmoid(decisions), log_sigmoid(-decisions)], dim=-1)
+            probs = torch.zeros(x.shape[:-1] + (self.num_latents,), device=x.device, dtype=x.dtype)
+            for level_width in range(self.n_levels):
+                probs = probs.unflatten(-1, (-1, 2, 2 ** level_width))
+                probs = probs + decisions[..., level_width, None, :, None]
+                probs = probs.flatten(-3, -1)
+            probs = torch.nn.functional.softmax(probs, dim=-1)
+            if self.cfg.reinmax:
+                grouped = probs.unflatten(-1, (self.cfg.fff_k, -1))
+                hard_decisions, soft_decisions = reinmax(grouped, 1.0)
+                indices_per_group = hard_decisions.argmax(-1)
+                decision_values = torch.gather(hard_decisions, -1, indices_per_group.unsqueeze(-1))[..., 0]
+                indices = (
+                    indices_per_group
+                    + torch.arange(0, self.cfg.fff_k,
+                                device=indices_per_group.device,
+                                dtype=indices_per_group.dtype)
+                    * probs.shape[-2]
+                ).flatten(0, -2)
+                return torch.gather(pre_acts, -1, indices) * decision_values, indices
+            else:
+                values, indices = groupmax_random(probs, k)
+                return torch.gather(pre_acts, -1, indices) * values, indices
         else:
-            all_values, all_indices = [], []
-            for _ in range(self.cfg.n_samples):
-                decision_values, indices = groupmax_random(decisions.flatten(-2), k)
-                values = torch.gather(pre_acts, -1, indices) * decision_values.exp()
-                all_values.append(values)
-                all_indices.append(indices)
-            aux_loss = 0.0
-            values = torch.cat(all_values, dim=-1)
-            indices = torch.cat(all_indices, dim=-1)
-            return values, indices, aux_loss
+            decisions = decisions.unflatten(-1, (self.cfg.fff_k, self.n_decisions))
+            decisions = expand_probabilities(torch.nn.LogSigmoid()(decisions))
+            if self.cfg.reinmax:
+                if self.cfg.n_samples > 1:
+                    raise ValueError("Reinmax does not support multiple samples.")
+                aux_loss = 0.0  # -(decisions.exp() * decisions).sum(-1).mean()
+                hard_decisions, soft_decisions = reinmax(decisions, 1.0)
+                indices_per_group = hard_decisions.argmax(-1)
+                decision_values = torch.gather(hard_decisions * soft_decisions, -1, indices_per_group.unsqueeze(-1))[..., 0]
+                indices = (
+                    indices_per_group
+                    + torch.arange(0, k,
+                                device=indices_per_group.device,
+                                dtype=indices_per_group.dtype)
+                    * decisions.shape[-2]
+                ).flatten(0, -2)
+                return torch.gather(pre_acts, -1, indices) * decision_values, indices, aux_loss
+            else:
+                all_values, all_indices = [], []
+                for _ in range(self.cfg.n_samples):
+                    decision_values, indices = groupmax_random(decisions.flatten(-2), k)
+                    values = torch.gather(pre_acts, -1, indices) * decision_values.exp()
+                    all_values.append(values)
+                    all_indices.append(indices)
+                aux_loss = 0.0
+                values = torch.cat(all_values, dim=-1)
+                indices = torch.cat(all_indices, dim=-1)
+                return values, indices, aux_loss
 
     @property
     def weight(self):
         return self._weight.weight
+
+
+def log_sigmoid(x):
+    return torch.nn.LogSigmoid()(x)
 
 
 def expand_probabilities(probs):
