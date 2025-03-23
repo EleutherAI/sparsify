@@ -1,7 +1,7 @@
 import math
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Optional
+from typing import Optional, Literal
 
 import torch
 import torch.nn as nn
@@ -213,10 +213,12 @@ class KroneckerLinear(nn.Module):
 @dataclass
 class FFFConfig(Serializable):
     fff_k: Optional[int] = None
-    reinmax: bool = False
+    gradients: Literal["ste", "reinmax", "gumbel", "almost_gumbel"] = "ste"
     n_samples: int = 1
+    binarize: bool = False
     full_fff: bool = False
     cheating: bool = False
+    temperature: float = 0.3
 
 
 class FFFLinear(nn.Module):
@@ -235,11 +237,14 @@ class FFFLinear(nn.Module):
         self.num_latents = num_latents
         self._weight = nn.Linear(d_in, num_latents, device=device, dtype=dtype)
         if cfg.full_fff:
-            self.n_levels = int(math.log2(num_latents)) - 1
-            self.n_decisions = 2 ** self.n_levels - 1
-            self._decisions = nn.Linear(d_in, self.n_decisions, device=device, dtype=dtype)
-            assert num_latents == 2 ** (self.n_levels + 1), \
-                f"Number of latents must be a power of 2 ({2 ** (self.n_levels+1)}), got {num_latents}"
+            if cfg.cheating:
+                self._decisions = nn.Linear(d_in, num_latents, device=device, dtype=dtype)
+            else:
+                self.n_levels = int(math.log2(num_latents // cfg.fff_k)) - 1
+                self.n_decisions = 2 ** self.n_levels - 1
+                self._decisions = nn.Linear(d_in, cfg.fff_k * self.n_decisions, device=device, dtype=dtype)
+                assert num_latents // cfg.fff_k == 2 ** (self.n_levels + 1), \
+                    f"Number of latents per k must be a power of 2 ({2 ** (self.n_levels+1)}), got {num_latents}"
         else:
             self.n_decisions = int(math.log2(num_latents // cfg.fff_k))
             self._decisions = nn.Linear(d_in, self.n_decisions * cfg.fff_k, device=device, dtype=dtype)
@@ -249,50 +254,54 @@ class FFFLinear(nn.Module):
 
     # @torch.compile(mode="reduce-overhead")
     def topk(self, x, k: int):
-        pre_acts = self._weight(x)
+        if not self.cfg.binarize:
+            pre_acts = self._weight(x)
         # pre_acts = torch.nn.functional.relu(pre_acts)
         
         decisions = self._decisions(x)
         if self.cfg.full_fff:
             assert self.cfg.n_samples == 1, "Full FFF does not support multiple samples."
             if not self.cfg.cheating:
-                # decisions: tensor of decisions at each tree level
+                decisions = decisions.unflatten(-1, (self.cfg.fff_k, self.n_decisions))
                 decisions = torch.stack([log_sigmoid(decisions), log_sigmoid(-decisions)], dim=-1)
-                probs = torch.zeros(x.shape[:-1] + (self.num_latents,), device=x.device, dtype=x.dtype)
+                probs = torch.zeros(x.shape[:-1] + (self.cfg.fff_k, self.num_latents // self.cfg.fff_k), device=x.device, dtype=x.dtype)
                 for level_width in range(self.n_levels):
                     probs = probs.unflatten(-1, (-1, 2, 2 ** level_width))
                     probs = probs + decisions[..., level_width, None, :, None]
                     probs = probs.flatten(-3, -1)
             else:
-                probs = torch.nn.functional.pad(decisions, (0, 1 + self.num_latents // 2), value=-100)
-            if self.cfg.reinmax:
-                grouped = probs.unflatten(-1, (self.cfg.fff_k, -1))
-                hard_decisions, soft_decisions = reinmax(grouped, 1.1)
-                # hard_decisions = torch.nn.functional.gumbel_softmax(grouped, tau=0.1, hard=False,)
-                # hard_decisions = torch.nn.functional.softmax(grouped, dim=-1)
-                # open("sparsities.txt", "a").write(str((
-                #     hard_decisions.sum(dim=-1).mean().item(),
-                #     self.cfg.fff_k, self.num_latents, self.num_latents // self.cfg.fff_k,
-                # )) + "\n")
+                probs = decisions.unflatten(-1, (self.cfg.fff_k, self.num_latents // self.cfg.fff_k))
+            if self.cfg.gradients in ("reinmax", "gumbel"):
+                if self.cfg.gradients == "reinmax":
+                    hard_decisions, soft_decisions = reinmax(probs, 1.0 + self.cfg.temperature)
+                elif self.cfg.gradients == "gumbel":
+                    hard_decisions = torch.nn.functional.gumbel_softmax(probs, tau=self.cfg.temperature, hard=True)
+                else:
+                    raise ValueError(f"Unknown gradient estimator {self.cfg.gradients}")
                 hard_decisions = hard_decisions.flatten(-2, -1)
-                # * hard_decisions, \
-                return pre_acts * hard_decisions, \
+                if not self.cfg.binarize:
+                    values = pre_acts * hard_decisions
+                else:
+                    values = hard_decisions
+                return values, \
                     torch.arange(0, self.num_latents, device=x.device, dtype=torch.int32)[None, :].expand(x.shape[:-1] + (self.num_latents,))
-                # indices_per_group = hard_decisions.argmax(-1)
-                # decision_values = torch.gather(hard_decisions, -1, indices_per_group.unsqueeze(-1))[..., 0]
-                # indices = (
-                #     indices_per_group
-                #     + torch.arange(0, self.cfg.fff_k,
-                #                 device=indices_per_group.device,
-                #                 dtype=indices_per_group.dtype)
-                #     * probs.shape[-2]
-                # ).flatten(0, -2)
-                # print(indices.max(), pre_acts.shape[-1])
-                # return torch.gather(pre_acts, -1, indices) * decision_values, indices
-            else:
+            elif self.cfg.gradients == "almost_gumbel":
+                hard_decisions = torch.nn.functional.gumbel_softmax(probs, tau=self.cfg.temperature, hard=True)
+                probify = lambda probs: probs.flatten(-2, -1).topk(k * 2, dim=-1)[1]
+                indices = torch.cat([probify(probs), probify(-probs)], dim=-1)
+                # indices = torch.randn_like(probs).flatten(-2, -1).topk(k * 4, dim=-1)[1]
+                values = torch.gather(pre_acts, -1, indices) * torch.gather(hard_decisions.flatten(-2, -1), -1, indices)
+                return values, indices
+                # decvision_values, decision_indices = hard_decisions.max(-1)
+                # decision_indices = decision_indices + \
+                #     torch.arange(0, self.cfg.fff_k, device=decision_indices.device, dtype=decision_indices.dtype) * probs.shape[-1]
+                # return torch.gather(pre_acts, -1, decision_indices) * decvision_values, decision_indices
+            elif self.cfg.gradients == "ste":
                 probs = torch.nn.functional.softmax(probs, dim=-1)
                 values, indices = groupmax_random(probs, k)
                 return torch.gather(pre_acts, -1, indices) * values, indices
+            else:
+                raise ValueError(f"Unknown gradient estimator {self.cfg.gradients}")
         else:
             decisions = decisions.unflatten(-1, (self.cfg.fff_k, self.n_decisions))
             decisions = expand_probabilities(torch.nn.LogSigmoid()(decisions))
