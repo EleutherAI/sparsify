@@ -286,6 +286,9 @@ class Trainer:
         avg_auxk_loss = defaultdict(float)
         avg_fvu = defaultdict(float)
         avg_multi_topk_fvu = defaultdict(float)
+        has_post_neurons = self.cfg.sae.post_neurons > 0
+        if has_post_neurons:
+            avg_post_l1 = defaultdict(float)
 
         input_dict: dict[str, Tensor] = {}
         output_dict: dict[str, Tensor] = {}
@@ -397,11 +400,16 @@ class Trainer:
                         avg_multi_topk_fvu[name] += float(
                             self.maybe_all_reduce(out.multi_topk_fvu.detach()) / denom
                         )
+                    if has_post_neurons:
+                        avg_post_l1[name] += float(  # type: ignore
+                            self.maybe_all_reduce(out.post_l1.detach()) / denom
+                        )
 
                     loss = (
                         out.fvu
                         + self.cfg.auxk_alpha * out.auxk_loss
                         + out.multi_topk_fvu / 8
+                        + self.cfg.sae.post_l1_alpha * out.post_l1
                     )
                     loss.div(acc_steps).backward()
 
@@ -463,10 +471,14 @@ class Trainer:
                             info[f"auxk/{name}"] = avg_auxk_loss[name]
                         if self.cfg.sae.multi_topk:
                             info[f"multi_topk_fvu/{name}"] = avg_multi_topk_fvu[name]
+                        if has_post_neurons:
+                            info[f"post_l1/{name}"] = avg_post_l1[name]
 
                     avg_auxk_loss.clear()
                     avg_fvu.clear()
                     avg_multi_topk_fvu.clear()
+                    if has_post_neurons:
+                        avg_post_l1.clear()
 
                     if self.cfg.distribute_modules:
                         outputs = [{} for _ in range(dist.get_world_size())]

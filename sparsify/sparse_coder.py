@@ -12,6 +12,7 @@ from torch import Tensor, nn
 
 from .config import SparseCoderConfig
 from .fused_encoder import EncoderOutput, fused_encoder
+from .kernels import dense_dense_cooout_matmul
 from .utils import decoder_impl
 
 
@@ -32,6 +33,9 @@ class ForwardOutput(NamedTuple):
 
     multi_topk_fvu: Tensor
     """Multi-TopK FVU, if applicable."""
+    
+    post_l1: Tensor
+    """L1 regularization for the post-activation layer, if applicable."""
 
 
 class SparseCoder(nn.Module):
@@ -256,6 +260,24 @@ class SparseCoder(nn.Module):
             multi_topk_fvu = (sae_out - y).pow(2).sum() / total_variance
         else:
             multi_topk_fvu = sae_out.new_tensor(0.0)
+        
+        if self.cfg.post_neurons > 0:
+            batch_size = top_indices.numel()
+            feature_indices = torch.randint(0, self.num_latents, (batch_size,), device=top_indices.device)
+            neuron1_indices = torch.randint(0, self.cfg.post_neurons, (batch_size,), device=top_indices.device)
+            neuron2_indices = torch.randint(0, self.cfg.post_neurons, (batch_size,), device=top_indices.device)
+            products_enc1 = dense_dense_cooout_matmul(
+                self.W_dec, self.post_enc1.weight.mT, torch.stack([feature_indices, neuron1_indices])
+            ).float()
+            products_enc2 = dense_dense_cooout_matmul(
+                self.W_dec, self.post_enc2.weight.mT, torch.stack([feature_indices, neuron2_indices])
+            ).float()
+            dec_norms = self.post_dec.weight.norm(dim=0)
+            post_dec1_norms = dec_norms[neuron1_indices]
+            post_dec2_norms = dec_norms[neuron2_indices]
+            post_l1 = (products_enc1 * post_dec1_norms).abs().mean() + (products_enc2 * post_dec2_norms).abs().mean()
+        else:
+            post_l1 = sae_out.new_tensor(0.0)
 
         return ForwardOutput(
             sae_out,
@@ -264,6 +286,7 @@ class SparseCoder(nn.Module):
             fvu,
             auxk_loss,
             multi_topk_fvu,
+            post_l1
         )
 
     @torch.no_grad()

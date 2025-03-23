@@ -37,6 +37,9 @@ class SparseCoderConfig(Serializable):
     
     post_neurons: int = 0
     """Number of neurons in the post-activation layer. If 0, don't use a post-activation layer."""
+    
+    post_l1_alpha: float = 0
+    """L1 regularization strength for the post-activation layer."""
 
 
 # Support different naming conventions for the same configuration
