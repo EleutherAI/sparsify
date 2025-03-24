@@ -12,12 +12,6 @@ from safetensors.torch import load_model, save_model
 from torch import Tensor, nn
 
 from .config import SparseCoderConfig
-# from .step import Step, JumpReLU
-
-import torch
-
-import lovely_tensors as lt
-lt.monkey_patch()
 
 
 def rectangle(x):
@@ -63,7 +57,6 @@ class Step(torch.autograd.Function):
             dim=0
         )
 
-        # print("threshold_grad in step", threshold_grad)
         return None, threshold_grad
 
 
@@ -99,8 +92,6 @@ class JumpReLU(torch.autograd.Function):
             * output_grad,
             dim=0
         )
-        # print("threshold_grad in jump", threshold_grad)
-
         return pre_acts_grad, threshold_grad
                  
 
@@ -325,6 +316,8 @@ class SparseCoder(nn.Module):
         l0_loss = (per_example_l0 / self.cfg.k - 1).pow(2).sum()
 
         sae_out = self.jump_decode(acts)
+        if self.W_skip is not None:
+            sae_out += x.to(self.dtype) @ self.W_skip.mT
 
         # Compute the residual
         e = y - sae_out
@@ -332,41 +325,43 @@ class SparseCoder(nn.Module):
         # Used as a denominator for putting everything on a reasonable scale
         total_variance = (y - y.mean(0)).pow(2).sum()
 
-        # Second decoder pass for AuxK loss
-        # if dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
-        #     # Heuristic from Appendix B.1 in the paper
-        #     k_aux = y.shape[-1] // 2
+        if self.cfg.activation != "jumprelu":
+            # Second decoder pass for AuxK loss
+            if dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
+                # Heuristic from Appendix B.1 in the paper
+                k_aux = y.shape[-1] // 2
 
-        #     # Reduce the scale of the loss if there are a small number of dead latents
-        #     scale = min(num_dead / k_aux, 1.0)
-        #     k_aux = min(k_aux, num_dead)
+                # Reduce the scale of the loss if there are a small number of dead latents
+                scale = min(num_dead / k_aux, 1.0)
+                k_aux = min(k_aux, num_dead)
 
-        #     # Don't include living latents in this loss
-        #     auxk_latents = torch.where(dead_mask[None], pre_acts, -torch.inf)
+                # Don't include living latents in this loss
+                auxk_latents = torch.where(dead_mask[None], pre_acts, -torch.inf)
 
-        #     # Top-k dead latents
-        #     auxk_acts, auxk_indices = auxk_latents.topk(k_aux, sorted=False)
+                # Top-k dead latents
+                auxk_acts, auxk_indices = auxk_latents.topk(k_aux, sorted=False)
 
-        #     # Encourage the top ~50% of dead latents to predict the residual of the
-        #     # top k living latents
-        #     e_hat = self.decode(auxk_acts, auxk_indices)
-        #     auxk_loss = (e_hat - e).pow(2).sum()
-        #     auxk_loss = scale * auxk_loss / total_variance
-        # else:
-        auxk_loss = sae_out.new_tensor(0.0)
+                # Encourage the top ~50% of dead latents to predict the residual of the
+                # top k living latents
+                e_hat = self.decode(auxk_acts, auxk_indices)
+                auxk_loss = (e_hat - e).pow(2).sum()
+                auxk_loss = scale * auxk_loss / total_variance
+            else:
+                auxk_loss = sae_out.new_tensor(0.0)
+        else:
+            auxk_loss = sae_out.new_tensor(0.0)
 
         l2_loss = e.pow(2).sum()
         fvu = l2_loss / total_variance
 
-        # if self.cfg.multi_topk:
-        #     raise NotImplementedError("Not implemented")
-            # assert not self.cfg.activation == "jumprelu", "Multi-TopK is not supported for JumpReLU."
-            # top_acts, top_indices = pre_acts.topk(4 * self.cfg.k, sorted=False)
-            # sae_out = self.decode(top_acts, top_indices)
+        if self.cfg.multi_topk:
+            assert not self.cfg.activation == "jumprelu", "Multi-TopK is not supported for JumpReLU."
+            top_acts, top_indices = pre_acts.topk(4 * self.cfg.k, sorted=False)
+            sae_out = self.decode(top_acts, top_indices)
 
-            # multi_topk_fvu = (sae_out - y).pow(2).sum() / total_variance
-        # else:
-        multi_topk_fvu = sae_out.new_tensor(0.0)
+            multi_topk_fvu = (sae_out - y).pow(2).sum() / total_variance
+        else:
+            multi_topk_fvu = sae_out.new_tensor(0.0)
 
         return ForwardOutput(
             sae_out,

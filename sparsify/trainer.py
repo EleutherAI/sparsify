@@ -320,9 +320,9 @@ class Trainer:
             if self.cfg.sae.transcode:
                 input_dict[name] = inputs.flatten(0, 1)
 
-        # k = self.get_current_k()
-        # for name, sae in self.saes.items():
-        #     sae.cfg.k = k
+        k = self.get_current_k()
+        for name, sae in self.saes.items():
+            sae.cfg.k = k
 
         for batch in dl:
             input_dict.clear()
@@ -359,16 +359,19 @@ class Trainer:
                 if self.cfg.sae.activation == "jumprelu":
                     # normalize activations to mean squared L2 norm of 1
                     scaling_factor = torch.rsqrt(inputs.pow(2).sum(-1).mean(0))
-                    # TODO use correct scaling factor for outputs when transcoding
+                    # TODO test using one scaling factor for both inputs and outputs when transcoding
                     inputs = inputs * scaling_factor
+
+                    if self.cfg.sae.transcode:
+                        scaling_factor = torch.rsqrt(outputs.pow(2).sum(-1).mean(0))
+                    
                     outputs = outputs * scaling_factor
 
-                    # print("mean squared l2 norm: ", torch.mean(torch.norm(inputs, dim=-1)**2))
-
-                # On the first iteration, initialize the decoder bias
-                # if self.global_step == 0:
-                    # mean = self.maybe_all_reduce(outputs.mean(0))
-                    # raw.b_dec.data = mean.to(raw.dtype)
+                if not self.cfg.sae.activation == "jumprelu":
+                    # On the first iteration, initialize the decoder bias
+                    if self.global_step == 0:
+                        mean = self.maybe_all_reduce(outputs.mean(0))
+                        raw.b_dec.data = mean.to(raw.dtype)
 
                 if not maybe_wrapped:
                     # Wrap the SAEs with Distributed Data Parallel. We have to do this
@@ -429,15 +432,13 @@ class Trainer:
             # Check if we need to actually do a training step
             step, substep = divmod(self.global_step + 1, self.cfg.grad_acc_steps)
             if substep == 0:
-                # if (
-                #     self.cfg.sae.normalize_decoder
-                #     and not self.cfg.sae.transcode
-                # ):
-                    # for sae in self.saes.values():
-                        # sae.remove_gradient_parallel_to_decoder_directions()
-
-                # for name, sae in self.saes.items():
-                    # torch.nn.utils.clip_grad_norm_(sae.parameters(), 1)
+                if (
+                    self.cfg.sae.normalize_decoder
+                    and not self.cfg.sae.transcode
+                    and not self.cfg.sae.activation == "jumprelu"
+                ):
+                    for sae in self.saes.values():
+                        sae.remove_gradient_parallel_to_decoder_directions()
 
                 for optimizer in self.optimizers:
                     optimizer.step()
@@ -446,9 +447,9 @@ class Trainer:
                 for scheduler in self.lr_schedulers:
                     scheduler.step()
 
-                # k = self.get_current_k()
-                # for name, sae in self.saes.items():
-                    # sae.cfg.k = k
+                k = self.get_current_k()
+                for name, sae in self.saes.items():
+                    sae.cfg.k = k
 
                 ###############
                 with torch.no_grad():
@@ -515,37 +516,9 @@ class Trainer:
 
         pbar.close()
 
-    # EXPERIMENT LOG
-    # All with bandwidth 0.01
-    # 9 0.1 muon?
-    # 15 0.1 adam threshold 0.02
-    # 15 0.1 adam threshold 0.04 causes a much lower starting k and a lower steady k, around 120
-    # 15 0.1 adam threshold 0.06 decays past 32, to around 28 and continuin
-    # 15 0.1 adam threshold 0.6 lr 7e-5, delays past 32 to around 27.5 and maybe continuin
-    # 15 0.1 adam threshold 0.2 lr 7e-5, decays extremely slowly
-    # 100 0.1 adam threshold 0.2 lr 7e-5, decays extremely slowly
-    # 100 0.1 adam threshold 0.01 lr 7e-5, with bandwidth 0.001, decays moderately slowly to 126 and continuing
-    # 100 0.1 adam threshold 0.01 lr 7e-5, with bandwidth 0.001 and gradient clipping @ 1, dogshit with barely any k decay
-    # 100 0.1 adam threshold 0.01 lr 7e-5, with bandwidth 2, honestly kind of decent, decays to 117 and continuing
-    # 100 0.1 adam threshold 0.01 lr 7e-5, with bandwidth 2, honestly kind of decent, decays to 117 and continuing
-    # didn't change anything except to -> type_as, was fine
-    # 100 0.1 adam threshold 0.04 lr 7e-5, with bandwidth 2 and decoder normalization removed, performing pretty well
-    # 100 0.1 adam threshold 0.04 lr 7e-5, with bandwidth 2 and decoder normalization removed and bias to mean removed, better, decays to 51 and continuing
-    # 100 0.1 adam threshold 0.04 lr 7e-5, with bandwidth 2 and decoder normalization removed and bias to mean remove
-    # and orthogonal grad removal removed, it made fvu and k higher. i probably want to add it back
-    # adding back decoder initialization because actually the paper does call for it: TODO (used signum by accident, was good)
-    # same as prev but using the kaiming init used in SAELens (the paper doesn't specify any particular initialization scheme): TODO
-    # I'm getting so tired that when I re-inited these runs with adam I didn't edit any code so I guess they're probably the same thing - both mods
-    # The signum run pre-kaiming is honestly looking really nice right about now, super duper fvu drop to 0.14 immediately and k around 36, not bad at all
-    # the two identical runs with kaiming etc. are bad, worst fvu and pretty high k. kaiming is absolute garbage
-    # removing kaiming.: TODO: does the trick and majorly improves perf. check if we're using signum or something altho it's still kinda slow so maybe not lmfao 
-    # time to switch gears - I doubt there's much alpha in SAELens, so I'll try signum with the improvesments so far. 
-    # Okay these all seem like they're asymptoting towards 40 now so I'm going to be charitable and assume they all hit 32
-    # 
-
 
     def get_current_lambda(self) -> float:
-        lmda = 80
+        lmda = 20
 
         if self.global_step >= self.cfg.lambda_warmup_steps:
             return lmda
