@@ -177,7 +177,6 @@ class Trainer:
             name: torch.zeros(sae.num_latents, device=device, dtype=torch.long)
             for name, sae in self.saes.items()
         }
-        self.save_count = 0
 
         num_latents = list(self.saes.values())[0].num_latents
         self.num_latents = num_latents
@@ -413,15 +412,10 @@ class Trainer:
                         self.maybe_all_reduce(out.fvu.detach()) / denom
                     )
 
-                    # print("out.l0", out.l0)
-                    # print("out.fvu", out.fvu)
-
                     loss = (
                         out.fvu # rescaled MSE
                         + out.l0 * self.get_current_lambda()
                     )
-                    # print("l0", out.per_example_l0)
-                    # print("lambda", self.get_current_lambda())
 
                     loss.div(acc_steps).backward()
 
@@ -613,9 +607,6 @@ class Trainer:
         """Save the SAEs to disk."""
 
         path = f"checkpoints/{self.cfg.run_name}" or "checkpoints/unnamed"
-        path = f"{path}-{self.save_count % 2}"
-        self.save_count += 1
-        print("saving to", path)
 
         rank_zero = not dist.is_initialized() or dist.get_rank() == 0
 
@@ -642,14 +633,11 @@ class Trainer:
                 torch.save(scheduler.state_dict(), f"{path}/lr_scheduler_{i}.pt")
 
             for i, optimizer in enumerate(self.optimizers):
-                print("saving optimizer", i)
                 torch.save(optimizer.state_dict(), f"{path}/optimizer_{i}.pt")
 
 
-            print("saving state")
             torch.save({"global_step": self.global_step}, f"{path}/state.pt")
 
-            print("saving config")
             self.cfg.save_json(f"{path}/config.json")
 
         for optimizer in self.optimizers:
