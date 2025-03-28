@@ -87,6 +87,9 @@ class TrainConfig(Serializable):
     layer_stride: int = 1
     """Stride between layers to train sparse coders on."""
 
+    test: bool = False
+    """Enable features under test"""
+
     distribute_modules: bool = False
     """Store one copy of each sparse coder, instead of copying them across devices."""
 
