@@ -398,6 +398,7 @@ class Trainer:
                             self.maybe_all_reduce(out.multi_topk_fvu.detach()) / denom
                         )
 
+                    print("out.fvu", out.fvu)
                     loss = (
                         out.fvu
                         + self.cfg.auxk_alpha * out.auxk_loss
@@ -406,7 +407,8 @@ class Trainer:
                     loss.div(acc_steps).backward()
 
                     # Update the did_fire mask
-                    did_fire[name][out.latent_indices.flatten()] = True
+                    if not self.cfg.sae.activation == "binary" and not self.cfg.sae.activation == "topk_binary":
+                        did_fire[name][out.latent_indices.flatten()] = True
                     self.maybe_all_reduce(did_fire[name], "max")  # max is boolean "any"
 
             # Check if we need to actually do a training step
