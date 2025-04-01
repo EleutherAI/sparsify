@@ -568,11 +568,11 @@ def main():
         metrics.append(f"fvu/layers.{num}.mlp")
         metrics.append(f"dead_pct/layers.{num}.mlp")
     
-    if os.path.exists("1_7B_optimizer_data.csv"):
-        df = pd.read_csv("1_7B_optimizer_data.csv")
+    if os.path.exists("images/1_7B_optimizer_data.csv"):
+        df = pd.read_csv("images/1_7B_optimizer_data.csv")
     else:
         df = load_wandb_data(run_names, metrics)
-        df.to_csv("1_7B_optimizer_data.csv", index=False)
+        df.to_csv("images/1_7B_optimizer_data.csv", index=False)
 
 
     df, regular_df, skip_df = process_data(df, run_names)
@@ -584,7 +584,9 @@ def main():
     dead_pct_fig = plot_metrics(regular_df, skip_df, "dead_pct", layer_nums)
     
     fvu_fig.write_image(images_path / "1.7B_fvu_metrics.pdf", format="pdf")
+    fvu_fig.write_image(images_path / "1.7B_fvu_metrics.png", format="png")
     dead_pct_fig.write_image(images_path / "1.7B_dead_neurons_metrics.pdf", format="pdf")
+    dead_pct_fig.write_image(images_path / "1.7B_dead_neurons_metrics.png", format="png")
 
 if __name__ == "__main__":
     main()
