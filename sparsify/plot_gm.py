@@ -31,7 +31,7 @@ def prepare_dataframe(df: pd.DataFrame):
     return df
 
 
-def create_plots(df, output_dir="images"):
+def create_plots(df, output_dir="images/benchmark_plots"):
     px = import_plotly()
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     print("plotting")
@@ -88,6 +88,7 @@ def create_plots(df, output_dir="images"):
     )
     
     fig_k.write_image(f"{output_dir}/varying_k_performance.pdf", format="pdf")
+    fig_k.write_image(f"{output_dir}/varying_k_performance.png", format="png")
     
     # 2. Plot varying batch sizes (fixed k and expansion_factor)
     df_batch = df[(df["k"] == standard_k) & 
@@ -135,7 +136,7 @@ def create_plots(df, output_dir="images"):
     
     print("writing to ", f"{output_dir}/varying_batch_performance.pdf")
     fig_batch.write_image(f"{output_dir}/varying_batch_performance.pdf", format="pdf")
-    
+    fig_batch.write_image(f"{output_dir}/varying_batch_performance.png", format="png")
     # # 3. Plot varying number of latents (fixed k and batch_size)
     df_latents = df[(df["k"] == standard_k) & 
                     (df["batch_size"] == standard_batch) &
@@ -180,9 +181,11 @@ def create_plots(df, output_dir="images"):
     )
     
     fig_latents.write_image(f"{output_dir}/varying_latents_performance.pdf", format="pdf")
+    fig_latents.write_image(f"{output_dir}/varying_latents_performance.png", format="png")
+
 
 def main():
-    results = pd.read_csv("benchmark_results/benchmark_results.csv")
+    results = pd.read_csv("images/benchmark_results/benchmark_results.csv")
     # results = load_results()
     df = prepare_dataframe(results)
     create_plots(df)

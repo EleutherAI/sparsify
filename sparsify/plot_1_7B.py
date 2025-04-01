@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 import os
 
+from sparsify.plot_optimizers import aggregate_optimizer_performance
 pio.kaleido.scope.mathjax = None  # https://github.com/plotly/plotly.py/issues/3469
 
 def load_wandb_data(run_names: list[str], metrics: list[str], project: str = "eleutherai/sae") -> pd.DataFrame:
@@ -337,20 +338,6 @@ def process_data(df, run_names):
 
     return df, regular_df, skip_df
     
-def aggregate_optimizer_performance(df):
-    fvu_df = df[df['metric'].str.contains('fvu', case=False)]
-
-    min_fvu_summary = (
-        fvu_df.groupby(['optimizer', 'activation', 'skip', 'layer'])['value']
-        .min()
-        .reset_index()
-        .pivot(index=['optimizer', 'activation', 'layer'], columns='skip', values='value')
-        .rename(columns={False: 'regular_min_fvu', True: 'skip_min_fvu'})
-        .reset_index()
-    )
-
-    return min_fvu_summary.sort_values(['layer', 'activation'])
-
 
 def hex_to_rgba(hex_color, opacity=0.5):
     """Convert hex color to rgba with opacity."""
@@ -372,20 +359,19 @@ def plot_metrics(regular_df, skip_df, metric_type, layer_nums):
     Returns:
         Plotly figure
     """
+    pretty_metric_type = (
+        "Fraction dead neurons" 
+        if metric_type == "dead_pct"
+        else metric_type.upper()
+    )
     n_rows = len(layer_nums)
 
     subplot_titles = []
     for layer in layer_nums:
-        if metric_type == "fvu":
-            subplot_titles.extend([
-                f"FVU (Transcoder Layer {layer} MLP)",
-                f"FVU (SAE Layer {layer} MLP)",
-            ])
-        else:
-            subplot_titles.extend([
-                f"{metric_type.upper()} (Transcoder Layer {layer} MLP)",
-                f"{metric_type.upper()} (SAE Layer {layer} MLP)",
-            ])
+        subplot_titles.extend([
+            f"{pretty_metric_type} (Transcoder Layer {layer} MLP)",
+            f"{pretty_metric_type} (SAE Layer {layer} MLP)",
+        ])
 
     fig = make_subplots(
         rows=n_rows, 
@@ -567,8 +553,11 @@ def main():
         "SmolLM2-1.7B-topk-adam",
         "SmolLM2-1.7B-topk-signum",
         "SmolLM2-1.7B-gm-signum",
+        "SmolLM2-1.7B-gm-adam",
         "SmolLM2-1.7B-skip-gm",
+        "SmolLM2-1.7B-skip-gm-adam",
         "SmolLM2-1.7B-skip-topk-signum",
+        "SmolLM2-1.7B-topk-skip-adam",
     ]
     if not run_names:
         raise NotImplementedError("This script is not yet implemented")
@@ -585,9 +574,11 @@ def main():
         df = load_wandb_data(run_names, metrics)
         df.to_csv("1_7B_optimizer_data.csv", index=False)
 
+
     df, regular_df, skip_df = process_data(df, run_names)
-    optimizer_performance = aggregate_optimizer_performance(df)
-    print(optimizer_performance)
+    optimizer_performance, win_counts = aggregate_optimizer_performance(df)
+    # print(optimizer_performance)
+    print(win_counts)
     
     fvu_fig = plot_metrics(regular_df, skip_df, "fvu", layer_nums)
     dead_pct_fig = plot_metrics(regular_df, skip_df, "dead_pct", layer_nums)
