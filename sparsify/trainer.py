@@ -239,7 +239,7 @@ class Trainer:
 
                 wandb.init(
                     name=self.cfg.run_name,
-                    project="sae",
+                    project="sparsify",
                     config=asdict(self.cfg),
                     save_code=True,
                 )
@@ -459,13 +459,7 @@ class Trainer:
                         kl = -torch.sum(clean_probs * dirty_lps, dim=-1).mean()
                         kl.div(acc_steps).backward()
 
-                        # Also compute the cross entropy loss for logging purposes
-                        with torch.inference_mode():
-                            ce = nn.functional.cross_entropy(
-                                dirty_lps[:, :-1].flatten(0, 1), x[:, 1:].flatten()
-                            )
-                            avg_ce += float(self.maybe_all_reduce(ce) / denom)
-                            avg_kl += float(self.maybe_all_reduce(kl) / denom)
+                        avg_kl += float(self.maybe_all_reduce(kl) / denom)
                     case "fvu":
                         self.model(x)
                     case other:
@@ -509,8 +503,9 @@ class Trainer:
                     and (step + 1) % self.cfg.wandb_log_frequency == 0
                 ):
                     info = {}
-                    if self.cfg.loss_fn in ("ce", "kl"):
+                    if self.cfg.loss_fn == "ce":
                         info["ce_loss"] = avg_ce
+                    elif self.cfg.loss_fn == "kl":
                         info["kl_loss"] = avg_kl
 
                     for name in self.saes:
