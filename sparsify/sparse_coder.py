@@ -11,15 +11,8 @@ from safetensors.torch import load_model, save_model
 from torch import Tensor, nn
 
 from .config import SparseCoderConfig
+from .fused_encoder import EncoderOutput, fused_encoder
 from .utils import decoder_impl
-
-
-class EncoderOutput(NamedTuple):
-    top_acts: Tensor
-    """Activations of the top-k latents."""
-
-    top_indices: Tensor
-    """Indices of the top-k features."""
 
 
 class ForwardOutput(NamedTuple):
@@ -183,39 +176,14 @@ class SparseCoder(nn.Module):
     def dtype(self):
         return self.encoder.weight.dtype
 
-    def pre_acts(self, x: Tensor) -> Tensor:
-        sae_in = x.to(self.dtype)
-
-        # Remove decoder bias as per Anthropic if we're autoencoding. This doesn't
-        # really make sense for transcoders because the input and output spaces are
-        # different.
-        if not self.cfg.transcode:
-            sae_in -= self.b_dec
-
-        out = self.encoder(sae_in)
-        return nn.functional.relu(out)
-
-    def select_topk(self, z: Tensor) -> EncoderOutput:
-        """Select the top-k latents."""
-
-        # Use GroupMax activation to get the k "top" latents
-        if self.cfg.activation == "groupmax":
-            values, indices = z.unflatten(-1, (self.cfg.k, -1)).max(dim=-1)
-
-            # torch.max gives us indices into each group, but we want indices into the
-            # flattened tensor. Add the offsets to get the correct indices.
-            offsets = torch.arange(
-                0, self.num_latents, self.num_latents // self.cfg.k, device=z.device
-            )
-            indices = offsets + indices
-            return EncoderOutput(values, indices)
-
-        # Use TopK activation
-        return EncoderOutput(*z.topk(self.cfg.k, sorted=False))
-
     def encode(self, x: Tensor) -> EncoderOutput:
         """Encode the input and select the top-k latents."""
-        return self.select_topk(self.pre_acts(x))
+        if not self.cfg.transcode:
+            x = x - self.b_dec
+
+        return fused_encoder(
+            x, self.encoder.weight, self.encoder.bias, self.cfg.k, self.cfg.activation
+        )
 
     def decode(self, top_acts: Tensor, top_indices: Tensor) -> Tensor:
         assert self.W_dec is not None, "Decoder weight was not initialized."
@@ -232,14 +200,13 @@ class SparseCoder(nn.Module):
     def forward(
         self, x: Tensor, y: Tensor | None = None, *, dead_mask: Tensor | None = None
     ) -> ForwardOutput:
-        pre_acts = self.pre_acts(x)
+        top_acts, top_indices, pre_acts = self.encode(x)
 
         # If we aren't given a distinct target, we're autoencoding
         if y is None:
             y = x
 
         # Decode
-        top_acts, top_indices = self.select_topk(pre_acts)
         sae_out = self.decode(top_acts, top_indices)
         if self.W_skip is not None:
             sae_out += x.to(self.dtype) @ self.W_skip.mT
@@ -268,7 +235,7 @@ class SparseCoder(nn.Module):
             # Encourage the top ~50% of dead latents to predict the residual of the
             # top k living latents
             e_hat = self.decode(auxk_acts, auxk_indices)
-            auxk_loss = (e_hat - e).pow(2).sum()
+            auxk_loss = (e_hat - e.detach()).pow(2).sum()
             auxk_loss = scale * auxk_loss / total_variance
         else:
             auxk_loss = sae_out.new_tensor(0.0)

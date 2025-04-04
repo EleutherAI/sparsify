@@ -56,7 +56,7 @@ class RunConfig(TrainConfig):
     """Maximum number of examples to use for training."""
 
     resume: bool = False
-    """Whether to try resuming from the checkpoint present at `run_name`."""
+    """Whether to try resuming from the checkpoint present at `checkpoints/run_name`."""
 
     text_column: str = "text"
     """Column name to use for text data."""
@@ -175,7 +175,7 @@ def run():
 
         trainer = Trainer(args, dataset, model)
         if args.resume:
-            trainer.load_state(args.run_name or "sae-ckpts")
+            trainer.load_state(f"checkpoints/{args.run_name}" or "checkpoints/unnamed")
         elif args.finetune:
             for name, sae in trainer.saes.items():
                 load_model(

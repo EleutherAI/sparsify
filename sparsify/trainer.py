@@ -137,9 +137,10 @@ class Trainer:
                     torch.optim.Adam(params - muon_params, lr=cfg.lr or 2e-3),
                 ]
                 self.lr_schedulers = [
+                    get_linear_schedule_with_warmup(self.optimizers[0], 0, num_batches),
                     get_linear_schedule_with_warmup(
-                        self.optimizers[0], 0, num_batches // cfg.batch_size
-                    )
+                        self.optimizers[1], cfg.lr_warmup_steps, num_batches
+                    ),
                 ]
             case "signum":
                 from schedulefree import ScheduleFreeWrapper
@@ -238,12 +239,13 @@ class Trainer:
 
                 wandb.init(
                     name=self.cfg.run_name,
-                    project="sparsify",
+                    project="sae",
                     config=asdict(self.cfg),
                     save_code=True,
                 )
             except (AttributeError, ImportError):
-                print("Weights & Biases not installed, skipping logging.")
+                print("Weights & Biases not available, skipping logging.")
+                print("Run `pip install -U wandb` if you want to use it.")
                 self.cfg.log_to_wandb = False
 
         num_sae_params = sum(
@@ -610,7 +612,7 @@ class Trainer:
     def save(self):
         """Save the SAEs to disk."""
 
-        path = self.cfg.run_name or "sae-ckpts"
+        path = f'{self.cfg.save_dir}/{self.cfg.run_name or "unnamed"}'
         rank_zero = not dist.is_initialized() or dist.get_rank() == 0
 
         for optimizer in self.optimizers:
