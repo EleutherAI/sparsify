@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 from simple_parsing import Serializable
 
+from .fused_encoder import binary_fused_encoder
+
 
 @dataclass
 class PKMConfig(Serializable):
@@ -219,6 +221,73 @@ class FFFConfig(Serializable):
     full_fff: bool = False
     cheating: bool = False
     temperature: float = 0.3
+    sigmoid_approx: bool = False
+    expand_sigmoid: bool = False
+    ste: bool = False
+
+
+# Thresholded
+# STE
+
+class DenseBinaryEncode(torch.autograd.Function):
+    @staticmethod
+    @torch.autocast(
+        "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_bf16_supported()
+    )
+    def forward(ctx, x, W_enc, b_enc, log_threshold):
+        preacts = x @ W_enc.T + b_enc
+
+        threshold = torch.exp(log_threshold)
+
+        ctx.save_for_backward(x, W_enc, b_enc, threshold)
+
+        return (preacts > threshold).float()
+
+    @staticmethod
+    @torch.autocast(
+        "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_bf16_supported()
+    )
+    def backward(ctx, grad_output):
+        x, W_enc, b_enc, threshold = ctx.saved_tensors
+
+        # Use sigmoid STE to approximate the binary activations
+        preacts = x @ W_enc.T + b_enc
+        ste_acts = torch.sigmoid(preacts - threshold)
+
+        # Gradient of a sigmoid wrt its input = sigmoid(x) * (1 - sigmoid(x))
+        grad_sigmoid_wrt_thresholded_preacts = ste_acts * (1 - ste_acts)
+
+        # dL/d(thresholded_preacts) = dL/d(ste_acts) * d(ste_acts)/d(thresholded_preacts)
+        grad_thresholded_preacts = grad_output * grad_sigmoid_wrt_thresholded_preacts       
+
+        # The gradient of the loss wrt the preacts is the same as the gradient of the loss 
+        # wrt the thresholded preacts because the difference is a constant (threshold)
+        grad_preacts = grad_thresholded_preacts
+
+        # Gradient of the loss wrt the input
+        grad_input = grad_preacts @ W_enc
+
+        # Gradient of the loss wrt the encoder weights
+        grad_W_enc = grad_preacts.T @ x
+
+        # Gradient of the loss wrt the encoder bias
+        grad_b_enc = grad_preacts.sum(0)
+
+        # Gradient of the loss wrt the threshold
+        grad_log_threshold = -grad_thresholded_preacts.sum(0)
+
+        # print("encode backwards")
+        # print("input grad", grad_input)
+        # print("W_enc grad", grad_W_enc)
+        # print("b_enc grad", grad_b_enc)
+        # print("thresholds", threshold)
+        # print("log threshold grad", grad_log_threshold)
+
+        return grad_input, grad_W_enc, grad_b_enc, grad_log_threshold
+
+def dense_binary_encode(x, W_enc, b_enc, threshold):
+    """Convenience function for dense binary encoding."""
+    return DenseBinaryEncode.apply(x, W_enc, b_enc, threshold) # type: ignore
 
 
 class FFFLinear(nn.Module):
@@ -248,17 +317,41 @@ class FFFLinear(nn.Module):
         else:
             self.n_decisions = int(math.log2(num_latents // cfg.fff_k))
             self._decisions = nn.Linear(d_in, self.n_decisions * cfg.fff_k, device=device, dtype=dtype)
+        if cfg.ste:
+            self.threshold = nn.Parameter((torch.full((self.num_latents,), 0.004, device=device, dtype=dtype)).log())
 
     def forward(self, x):
         raise NotImplementedError
 
     # @torch.compile(mode="reduce-overhead")
     def topk(self, x, k: int):
+        if self.cfg.ste:
+            return binary_fused_encoder(
+                x, self._weight.weight, self._weight.bias, k, self.threshold.exp()
+            )
+            values = dense_binary_encode(
+                x, self._weight.weight, self._weight.bias, self.threshold
+            )
+            return values, torch.arange(0, self.num_latents, device=x.device, dtype=torch.int32)[None, :].expand(x.shape[:-1] + (self.num_latents,))
+        
         if not self.cfg.binarize:
             pre_acts = self._weight(x)
         # pre_acts = torch.nn.functional.relu(pre_acts)
         
         decisions = self._decisions(x)
+        if self.cfg.sigmoid_approx:
+            assert self.cfg.cheating and self.cfg.full_fff and self.cfg.binarize
+            if self.cfg.expand_sigmoid:
+                values, indices = decisions.topk(k * 2, dim=-1, sorted=True)
+                threshold = values[..., k:k+1]
+                sigmoided = torch.nn.functional.sigmoid(values)
+                values = (values > threshold) + (sigmoided - sigmoided.detach())
+                return values, indices
+            else:
+                values, indices = decisions.topk(k, dim=-1)
+                sigmoided = torch.nn.functional.sigmoid(values)
+                values = torch.ones_like(sigmoided) + (sigmoided - sigmoided.detach())
+                return values, indices
         if self.cfg.full_fff:
             assert self.cfg.n_samples == 1, "Full FFF does not support multiple samples."
             if not self.cfg.cheating:
