@@ -17,7 +17,7 @@ class SparseCoderConfig(Serializable):
     """Activation function to use."""
 
     expansion_factor: int = 32
-    """Multiple of the input dimension to use as the SAE dimension."""
+    """Multiple of the input dimension to use as the sparse coder dimension."""
 
     normalize_decoder: bool = True
     """Normalize the decoder weights to have unit norm."""
@@ -55,6 +55,14 @@ class TrainConfig(Serializable):
 
     micro_acc_steps: int = 1
     """Chunk the activations into this number of microbatches for training."""
+
+    loss_fn: Literal["ce", "fvu", "kl"] = "fvu"
+    """Loss function to use for training the sparse coders.
+
+    - `ce`: Cross-entropy loss of the final model logits.
+    - `fvu`: Fraction of variance explained.
+    - `kl`: KL divergence of the final model logits w.r.t. the original logits.
+    """
 
     optimizer: Literal["adam", "muon", "signum"] = "signum"
     """Optimizer to use."""
@@ -96,15 +104,27 @@ class TrainConfig(Serializable):
     """Store one copy of each sparse coder, instead of copying them across devices."""
 
     save_every: int = 1000
-    """Save SAEs every `save_every` steps."""
+    """Save sparse coders every `save_every` steps."""
+
+    save_best: bool = False
+    """Save the best checkpoint found for each hookpoint."""
 
     log_to_wandb: bool = True
     run_name: str | None = None
     wandb_log_frequency: int = 1
 
-    def __post_init__(self):
-        assert not (
-            self.layers and self.layer_stride != 1
-        ), "Cannot specify both `layers` and `layer_stride`."
+    save_dir: str = "checkpoints"
 
-        assert len(self.init_seeds) > 0, "Must specify at least one random seed."
+    def __post_init__(self):
+        """Validate the configuration."""
+        if self.layers and self.layer_stride != 1:
+            raise ValueError("Cannot specify both `layers` and `layer_stride`.")
+
+        if self.distribute_modules and self.loss_fn in ("ce", "kl"):
+            raise ValueError(
+                "Distributing modules across ranks is not compatible with the "
+                "cross-entropy or KL divergence losses."
+            )
+
+        if not self.init_seeds:
+            raise ValueError("Must specify at least one random seed.")

@@ -131,6 +131,10 @@ There are several features that we'd like to add in the near future:
 
 If you'd like to help out with any of these, please feel free to open a PR! You can collaborate with us in the sparse-autoencoders channel of the EleutherAI Discord.
 
+## Development
+
+Run `pip install pre-commit` then `pre-commit install`.
+
 ## Experimental features
 
 Linear k decay schedule:

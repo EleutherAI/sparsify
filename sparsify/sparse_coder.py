@@ -312,7 +312,6 @@ class SparseCoder(nn.Module):
 
     def binary_decode(self, top_indices: Tensor, top_acts: Tensor) -> Tensor:
         assert self.W_dec is not None, "Decoder weight was not initialized."
-
         y = eager_decode(top_indices, top_acts, self.W_dec.mT)
         # y = BinaryDecode.apply(top_indices, top_acts, self.W_dec.mT)
         return y + self.b_dec
@@ -325,7 +324,9 @@ class SparseCoder(nn.Module):
 
     # Wrapping the forward in bf16 autocast improves performance by almost 2x
     @torch.autocast(
-        "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_bf16_supported()
+        "cuda",
+        dtype=torch.bfloat16,
+        enabled=torch.cuda.is_bf16_supported(),
     )
     def forward(
         self, x: Tensor, y: Tensor | None = None, *, dead_mask: Tensor | None = None

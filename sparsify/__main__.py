@@ -9,7 +9,13 @@ import torch.distributed as dist
 from datasets import Dataset, load_dataset
 from safetensors.torch import load_model
 from simple_parsing import field, parse
-from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig, PreTrainedModel
+from transformers import (
+    AutoModel,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    PreTrainedModel,
+)
 
 from .data import MemmapDataset, chunk_and_tokenize
 from .trainer import TrainConfig, Trainer
@@ -35,7 +41,9 @@ class RunConfig(TrainConfig):
     ctx_len: int = 2048
     """Context length to use for training."""
 
-    hf_token: str | None = None
+    # Use a dummy encoding function to prevent the token from being saved
+    # to disk in plain text
+    hf_token: str | None = field(default=None, encoding_fn=lambda _: None)
     """Huggingface API token for downloading models."""
 
     revision: str | None = None
@@ -75,7 +83,9 @@ def load_artifacts(
     else:
         dtype = "auto"
 
-    model = AutoModel.from_pretrained(
+    # End-to-end training requires a model with a causal LM head
+    model_cls = AutoModel if args.loss_fn == "fvu" else AutoModelForCausalLM
+    model = model_cls.from_pretrained(
         args.model,
         device_map={"": f"cuda:{rank}"},
         quantization_config=(
@@ -165,7 +175,7 @@ def run():
 
         trainer = Trainer(args, dataset, model)
         if args.resume:
-            trainer.load_state(f'checkpoints/{args.run_name}' or "checkpoints/unnamed")
+            trainer.load_state(f"checkpoints/{args.run_name}" or "checkpoints/unnamed")
         elif args.finetune:
             for name, sae in trainer.saes.items():
                 load_model(

@@ -22,7 +22,7 @@ def get_layer_list(model: PreTrainedModel) -> tuple[str, nn.ModuleList]:
     N = assert_type(int, model.config.num_hidden_layers)
     candidates = [
         (name, mod)
-        for (name, mod) in model.named_modules()
+        for (name, mod) in model.base_model.named_modules()
         if isinstance(mod, nn.ModuleList) and len(mod) == N
     ]
     assert len(candidates) == 1, "Could not find the list of layers."
@@ -37,7 +37,9 @@ def resolve_widths(
     dim: int = -1,
 ) -> dict[str, int]:
     """Find number of output dimensions for the specified modules."""
-    module_to_name = {model.get_submodule(name): name for name in module_names}
+    module_to_name = {
+        model.base_model.get_submodule(name): name for name in module_names
+    }
     shapes: dict[str, int] = {}
 
     def hook(module, _, output):
@@ -57,6 +59,23 @@ def resolve_widths(
             handle.remove()
 
     return shapes
+
+
+def set_submodule(model: nn.Module, submodule_path: str, new_submodule: nn.Module):
+    """
+    Replaces a submodule in a PyTorch model dynamically.
+
+    Args:
+        model (nn.Module): The root model containing the submodule.
+        submodule_path (str): Dotted path to the submodule.
+        new_submodule (nn.Module): The new module to replace the existing one.
+
+    Example:
+        set_submodule(model, "encoder.layer.0.attention.self", nn.Identity())
+    """
+    parent_path, _, last_name = submodule_path.rpartition(".")
+    parent_module = model.get_submodule(parent_path) if parent_path else model
+    setattr(parent_module, last_name, new_submodule)
 
 
 # Fallback implementation of SAE decoder

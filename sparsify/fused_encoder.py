@@ -41,11 +41,10 @@ class BinaryFusedEncoder(torch.autograd.Function):
         k:      int (number of top elements to select along dim=1)
         """
         preacts = F.relu(F.linear(input, weight, bias))
-
         # Get top-k values and indices for each row
 
-        topk_values, indices = torch.topk(preacts, k, dim=1, sorted=False)
-        values = (topk_values > threshold[indices]).float()
+        topk_values, indices = torch.topk(preacts - threshold, k, dim=1, sorted=False)
+        values = (topk_values > 0).float()
 
         # Save tensors needed for the backward pass
         ctx.save_for_backward(
@@ -81,28 +80,6 @@ class BinaryFusedEncoder(torch.autograd.Function):
             grad_threshold = (
                 -(threshold / 2.0) * rectangle((topk_values) / 2.0) * grad_values
             )
-
-        # import time
-
-        # start = time.time()
-        # for _ in range(1000):
-        #     grad_threshold = torch.zeros_like(threshold)
-
-        # print(time.time() - start)
-
-        # start = time.time()
-        # for _ in range(1000):
-        #     flat_indices = indices.flatten()
-        #     grad_values_flat = grad_values.flatten()
-
-        #     grad_threshold = torch.zeros_like(threshold).scatter_add_(
-        # 0, flat_indices, threshold_grad_contributions)
-
-        #     grad_threshold = torch.zeros_like(threshold)
-        #     grad_threshold.index_add_(0, flat_indices, grad_values_flat)
-
-        # print(time.time() - start)
-        # breakpoint()
 
         # --- Grad w.r.t. input ---
         if ctx.needs_input_grad[0]:
@@ -235,7 +212,5 @@ def binary_fused_encoder(
     threshold: Tensor,
 ) -> EncoderOutput:
     return EncoderOutput(
-        *BinaryFusedEncoder.apply(
-            input, weight, bias, k, threshold, ste_activation="rectangle"
-        )  # type: ignore
+        *BinaryFusedEncoder.apply(input, weight, bias, k, threshold)  # type: ignore
     )

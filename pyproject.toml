@@ -22,6 +22,10 @@ dependencies = [
     "transformers",
 ]
 version = "0.1.0"
+[project.optional-dependencies]
+dev = [
+    "pre-commit",
+]
 
 [project.scripts]
 sparsify = "sparsify.__main__:run"
