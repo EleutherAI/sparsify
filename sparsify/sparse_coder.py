@@ -1,124 +1,23 @@
 import json
 from fnmatch import fnmatch
 from pathlib import Path
-from turtle import right
 from typing import NamedTuple
 
 import einops
 import torch
+import torch.nn.functional as F
 from huggingface_hub import snapshot_download
 from natsort import natsorted
 from safetensors.torch import load_model, save_model
 from torch import Tensor, nn
 
 from .config import SparseCoderConfig
-from .fused_encoder import EncoderOutput, fused_encoder, binary_fused_encoder
+from .fused_encoder import EncoderOutput, binary_fused_encoder, fused_encoder
 from .utils import decoder_impl, eager_decode
-
-import torch.nn.functional as F
-
-
-# class BinaryTopKEncodeDecode(torch.autograd.Function):
-#     @staticmethod
-#     def forward(ctx, x, W_enc, b_enc, W_dec, b_dec, k):
-#         preacts = x @ W_enc.T + b_enc
-
-#         top_acts, top_indices = preacts.topk(k, sorted=False)
-
-#         # Implicitly binarize top_acts to 1 by using the default weights. 
-#         # The gradient of top_acts is lost. 
-#         # We use a STE in the backwards pass to approximate its binarization.
-#         sae_out = nn.functional.embedding_bag(
-#             top_indices, W_dec.mT, mode="sum"
-#         ) + b_dec
-
-#         ctx.save_for_backward(x, W_enc, b_enc, W_dec, b_dec, top_indices, top_acts)
-#         return sae_out
-    
-#     @staticmethod
-#     @torch.autocast(
-#         "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_bf16_supported()
-#     )
-#     def backward(ctx, grad_output):
-#         x, W_enc, b_enc, W_dec, b_dec, top_indices, top_acts = ctx.saved_tensors
-
-#         # STE for binarized top_acts
-#         top_acts_sigmoid = torch.sigmoid(top_acts)
-#         grad_top_acts_sigmoid = top_acts_sigmoid * (1 - top_acts_sigmoid)
-
-#         # Gradient of decoder weights wrt decoder output
-#         # W_dec is [d_in, d_sae] but only the top k columns are non-zero for each batch of activations,
-#         # so only the corresponding columns of grad_output in the batch are non-zero
-#         # grad_W_dec = torch.zeros_like(W_dec)
-#         # # for each act scale the grad by its magnitude. 
-#         # # we may want to come back later and use a different STE than identity for top_acts
-#         # # grad_output is [batch, d_resid] and top_acts is [batch, k]
-#         # # TODO there may be an error, do we need the gradient of the sigmoid here?
-#         # grad_contributions = grad_output.unsqueeze(1) * top_acts_sigmoid.unsqueeze(2)
-#         # # grad_contributions is [batch, k, d_in]
-#         # _, _, D = grad_contributions.shape
-#         # grad_contributions = grad_contributions.reshape(-1, D)
-#         # grad_W_dec.index_add_(1, top_indices.flatten(), grad_contributions.T) 
-
-#         # Gradient wrt decoder bias
-#         # The derivative of the output wrt the bias is 1 because it gets added (because changing the bias by x changes the output by x)
-#         grad_b_dec = grad_output.sum(0)
-
-#         # Gradient of the loss wrt top acts (using sigmoid STE) - how does changing the top acts affect the sae_out?
-#         from xformers import embedding_bag_bw_rev_indices
-#         # top acts is [batch, k] so the grad is too.
-#         # grad_output is [batch, d_resid]
-#         # The derivative of sigmoid(top acts) wrt top acts is sigmoid(top acts) * (1 - sigmoid(top acts))
-#         grad_top_acts = embedding_bag_bw_rev_indices(top_indices, W_dec, grad_output, grad_output * top_acts_sigmoid * (1 - top_acts_sigmoid))
-
-#         grad_top_acts, grad_W_dec = embedding_bag_bw_rev_indices(
-#             top_indices,
-#             W_dec,
-#             grad_top_acts_sigmoid,
-#             grad_output,
-#         )
-
-#         # --- Grad w.r.t. input ---
-#         if ctx.needs_input_grad[0]:
-#             grad_input = F.embedding_bag(
-#                 indices,
-#                 right,
-#                 mode="sum",
-#                 per_sample_weights=grad_top_acts.type_as(W_enc),
-#             )
-
-#         # --- Grad w.r.t. weight ---
-#         if ctx.needs_input_grad[1]:
-#             grad_W_enc = torch.zeros_like(W_enc)
-#             # Compute contributions from each top-k element:
-#             # computed as grad_values * input for each top-k location.
-#             contributions = grad_top_acts.unsqueeze(2) * input.unsqueeze(1)
-#             _, _, D = contributions.shape
-#             # Flatten contributions to shape (N*k, D)
-#             contributions = contributions.reshape(-1, D)
-
-#             # Accumulate contributions into the correct rows of grad_W_enc.
-#             grad_W_enc.index_add_(0, indices.flatten(), contributions.type_as(W_enc))
-#             print("grad weight", grad_W_enc)
-#         # --- Grad w.r.t. bias ---
-#         if b_enc is not None and ctx.needs_input_grad[2]:
-#             grad_b_enc = torch.zeros_like(b_enc)
-#             grad_b_enc.index_add_(
-#                 0, indices.flatten(), grad_top_acts.flatten().type_as(b_enc)
-#             )
-#             print("grad bias", grad_b_enc)
-
-#         return grad_input, grad_W_enc, grad_b_enc, grad_W_dec, grad_b_dec
-        
-
-# def binary_topk_encode_decode(x, W_enc, b_enc, W_dec, b_dec, k) -> Tensor:
-#     return BinaryTopKEncodeDecode.apply(x, W_enc, b_enc, W_dec, b_dec, k) # type: ignore
-
-# Try a different STE eg rectangle or tanh
-
 
 # Thresholded
 # STE
+
 
 class DenseBinaryEncode(torch.autograd.Function):
     @staticmethod
@@ -148,11 +47,13 @@ class DenseBinaryEncode(torch.autograd.Function):
         # Gradient of a sigmoid wrt its input = sigmoid(x) * (1 - sigmoid(x))
         grad_sigmoid_wrt_thresholded_preacts = ste_acts * (1 - ste_acts)
 
-        # dL/d(thresholded_preacts) = dL/d(ste_acts) * d(ste_acts)/d(thresholded_preacts)
-        grad_thresholded_preacts = grad_output * grad_sigmoid_wrt_thresholded_preacts       
+        # dL/d(thresholded_preacts) =
+        #   dL/d(ste_acts) * d(ste_acts)/d(thresholded_preacts)
+        grad_thresholded_preacts = grad_output * grad_sigmoid_wrt_thresholded_preacts
 
-        # The gradient of the loss wrt the preacts is the same as the gradient of the loss 
-        # wrt the thresholded preacts because the difference is a constant (threshold)
+        # The gradient of the loss wrt the preacts is the same as the gradient of the
+        # loss wrt the thresholded preacts because the difference is a constant
+        # (the threshold)
         grad_preacts = grad_thresholded_preacts
 
         # Gradient of the loss wrt the input
@@ -176,9 +77,11 @@ class DenseBinaryEncode(torch.autograd.Function):
 
         return grad_input, grad_W_enc, grad_b_enc, grad_log_threshold
 
+
 def dense_binary_encode(x, W_enc, b_enc, threshold):
     """Convenience function for dense binary encoding."""
-    return DenseBinaryEncode.apply(x, W_enc, b_enc, threshold) # type: ignore
+    return DenseBinaryEncode.apply(x, W_enc, b_enc, threshold)  # type: ignore
+
 
 class BinaryDecode(torch.autograd.Function):
     @staticmethod
@@ -190,9 +93,18 @@ class BinaryDecode(torch.autograd.Function):
     def backward(ctx, grad_output):
         top_indices, W_dec = ctx.saved_tensors
         grad_top_indices = grad_top_acts = grad_W_dec = None
-        
-        
+
         return grad_top_indices, grad_top_acts, grad_W_dec
+
+
+def gumbel_encoder(x: Tensor, W_enc: Tensor, b_enc: Tensor, k: int) -> EncoderOutput:
+    preacts = x @ W_enc.T + b_enc
+    grouped = einops.rearrange(preacts, "... (k h) -> ... k h", k=k)
+    hard = F.gumbel_softmax(grouped, tau=0.5, hard=True, dim=-1).flatten(-2, -1)
+    num_latents = hard.shape[-1]
+    indices = torch.arange(0, num_latents, device=x.device, dtype=torch.int32)[None, :]
+    indices = indices.expand(x.shape[:-1] + (indices.shape[-1],))
+    return EncoderOutput(hard, indices, hard)
 
 
 class ForwardOutput(NamedTuple):
@@ -233,8 +145,8 @@ class SparseCoder(nn.Module):
         # if self.cfg.transcode:
         # self.encoder.weight.data *= 1e-4
         # else:
-            # self.encoder.weight.data *= 1e-1
-        
+        # self.encoder.weight.data *= 1e-1
+
         self.encoder.bias.data.zero_()
 
         if decoder:
@@ -258,7 +170,11 @@ class SparseCoder(nn.Module):
         )
 
         if self.cfg.activation == "binary" or self.cfg.activation == "topk_binary":
-            self.log_threshold = nn.Parameter((torch.full((self.num_latents,), 0.004, dtype=dtype, device=device)).log())
+            self.log_threshold = nn.Parameter(
+                (
+                    torch.full((self.num_latents,), 0.004, dtype=dtype, device=device)
+                ).log()
+            )
 
     @staticmethod
     def load_many(
@@ -371,20 +287,32 @@ class SparseCoder(nn.Module):
 
         if self.cfg.activation == "binary":
             # Dense encode with binary activations
-            acts = dense_binary_encode(x, self.encoder.weight, self.encoder.bias, self.log_threshold)
+            acts = dense_binary_encode(
+                x, self.encoder.weight, self.encoder.bias, self.log_threshold
+            )
             return EncoderOutput(acts, None, None)
         elif self.cfg.activation == "topk_binary":
             return binary_fused_encoder(
-                x, self.encoder.weight, self.encoder.bias, self.cfg.k, self.log_threshold.exp()
+                x,
+                self.encoder.weight,
+                self.encoder.bias,
+                self.cfg.k,
+                self.log_threshold.exp(),
             )
+        elif self.cfg.activation == "gumbel_binary":
+            return gumbel_encoder(x, self.encoder.weight, self.encoder.bias, self.cfg.k)
         else:
             return fused_encoder(
-                x, self.encoder.weight, self.encoder.bias, self.cfg.k, self.cfg.activation
+                x,
+                self.encoder.weight,
+                self.encoder.bias,
+                self.cfg.k,
+                self.cfg.activation,
             )
 
     def binary_decode(self, top_indices: Tensor, top_acts: Tensor) -> Tensor:
         assert self.W_dec is not None, "Decoder weight was not initialized."
-        
+
         y = eager_decode(top_indices, top_acts, self.W_dec.mT)
         # y = BinaryDecode.apply(top_indices, top_acts, self.W_dec.mT)
         return y + self.b_dec
@@ -403,13 +331,17 @@ class SparseCoder(nn.Module):
         self, x: Tensor, y: Tensor | None = None, *, dead_mask: Tensor | None = None
     ) -> ForwardOutput:
         if self.cfg.activation == "binary":
-            # sae_out = binary_topk_encode_decode(x, self.encoder.weight, self.encoder.bias, self.W_dec.mT, self.b_dec, self.cfg.k)
+            # sae_out = binary_topk_encode_decode(
+            #   x, self.encoder.weight, self.encoder.bias,
+            #   self.W_dec.mT, self.b_dec, self.cfg.k)
             # top_acts, top_indices, pre_acts = None, None, None
             # top_acts = dense_binary_encode(x, self.encoder.weight, self.encoder.bias)
             # top_indices = None
             # pre_acts = None
 
-            top_acts = dense_binary_encode(x, self.encoder.weight, self.encoder.bias, self.log_threshold)
+            top_acts = dense_binary_encode(
+                x, self.encoder.weight, self.encoder.bias, self.log_threshold
+            )
             top_indices, pre_acts = None, None
             sae_out = top_acts @ self.W_dec + self.b_dec
         else:
@@ -425,6 +357,8 @@ class SparseCoder(nn.Module):
         elif self.cfg.activation == "binary":
             pass
             # sae_out = top_acts @ self.W_dec + self.b_dec
+        elif self.cfg.activation == "gumbel_binary":
+            sae_out = top_acts @ self.W_dec + self.b_dec
         else:
             sae_out = self.decode(top_acts, top_indices)
         if self.W_skip is not None:
@@ -463,7 +397,9 @@ class SparseCoder(nn.Module):
         fvu = l2_loss / total_variance
 
         if self.cfg.multi_topk:
-            assert not self.cfg.activation == "topk_binary", "Multi-TopK is not supported for binary activation."
+            assert (
+                not self.cfg.activation == "topk_binary"
+            ), "Multi-TopK is not supported for binary activation."
             top_acts, top_indices = pre_acts.topk(4 * self.cfg.k, sorted=False)
             sae_out = self.decode(top_acts, top_indices)
 

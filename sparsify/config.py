@@ -11,7 +11,9 @@ class SparseCoderConfig(Serializable):
     Configuration for training a sparse coder on a language model.
     """
 
-    activation: Literal["groupmax", "topk", "topk_binary", "binary"] = "topk"
+    activation: Literal[
+        "groupmax", "topk", "topk_binary", "binary", "gumbel_binary"
+    ] = "topk"
     """Activation function to use."""
 
     expansion_factor: int = 32
