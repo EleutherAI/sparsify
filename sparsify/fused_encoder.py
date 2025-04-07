@@ -62,6 +62,7 @@ class BinaryFusedEncoder(torch.autograd.Function):
         input, weight, bias, values, indices, threshold, topk_values = ctx.saved_tensors
         grad_input = grad_weight = grad_bias = None
 
+        grad_threshold = torch.zeros_like(threshold)
         if ctx.ste_activation == "sigmoid":
             ste_vals = torch.sigmoid(topk_values)
             sigmoid_grad_wrt_vals = ste_vals * (1 - ste_vals)
@@ -70,16 +71,18 @@ class BinaryFusedEncoder(torch.autograd.Function):
             grad_values = grad_values * sigmoid_grad_wrt_vals
 
             # dL/dthreshold = dL/dvals * dvals/dthreshold
-            grad_threshold = torch.zeros_like(threshold)
             grad_threshold.index_add_(0, indices.flatten(), -grad_values.flatten())
         elif ctx.ste_activation == "rectangle":
             ste_vals = rectangle(topk_values)
             rect_grad_wrt_vals = ste_vals
             grad_values = grad_values * rect_grad_wrt_vals
 
-            grad_threshold = (
-                -(threshold / 2.0) * rectangle((topk_values) / 2.0) * grad_values
+            grad_threshold_vals = (
+                -(threshold[indices].flatten() / 2.0)
+                * rectangle((topk_values) / 2.0).flatten()
+                * grad_values.flatten()
             )
+            grad_threshold.index_add_(0, indices.flatten(), grad_threshold_vals)
 
         # --- Grad w.r.t. input ---
         if ctx.needs_input_grad[0]:
@@ -111,11 +114,14 @@ class BinaryFusedEncoder(torch.autograd.Function):
             )
 
         # The k parameter is an int, so return None for its gradient.
-        return grad_input, grad_weight, grad_bias, None, grad_threshold
+        return grad_input, grad_weight, grad_bias, None, grad_threshold, None
 
 
 class FusedEncoder(torch.autograd.Function):
     @staticmethod
+    @torch.autocast(
+        "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_bf16_supported()
+    )
     def forward(
         ctx,
         input,
@@ -154,6 +160,9 @@ class FusedEncoder(torch.autograd.Function):
         ctx.activation = activation
         return values, indices, preacts
 
+    @torch.autocast(
+        "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_bf16_supported()
+    )
     @staticmethod
     def backward(ctx, grad_values, grad_indices, grad_preacts):
         input, weight, bias, values, indices = ctx.saved_tensors
@@ -210,7 +219,10 @@ def binary_fused_encoder(
     bias,
     k: int,
     threshold: Tensor,
+    ste_activation: Literal["sigmoid", "rectangle"] = "sigmoid",
 ) -> EncoderOutput:
     return EncoderOutput(
-        *BinaryFusedEncoder.apply(input, weight, bias, k, threshold)  # type: ignore
+        *BinaryFusedEncoder.apply(
+            input, weight, bias, k, threshold, ste_activation
+        )  # type: ignore
     )
