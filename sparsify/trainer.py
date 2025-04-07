@@ -387,6 +387,11 @@ class Trainer:
             if raw.cfg.normalize_decoder and not self.cfg.sae.transcode:
                 raw.set_decoder_norm_to_unit_norm()
 
+            torch.compiler.cudagraph_mark_step_begin()
+            if self.cfg.loss_fn not in ("ce", "kl"):
+                inputs = inputs.detach()
+                outputs = outputs.detach()
+
             wrapped = maybe_wrapped[name]
             out = wrapped(
                 x=inputs,

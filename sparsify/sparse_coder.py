@@ -1,11 +1,10 @@
 import json
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import einops
 import torch
-import torch.nn.functional as F
 from huggingface_hub import snapshot_download
 from natsort import natsorted
 from safetensors.torch import load_model, save_model
@@ -97,14 +96,44 @@ class BinaryDecode(torch.autograd.Function):
         return grad_top_indices, grad_top_acts, grad_W_dec
 
 
+def custom_gumbel_softmax(
+    logits: Tensor,
+    tau: float = 1,
+    eps: float = 1e-10,
+    dim: int = -1,
+    k: Optional[int] = None,
+) -> Tensor:
+    gumbels = (
+        -torch.empty_like(logits, memory_format=torch.legacy_contiguous_format)
+        .exponential_()
+        .log()
+    )  # ~Gumbel(0,1)
+    gumbels = (logits + gumbels) / tau  # ~Gumbel(logits,tau)
+    y_soft = gumbels.softmax(dim)
+
+    # Straight through.
+    index = y_soft.max(dim, keepdim=True)[1]
+    y_hard = torch.zeros_like(
+        logits, memory_format=torch.legacy_contiguous_format
+    ).scatter_(dim, index, 1.0)
+    if k is not None:
+        soft_values, soft_indices = y_soft.topk(k, dim=dim)
+        hard_values = torch.gather(y_hard, dim, soft_indices)
+        return hard_values + (soft_values - soft_values.detach()), soft_indices
+    return y_hard - y_soft.detach() + y_soft
+
+
+@torch.compile(mode="max-autotune-no-cudagraphs")
 def gumbel_encoder(x: Tensor, W_enc: Tensor, b_enc: Tensor, k: int) -> EncoderOutput:
-    preacts = x @ W_enc.T + b_enc
+    preacts = torch.einsum("...i,oi->...o", x, W_enc) + b_enc
     grouped = einops.rearrange(preacts, "... (k h) -> ... k h", k=k)
-    hard = F.gumbel_softmax(grouped, tau=0.5, hard=True, dim=-1).flatten(-2, -1)
-    num_latents = hard.shape[-1]
-    indices = torch.arange(0, num_latents, device=x.device, dtype=torch.int32)[None, :]
-    indices = indices.expand(x.shape[:-1] + (indices.shape[-1],))
-    return EncoderOutput(hard, indices, hard)
+    values, indices = custom_gumbel_softmax(grouped, tau=0.5, dim=-1, k=4)
+    values = values.flatten(-2, -1)
+    indices = indices + torch.arange(
+        indices.shape[-2], device=indices.device
+    ).unsqueeze(-1) * (grouped.shape[-1] // indices.shape[-2])
+    indices = indices.flatten(-2, -1)
+    return EncoderOutput(values, indices, preacts)
 
 
 class ForwardOutput(NamedTuple):
@@ -353,13 +382,11 @@ class SparseCoder(nn.Module):
             y = x
 
         # Decode
-        if self.cfg.activation == "topk_binary":
+        if self.cfg.activation in "topk_binary":
             sae_out = self.binary_decode(top_indices, top_acts)
         elif self.cfg.activation == "binary":
             pass
             # sae_out = top_acts @ self.W_dec + self.b_dec
-        elif self.cfg.activation == "gumbel_binary":
-            sae_out = top_acts @ self.W_dec + self.b_dec
         else:
             sae_out = self.decode(top_acts, top_indices)
         if self.W_skip is not None:
