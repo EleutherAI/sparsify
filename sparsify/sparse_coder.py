@@ -117,6 +117,17 @@ def custom_gumbel_softmax(
         logits, memory_format=torch.legacy_contiguous_format
     ).scatter_(dim, index, 1.0)
     if k is not None:
+        # indices = torch.arange(0, y_hard.shape[dim], device=y_hard.device)
+        # if dim < 0:
+        #     dim = y_hard.dim() + dim
+        # for _ in range(dim):
+        #     indices = indices.unsqueeze(0)
+        # for _ in range(y_hard.dim() - dim - 1):
+        #     indices = indices.unsqueeze(-1)
+        # indices = indices.expand_as(y_hard)
+        # soft_threshold = y_soft.topk(k, dim=dim,)[0][..., -1, None]
+        # y_soft = y_soft * (y_soft >= soft_threshold).float()
+        # return y_hard + (y_soft - y_soft.detach()), indices
         soft_values, soft_indices = y_soft.topk(k, dim=dim)
         hard_values = torch.gather(y_hard, dim, soft_indices)
         return hard_values + (soft_values - soft_values.detach()), soft_indices
@@ -131,7 +142,7 @@ def gumbel_encoder(x: Tensor, W_enc: Tensor, b_enc: Tensor, k: int) -> EncoderOu
     values = values.flatten(-2, -1)
     indices = indices + torch.arange(
         indices.shape[-2], device=indices.device
-    ).unsqueeze(-1) * (grouped.shape[-1] // indices.shape[-2])
+    ).unsqueeze(-1) * (preacts.shape[-1] // indices.shape[-2])
     indices = indices.flatten(-2, -1)
     return EncoderOutput(values, indices, preacts)
 
