@@ -33,6 +33,7 @@ class BinaryFusedEncoder(torch.autograd.Function):
         k: int,
         threshold: Tensor,
         ste_activation: Literal["sigmoid", "rectangle"] = "sigmoid",
+        ste_temperature: float = 1.0,
     ):
         """
         input:  (N, D)
@@ -52,6 +53,7 @@ class BinaryFusedEncoder(torch.autograd.Function):
         )
         ctx.k = k
         ctx.ste_activation = ste_activation
+        ctx.ste_temperature = ste_temperature
         return values, indices, preacts
 
     @staticmethod
@@ -60,11 +62,12 @@ class BinaryFusedEncoder(torch.autograd.Function):
     )
     def backward(ctx, grad_values, grad_indices, grad_preacts):  # bandwidth: float = 2.
         input, weight, bias, values, indices, threshold, topk_values = ctx.saved_tensors
+        ste_temperature = ctx.ste_temperature
         grad_input = grad_weight = grad_bias = None
 
         grad_threshold = torch.zeros_like(threshold)
         if ctx.ste_activation == "sigmoid":
-            ste_vals = torch.sigmoid(topk_values)
+            ste_vals = torch.sigmoid(topk_values / ste_temperature)
             sigmoid_grad_wrt_vals = ste_vals * (1 - ste_vals)
 
             # dL/dvals = dL/dsigmoid * dsigmoid/dvals
@@ -73,14 +76,22 @@ class BinaryFusedEncoder(torch.autograd.Function):
             # dL/dthreshold = dL/dvals * dvals/dthreshold
             grad_threshold.index_add_(0, indices.flatten(), -grad_values.flatten())
         elif ctx.ste_activation == "rectangle":
-            ste_vals = rectangle(topk_values)
+            # TODO LQ try
+            ste_vals = rectangle(topk_values / ste_temperature)
+            # ste_vals = rectangle(topk_values)
             rect_grad_wrt_vals = ste_vals
             grad_values = grad_values * rect_grad_wrt_vals
 
             grad_threshold_vals = (
-                -(threshold[indices].flatten() / 2.0)
-                * rectangle((topk_values) / 2.0).flatten()
+                -(threshold[indices].flatten() / ste_temperature)
+                * rectangle(topk_values / ste_temperature).flatten()
                 * grad_values.flatten()
+            )
+            grad_threshold.index_add_(0, indices.flatten(), grad_threshold_vals)
+        elif ctx.ste_activation == "identity":
+            breakpoint()
+            grad_threshold_vals = (
+                -grad_values * threshold[indices].flatten() / ste_temperature
             )
             grad_threshold.index_add_(0, indices.flatten(), grad_threshold_vals)
 
@@ -114,7 +125,7 @@ class BinaryFusedEncoder(torch.autograd.Function):
             )
 
         # The k parameter is an int, so return None for its gradient.
-        return grad_input, grad_weight, grad_bias, None, grad_threshold, None
+        return grad_input, grad_weight, grad_bias, None, grad_threshold, None, None
 
 
 class FusedEncoder(torch.autograd.Function):
@@ -220,9 +231,10 @@ def binary_fused_encoder(
     k: int,
     threshold: Tensor,
     ste_activation: Literal["sigmoid", "rectangle"] = "sigmoid",
+    ste_temperature: float = 1.0,
 ) -> EncoderOutput:
     return EncoderOutput(
         *BinaryFusedEncoder.apply(
-            input, weight, bias, k, threshold, ste_activation
+            input, weight, bias, k, threshold, ste_activation, ste_temperature
         )  # type: ignore
     )
