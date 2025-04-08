@@ -284,7 +284,8 @@ class SparseCoder(nn.Module):
                 self.encoder.bias,
                 self.cfg.k,
                 self.log_threshold.exp(),
-                "rectangle",
+                self.cfg.ste,
+                self.cfg.ste_temperature,
             )
         else:
             return fused_encoder(
