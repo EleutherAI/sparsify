@@ -35,7 +35,7 @@ class SparseCoderConfig(Serializable):
     transcode: bool = False
     """Whether we want to predict the output of a module given its input."""
 
-    ste: Literal["sigmoid", "rectangle", "identity"] = "sigmoid"
+    ste: Literal["sigmoid", "rectangle", "identity", "re"] = "sigmoid"
     """Straight-through estimator to use."""
 
     ste_temperature: float = 1.0
