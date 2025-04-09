@@ -286,6 +286,7 @@ class SparseCoder(nn.Module):
                 self.log_threshold.exp(),
                 self.cfg.ste,
                 self.cfg.ste_temperature,
+                self.cfg.ste_thresh_est,
             )
         else:
             return fused_encoder(

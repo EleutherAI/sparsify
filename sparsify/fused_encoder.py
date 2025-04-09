@@ -20,6 +20,54 @@ def rectangle(x):
     return ((x > -0.5) & (x < 0.5)).to(x.dtype)
 
 
+@torch.inference_mode()
+@torch.compile
+def find_sigmoid_threshold(logits, target_sum, max_iter=7, tol=1e-6):
+    """
+    Find threshold x such that when added to logits, the sum of sigmoid
+    probabilities equals target_sum Uses Newton's method for fast convergence
+
+    Args:
+        logits: tensor of shape (batch_size, num_classes) - raw logits before sigmoid
+        target_sum: desired sum of probabilities
+            (scalar or tensor of shape [batch_size])
+        max_iter: maximum number of Newton iterations
+        tol: tolerance for convergence
+
+    Returns:
+        Tensor of shape [batch_size] containing threshold value for each sample
+    """
+    batch_size = logits.shape[0]
+
+    # If target_sum is a scalar, expand it to match batch_size
+    if isinstance(target_sum, (int, float)) or (
+        isinstance(target_sum, torch.Tensor) and target_sum.dim() == 0
+    ):
+        target_sum = torch.ones(batch_size, device=logits.device) * target_sum
+
+    # Initialize x with zeros
+    x = torch.zeros(batch_size, device=logits.device)
+
+    for _ in range(max_iter):
+        # Calculate sigmoid values for current x
+        sig = torch.sigmoid(logits + x.unsqueeze(1))
+
+        # Calculate function value: sum(sigmoid(logits + x)) - target_sum
+        f_x = torch.sum(sig, dim=1) - target_sum
+
+        # Check for convergence
+        if torch.max(torch.abs(f_x)) < tol:
+            break
+
+        # Calculate derivative: sum(sigmoid(logits + x) * (1 - sigmoid(logits + x)))
+        df_x = torch.sum(sig * (1 - sig), dim=1)
+
+        # Newton update: x = x - f(x)/f'(x)
+        x = x - f_x / df_x
+
+    return x
+
+
 class BinaryFusedEncoder(torch.autograd.Function):
     @staticmethod
     @torch.autocast(
@@ -33,6 +81,7 @@ class BinaryFusedEncoder(torch.autograd.Function):
         k: int,
         threshold: Tensor,
         ste_activation: Literal["sigmoid", "rectangle"] = "sigmoid",
+        ste_thresh_est: bool = False,
         ste_temperature: float = 1.0,
     ):
         """
@@ -44,8 +93,14 @@ class BinaryFusedEncoder(torch.autograd.Function):
         preacts = F.linear(input, weight, bias)  #  F.relu(
         # Get top-k values and indices for each row
 
-        topk_values, indices = torch.topk(preacts - threshold, k, dim=1, sorted=False)
-        values = (topk_values > 0).float()
+        threshold_ = threshold
+        if ste_thresh_est:
+            threshold_ = torch.zeros_like(preacts)
+            threshold_ += -find_sigmoid_threshold(preacts, k).unsqueeze(1).detach()
+
+        topk_values, indices = torch.topk(preacts - threshold_, k, dim=1, sorted=False)
+        # values = (topk_values > 0).float()
+        values = torch.ones_like(topk_values).float()
 
         # Save tensors needed for the backward pass
         ctx.save_for_backward(
@@ -129,7 +184,16 @@ class BinaryFusedEncoder(torch.autograd.Function):
             )
 
         # The k parameter is an int, so return None for its gradient.
-        return grad_input, grad_weight, grad_bias, None, grad_threshold, None, None
+        return (
+            grad_input,
+            grad_weight,
+            grad_bias,
+            None,
+            grad_threshold,
+            None,
+            None,
+            None,
+        )
 
 
 class BinaryGroupMaxFusedEncoder(torch.autograd.Function):
@@ -349,9 +413,17 @@ def binary_fused_encoder(
     threshold: Tensor,
     ste_activation: Literal["sigmoid", "rectangle"] = "sigmoid",
     ste_temperature: float = 1.0,
+    ste_thresh_est: bool = False,
 ) -> EncoderOutput:
     return EncoderOutput(
         *BinaryFusedEncoder.apply(
-            input, weight, bias, k, threshold, ste_activation, ste_temperature
+            input,
+            weight,
+            bias,
+            k,
+            threshold,
+            ste_activation,
+            ste_temperature,
+            ste_thresh_est,
         )  # type: ignore
     )

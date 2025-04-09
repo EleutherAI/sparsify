@@ -41,6 +41,9 @@ class SparseCoderConfig(Serializable):
     ste_temperature: float = 1.0
     """Temperature for the STE."""
 
+    ste_thresh_est: bool = False
+    """Estimate the threshold for the STE based on the expected L0."""
+
 
 # Support different naming conventions for the same configuration
 SaeConfig = SparseCoderConfig
