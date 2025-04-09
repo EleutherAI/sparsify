@@ -117,18 +117,13 @@ def custom_gumbel_softmax(
         logits, memory_format=torch.legacy_contiguous_format
     ).scatter_(dim, index, 1.0)
     if k is not None:
-        # indices = torch.arange(0, y_hard.shape[dim], device=y_hard.device)
-        # if dim < 0:
-        #     dim = y_hard.dim() + dim
-        # for _ in range(dim):
-        #     indices = indices.unsqueeze(0)
-        # for _ in range(y_hard.dim() - dim - 1):
-        #     indices = indices.unsqueeze(-1)
-        # indices = indices.expand_as(y_hard)
-        # soft_threshold = y_soft.topk(k, dim=dim,)[0][..., -1, None]
-        # y_soft = y_soft * (y_soft >= soft_threshold).float()
-        # return y_hard + (y_soft - y_soft.detach()), indices
         soft_values, soft_indices = y_soft.topk(k, dim=dim)
+        if 0:
+            threshold = soft_values[..., -1, None]
+            # soft_values = torch.where(mask, soft_values, soft_values.detach())
+            gumbels_ = torch.where(y_soft >= threshold, gumbels, gumbels.detach())
+            y_soft_ = gumbels_.softmax(dim)
+            soft_values = torch.gather(y_soft_, dim, soft_indices)
         hard_values = torch.gather(y_hard, dim, soft_indices)
         return hard_values + (soft_values - soft_values.detach()), soft_indices
     return y_hard - y_soft.detach() + y_soft
@@ -393,7 +388,7 @@ class SparseCoder(nn.Module):
             y = x
 
         # Decode
-        if self.cfg.activation in "topk_binary":
+        if self.cfg.activation == "topk_binary":
             sae_out = self.binary_decode(top_indices, top_acts)
         elif self.cfg.activation == "binary":
             pass

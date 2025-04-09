@@ -114,6 +114,9 @@ class BinaryFusedEncoder(torch.autograd.Function):
         return grad_input, grad_weight, grad_bias, None, grad_threshold
 
 
+K_MUL = 4
+
+
 class FusedEncoder(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -122,7 +125,7 @@ class FusedEncoder(torch.autograd.Function):
         weight,
         bias,
         k: int,
-        activation: Literal["groupmax", "topk", "topk_binary"],
+        activation: Literal["groupmax", "topk", "topk_binary", "gumbel_binary"],
     ):
         """
         input:  (N, D)
@@ -135,6 +138,7 @@ class FusedEncoder(torch.autograd.Function):
         # Get top-k values and indices for each row
         if activation == "topk":
             values, indices = torch.topk(preacts, k, dim=1, sorted=False)
+            extra_ctx = ()
         elif activation == "groupmax":
             values, indices = preacts.unflatten(-1, (k, -1)).max(dim=-1)
 
@@ -145,11 +149,16 @@ class FusedEncoder(torch.autograd.Function):
                 0, num_latents, num_latents // k, device=preacts.device
             )
             indices = offsets + indices
+            extra_ctx = ()
+        elif activation == "gumbel_binary":
+            generator = torch.Generator(preacts.device)
+
+            extra_ctx = (generator,)
         else:
             raise ValueError(f"Unknown activation: {activation}")
 
         # Save tensors needed for the backward pass
-        ctx.save_for_backward(input, weight, bias, values, indices)
+        ctx.save_for_backward(input, weight, bias, values, indices, *extra_ctx)
         ctx.k = k
         ctx.activation = activation
         return values, indices, preacts
