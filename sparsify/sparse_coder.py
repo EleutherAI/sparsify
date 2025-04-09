@@ -237,26 +237,41 @@ def reinmax(
 
 @torch.compile(mode="max-autotune-no-cudagraphs")
 def gumbel_encoder(x: Tensor, W_enc: Tensor, b_enc: Tensor, k: int) -> EncoderOutput:
-    preacts = torch.einsum("...i,oi->...o", x, W_enc) + b_enc
-    grouped = einops.rearrange(preacts, "... (k h) -> ... k h", k=k)
-    # values = torch.nn.functional.gumbel_softmax(
-    #     grouped, tau=0.5, hard=True, dim=-1
-    # )
-    values, _ = reinmax(grouped, tau=1.1)
+    if 1:
+        preacts = torch.einsum("...i,oi->...o", x, W_enc) + b_enc
+        gumbel = torch.empty_like(preacts).exponential_().log().neg()
+        gumbeled = preacts + gumbel
+        softmaxed = torch.nn.functional.softmax(
+            preacts,
+            # gumbeled,
+            dim=-1,
+        )
+        softmaxed = 1 - (1 - softmaxed).pow(k)
+        _, indices = gumbeled.topk(k, dim=-1)
+        values = torch.gather(softmaxed, -1, indices)
+        values = torch.ones_like(values).float() + (values - values.detach())
+        return EncoderOutput(values, indices, preacts)
+
+    if 1:
+        grouped = einops.rearrange(preacts, "... (k h) -> ... k h", k=k)
+        # values = torch.nn.functional.gumbel_softmax(
+        #     grouped, tau=0.5, hard=True, dim=-1
+        # )
+        values, _ = reinmax(grouped, tau=1.1)
+        values = values.flatten(-2, -1)
+        indices = (
+            torch.arange(values.shape[-1], device=values.device)
+            .unsqueeze(0)
+            .expand_as(values)
+        )
+        return EncoderOutput(values, indices, preacts)
+    values, indices = custom_gumbel_softmax(grouped, tau=0.5, dim=-1, k=4)
     values = values.flatten(-2, -1)
-    indices = (
-        torch.arange(values.shape[-1], device=values.device)
-        .unsqueeze(0)
-        .expand_as(values)
-    )
+    indices = indices + torch.arange(
+        indices.shape[-2], device=indices.device
+    ).unsqueeze(-1) * (preacts.shape[-1] // indices.shape[-2])
+    indices = indices.flatten(-2, -1)
     return EncoderOutput(values, indices, preacts)
-    # values, indices = custom_gumbel_softmax(grouped, tau=0.5, dim=-1, k=4)
-    # values = values.flatten(-2, -1)
-    # indices = indices + torch.arange(
-    #     indices.shape[-2], device=indices.device
-    # ).unsqueeze(-1) * (preacts.shape[-1] // indices.shape[-2])
-    # indices = indices.flatten(-2, -1)
-    # return EncoderOutput(values, indices, preacts)
 
 
 class ForwardOutput(NamedTuple):
