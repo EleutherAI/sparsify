@@ -41,6 +41,15 @@ class SparseCoderConfig(Serializable):
     ste_temperature: float = 1.0
     """Temperature for the STE."""
 
+    tied_decoder: bool = False
+    """Tie the decoder weights to the encoder weights."""
+
+    matryoshka: bool = False
+    """Use Matryoshka sparse coders."""
+
+    matryoshka_groups: int = 5
+    """Number of activation groups to use for the Matryoshka loss."""
+
 
 # Support different naming conventions for the same configuration
 SaeConfig = SparseCoderConfig
