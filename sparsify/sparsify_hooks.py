@@ -148,9 +148,9 @@ def collect_activations(
     model: PreTrainedModel, hookpoints: list[str], input_acts: bool = False
 ):
     """
-    Context manager that temporarily hooks models and collects their activations.
-    An activation tensor is produced for each batch processed and stored in a list
-    for that hookpoint in the activations dictionary.
+    Context manager that hooks a model and collects activations.
+    An activation tensor is produced for each batch processed and stored
+    in added to a list for that hookpoint in the activations dictionary.
 
     Args:
         model: The transformer model to hook
