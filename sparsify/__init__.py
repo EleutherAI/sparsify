@@ -1,7 +1,7 @@
 from .config import SaeConfig, SparseCoderConfig, TrainConfig, TranscoderConfig
 from .sparse_coder import Sae, SparseCoder
+from .sparsify_hooks import edit_with_mse
 from .trainer import SaeTrainer, Trainer
-from .edit_sparse import edit_with_mse
 
 __all__ = [
     "Sae",
@@ -12,5 +12,5 @@ __all__ = [
     "Trainer",
     "TrainConfig",
     "TranscoderConfig",
-    "edit_with_mse"
+    "edit_with_mse",
 ]
