@@ -1,3 +1,5 @@
+__version__ = "0.1.0"
+
 from .config import SaeConfig, SparseCoderConfig, TrainConfig, TranscoderConfig
 from .sparse_coder import Sae, SparseCoder
 from .trainer import SaeTrainer, Trainer
