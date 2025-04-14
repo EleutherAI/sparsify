@@ -23,6 +23,9 @@ from .sign_sgd import SignSGD
 from .sparse_coder import SparseCoder
 from .utils import get_layer_list, resolve_widths, set_submodule
 
+# import lovely_tensors as lt
+# lt.monkey_patch()
+
 
 class Trainer:
     def __init__(
@@ -170,7 +173,7 @@ class Trainer:
         }
 
         num_latents = list(self.saes.values())[0].num_latents
-        self.initial_k = min(num_latents, round(list(input_widths.values())[0] * 10))
+        self.initial_k = min(num_latents, round(list(input_widths.values())[0] * 2))
         self.final_k = self.cfg.sae.k
 
         if self.cfg.save_best:
@@ -235,7 +238,8 @@ class Trainer:
         torch.set_float32_matmul_precision("high")
 
         # Make sure the model is frozen
-        self.model.requires_grad_(False)
+        # self.model.requires_grad_(False)
+        self.model.requires_grad_(True)
 
         rank_zero = not dist.is_initialized() or dist.get_rank() == 0
         ddp = dist.is_initialized() and not self.cfg.distribute_modules
@@ -308,7 +312,7 @@ class Trainer:
             else float("inf")
         )
 
-        if self.cfg.loss_fn == "ce":
+        if self.cfg.loss_fn == "ce" or self.cfg.train_on_backward:
             batch = next(iter(dl))
             x = batch["input_ids"].to(device)
 
@@ -319,7 +323,7 @@ class Trainer:
 
             # If doing end-to-end transcoders, then we don't actually want to run the
             # modules that we're replacing
-            if self.cfg.sae.transcode:
+            if self.cfg.sae.transcode and self.cfg.loss_fn == "ce":
                 for point in self.cfg.hookpoints:
                     set_submodule(self.model.base_model, point, nn.Identity())
 
@@ -339,12 +343,13 @@ class Trainer:
             if isinstance(outputs, tuple):
                 outputs, *aux_out = outputs
 
+            if self.cfg.train_on_backward:
+                inputs = inputs.detach()
+                outputs = outputs.detach()
+
             # Name may optionally contain a suffix of the form /seedN where N is an
             # integer. We only care about the part before the slash.
             name, _, _ = module_to_name[module].partition("/")
-
-            # Remember the original output shape since we'll need it for e2e training
-            out_shape = outputs.shape
 
             # Scatter and gather the hidden states across ranks if necessary
             if self.cfg.distribute_modules:
@@ -387,6 +392,12 @@ class Trainer:
             if raw.cfg.normalize_decoder and not self.cfg.sae.transcode:
                 raw.set_decoder_norm_to_unit_norm()
 
+            module.sae_inputs = inputs
+            module.sae_outputs = outputs
+
+            return None
+
+        def do_sae_fwd_bwd(inputs, outputs, name):
             wrapped = maybe_wrapped[name]
             out = wrapped(
                 x=inputs,
@@ -403,10 +414,10 @@ class Trainer:
             self.maybe_all_reduce(did_fire[name], "max")  # max is boolean "any"
 
             if self.cfg.loss_fn in ("ce", "kl"):
-                # Replace the normal output with the SAE output
-                output = out.sae_out.reshape(out_shape).type_as(outputs)
-                return (output, *aux_out) if aux_out is not None else output
-
+                raise ValueError(
+                    f"Loss function '{self.cfg.loss_fn}' is not compatible "
+                    "with training on backward pass gradients."
+                )
             # Metrics that only make sense for local
             avg_fvu[name] += float(self.maybe_all_reduce(out.fvu.detach()) / denom)
             if self.cfg.auxk_alpha > 0:
@@ -422,6 +433,7 @@ class Trainer:
             loss = (
                 out.fvu + self.cfg.auxk_alpha * out.auxk_loss + out.multi_topk_fvu / 8
             )
+            # print("loss", loss, loss.requires_grad)
             loss.div(acc_steps).backward()
 
         k = self.get_current_k()
@@ -457,7 +469,7 @@ class Trainer:
 
             # Forward pass on the model to get the next batch of activations
             handles = [
-                mod.register_forward_hook(hook) for mod in name_to_module.values()
+                mod.register_full_backward_hook(hook) for mod in name_to_module.values()
             ]
             try:
                 match self.cfg.loss_fn:
@@ -476,7 +488,24 @@ class Trainer:
                         avg_kl += float(self.maybe_all_reduce(kl) / denom)
                         avg_losses = avg_kl
                     case "fvu":
-                        self.model(x)
+                        if self.cfg.train_on_backward:
+                            outputs = self.model(x, labels=x)
+                            outputs.loss.div(acc_steps).backward(retain_graph=True)
+                            print("outputs.loss", outputs.loss)
+
+                            for name, module in name_to_module.items():
+                                if module.sae_inputs is not None:
+                                    scaling_factor = torch.rsqrt(
+                                        module.sae_inputs.pow(2).sum(-1).mean(0)
+                                    )
+                                    do_sae_fwd_bwd(
+                                        module.sae_inputs * scaling_factor,
+                                        module.sae_outputs * scaling_factor,
+                                        name,
+                                    )
+                        else:
+                            outputs = self.model(x)
+
                         avg_losses = avg_fvu
                     case other:
                         raise ValueError(f"Unknown loss function '{other}'")

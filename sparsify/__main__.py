@@ -81,7 +81,11 @@ def load_artifacts(
         dtype = "auto"
 
     # End-to-end training requires a model with a causal LM head
-    model_cls = AutoModel if args.loss_fn == "fvu" else AutoModelForCausalLM
+    model_cls = (
+        AutoModel
+        if args.loss_fn == "fvu" and not args.train_on_backward
+        else AutoModelForCausalLM
+    )
     model = model_cls.from_pretrained(
         args.model,
         device_map={"": f"cuda:{rank}"},

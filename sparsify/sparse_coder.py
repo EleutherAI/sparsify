@@ -51,6 +51,9 @@ class SparseCoder(nn.Module):
 
         self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
         self.encoder.bias.data.zero_()
+        # self.encoder.weight.data = self.encoder.weight.data * 0.1
+        # self.encoder.weight.data = self.encoder.weight.data * 0.001
+        self.encoder.weight.data = self.encoder.weight.data * 0.01
 
         if decoder:
             # Transcoder initialization: use zeros
@@ -207,7 +210,11 @@ class SparseCoder(nn.Module):
             y = x
 
         # Decode
+        # print("top_acts", top_acts)
+        # print("top_indices", top_indices)
+
         sae_out = self.decode(top_acts, top_indices)
+        # print("sae_out", sae_out)
         if self.W_skip is not None:
             sae_out += x.to(self.dtype) @ self.W_skip.mT
 
@@ -241,7 +248,11 @@ class SparseCoder(nn.Module):
             auxk_loss = sae_out.new_tensor(0.0)
 
         l2_loss = e.pow(2).sum()
-        fvu = l2_loss / total_variance
+        fvu = l2_loss / total_variance  # 1e-8 #/
+
+        # print("fvu", fvu, "l2", l2_loss, "total_variance", total_variance,
+        # "actual fvu" l2_loss.float() / total_variance) #, "total",
+        # total_variance)
 
         if self.cfg.multi_topk:
             top_acts, top_indices = pre_acts.topk(4 * self.cfg.k, sorted=False)

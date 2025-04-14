@@ -113,6 +113,9 @@ class TrainConfig(Serializable):
 
     save_dir: str = "checkpoints"
 
+    train_on_backward: bool = True
+    """Train on backward pass gradients instead of forward pass activations."""
+
     def __post_init__(self):
         """Validate the configuration."""
         if self.layers and self.layer_stride != 1:
@@ -126,3 +129,9 @@ class TrainConfig(Serializable):
 
         if not self.init_seeds:
             raise ValueError("Must specify at least one random seed.")
+
+        if self.train_on_backward and self.loss_fn in ("ce", "kl"):
+            raise ValueError(
+                f"Loss function '{self.loss_fn}' is not compatible "
+                "with train_on_backward=True."
+            )
