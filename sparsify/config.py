@@ -12,7 +12,7 @@ class SparseCoderConfig(Serializable):
     """
 
     activation: Literal[
-        "groupmax", "topk", "topk_binary", "binary", "gumbel_binary"
+        "groupmax", "topk", "topk_binary", "binary", "gumbel_binary", "optimal"
     ] = "topk"
     """Activation function to use."""
 

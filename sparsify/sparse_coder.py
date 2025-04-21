@@ -5,6 +5,7 @@ from typing import NamedTuple, Optional
 
 import einops
 import torch
+from eindex import eindex
 from huggingface_hub import snapshot_download
 from natsort import natsorted
 from safetensors.torch import load_model, save_model
@@ -12,6 +13,7 @@ from torch import Tensor, nn
 
 from .config import SparseCoderConfig
 from .fused_encoder import EncoderOutput, binary_fused_encoder, fused_encoder
+from .reinmax import reinmax
 from .utils import decoder_impl, eager_decode
 
 # Thresholded
@@ -129,116 +131,11 @@ def custom_gumbel_softmax(
     return y_hard - y_soft.detach() + y_soft
 
 
-class ReinMaxCore(torch.autograd.Function):
-    """
-    `torch.autograd.Function` implementation of the ReinMax gradient estimator.
-    """
-
-    @staticmethod
-    # @torch.compile(mode="max-autotune")
-    def forward(
-        ctx,
-        logits: torch.Tensor,
-        tau: torch.Tensor,
-    ):
-        y_soft = logits.softmax(dim=-1)
-        sample = torch.multinomial(
-            y_soft,
-            num_samples=1,
-            replacement=True,
-        )
-        one_hot_sample = torch.zeros_like(
-            y_soft, memory_format=torch.legacy_contiguous_format
-        ).scatter_(-1, sample, 1.0)
-        ctx.save_for_backward(one_hot_sample, logits, y_soft, tau)
-        return one_hot_sample, y_soft
-
-    @staticmethod
-    @torch.compile(mode="max-autotune")
-    def backward(
-        ctx,
-        grad_at_sample: torch.Tensor,
-        grad_at_p: torch.Tensor,
-    ):
-        one_hot_sample, logits, y_soft, tau = ctx.saved_tensors
-
-        shifted_y_soft = 0.5 * ((logits / tau).softmax(dim=-1) + one_hot_sample)
-        grad_at_input_1 = (2 * grad_at_sample) * shifted_y_soft
-        grad_at_input_1 = grad_at_input_1 - shifted_y_soft * grad_at_input_1.sum(
-            dim=-1, keepdim=True
-        )
-
-        grad_at_input_0 = (-0.5 * grad_at_sample + grad_at_p) * y_soft
-        grad_at_input_0 = grad_at_input_0 - y_soft * grad_at_input_0.sum(
-            dim=-1, keepdim=True
-        )
-
-        grad_at_input = grad_at_input_0 + grad_at_input_1
-        return grad_at_input - grad_at_input.mean(dim=-1, keepdim=True), None
-
-
-def reinmax(
-    logits: torch.Tensor,
-    tau: float,
-):
-    r"""
-    Parameters
-    ----------
-
-    logits: ``torch.Tensor``, required
-        The input Tensor for the softmax. Note that the softmax
-        operation would be conducted along the
-        last dimension.
-    tau: ``float``, required
-        The temperature hyper-parameter. Note note that reinmax
-        prefers to set tau >= 1, while gumbel-softmax prefers to set tau < 1.
-        For more details, please refer to their paper.
-
-    Returns
-    -------
-    y_hard: ``torch.Tensor``
-        The one-hot sample generated from ``multinomial(softmax(logits))``.
-    y_soft: ``torch.Tensor``
-        The output of the softmax function, i.e., ``softmax(logits)``.
-
-    Example
-    -------
-    Below is an example replacing Straight-Through Gumbel-Softmax with ReinMax
-
-    .. code-block:: python
-        :linenos:
-        :emphasize-added: 2
-        :emphasize-removed: 1
-
-        y_hard = torch.nn.functional.gumbel_softmax(logits, tau=tau, hard=True)
-        y_hard, _ = reinmax.reinmax(logits, tau)
-
-    Below is an example replacing Straight-Through with ReinMax
-
-    .. code-block:: python
-        :linenos:
-        :emphasize-added: 4
-        :emphasize-removed: 1,2,3
-
-        y_hard = one_hot_multinomial(logits.softmax())
-        y_soft_tau = (logits/tau).softmax()
-        y_hard = y_soft_tau - y_soft_tau.detach() + y_hard
-        y_hard, y_soft = reinmax.reinmax(logits, tau)
-    """
-    if tau < 1:
-        raise ValueError(
-            "ReinMax prefers to set the temperature (tau) larger or equal to 1."
-        )
-    shape = logits.size()
-    logits = logits.view(-1, shape[-1])
-    grad_sample, y_soft = ReinMaxCore.apply(logits, logits.new_empty(1).fill_(tau))
-    return grad_sample.view(shape), y_soft.view(shape)
-
-
 @torch.compile(mode="max-autotune-no-cudagraphs")
 def gumbel_encoder(x: Tensor, W_enc: Tensor, b_enc: Tensor, k: int) -> EncoderOutput:
-    if 1:
-        preacts = torch.einsum("...i,oi->...o", x, W_enc) + b_enc
+    preacts = torch.einsum("...i,oi->...o", x, W_enc) + b_enc
+
+    if 0:
         gumbel = torch.empty_like(preacts).exponential_().log().neg()
         gumbeled = preacts + gumbel
         softmaxed = torch.nn.functional.softmax(
@@ -257,7 +154,9 @@ def gumbel_encoder(x: Tensor, W_enc: Tensor, b_enc: Tensor, k: int) -> EncoderOu
         # values = torch.nn.functional.gumbel_softmax(
         #     grouped, tau=0.5, hard=True, dim=-1
         # )
+        threshold = grouped.topk(4, dim=-1).values[..., -1, None]
         values, _ = reinmax(grouped, tau=1.1)
+        values = torch.where(values >= threshold, values, values.detach())
         values = values.flatten(-2, -1)
         indices = (
             torch.arange(values.shape[-1], device=values.device)
@@ -514,43 +413,50 @@ class SparseCoder(nn.Module):
     def forward(
         self, x: Tensor, y: Tensor | None = None, *, dead_mask: Tensor | None = None
     ) -> ForwardOutput:
-        if self.cfg.activation == "binary":
-            # sae_out = binary_topk_encode_decode(
-            #   x, self.encoder.weight, self.encoder.bias,
-            #   self.W_dec.mT, self.b_dec, self.cfg.k)
-            # top_acts, top_indices, pre_acts = None, None, None
-            # top_acts = dense_binary_encode(x, self.encoder.weight, self.encoder.bias)
-            # top_indices = None
-            # pre_acts = None
+        # Used as a denominator for putting everything on a reasonable scale
+        total_variance = (y - y.mean(0)).pow(2).sum()
 
-            top_acts = dense_binary_encode(
-                x, self.encoder.weight, self.encoder.bias, self.log_threshold
+        if self.cfg.activation == "optimal":
+            pre_acts = x @ self.encoder.weight.T + self.encoder.bias
+            sae_out, top_acts, top_indices = OptimalDecoder.apply(
+                pre_acts, self.W_dec, self.b_dec, self.cfg.k, y
             )
-            top_indices, pre_acts = None, None
-            sae_out = top_acts @ self.W_dec + self.b_dec
         else:
-            top_acts, top_indices, pre_acts = self.encode(x)
+            if self.cfg.activation == "binary":
+                # sae_out = binary_topk_encode_decode(
+                #   x, self.encoder.weight, self.encoder.bias,
+                #   self.W_dec.mT, self.b_dec, self.cfg.k)
+                # top_acts, top_indices, pre_acts = None, None, None
+                # top_acts = dense_binary_encode(
+                # x, self.encoder.weight, self.encoder.bias)
+                # top_indices = None
+                # pre_acts = None
 
-        # If we aren't given a distinct target, we're autoencoding
-        if y is None:
-            y = x
+                top_acts = dense_binary_encode(
+                    x, self.encoder.weight, self.encoder.bias, self.log_threshold
+                )
+                top_indices, pre_acts = None, None
+                sae_out = top_acts @ self.W_dec + self.b_dec
+            else:
+                top_acts, top_indices, pre_acts = self.encode(x)
 
-        # Decode
-        if self.cfg.activation == "topk_binary":
-            sae_out = self.binary_decode(top_indices, top_acts)
-        elif self.cfg.activation == "binary":
-            pass
-            # sae_out = top_acts @ self.W_dec + self.b_dec
-        else:
-            sae_out = self.decode(top_acts, top_indices)
+            # If we aren't given a distinct target, we're autoencoding
+            if y is None:
+                y = x
+
+            # Decode
+            if self.cfg.activation == "topk_binary":
+                sae_out = self.binary_decode(top_indices, top_acts)
+            elif self.cfg.activation == "binary":
+                pass
+                # sae_out = top_acts @ self.W_dec + self.b_dec
+            else:
+                sae_out = self.decode(top_acts, top_indices)
         if self.W_skip is not None:
             sae_out += x.to(self.dtype) @ self.W_skip.mT
 
         # Compute the residual
         e = y - sae_out
-
-        # Used as a denominator for putting everything on a reasonable scale
-        total_variance = (y - y.mean(0)).pow(2).sum()
 
         # Second decoder pass for AuxK loss
         if dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
@@ -621,6 +527,150 @@ class SparseCoder(nn.Module):
             self.W_dec.data,
             "d_sae, d_sae d_in -> d_sae d_in",
         )
+
+
+class OptimalDecoder(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, pre_acts: Tensor, W_dec: Tensor, b_dec: Tensor, k: int, y: Tensor):
+        ctx.k = k
+        grouped = pre_acts.unflatten(-1, (k, -1))
+        # gumbel softmax
+        grouped = grouped + torch.empty_like(grouped).exponential_().log().neg()
+        values, indices = grouped.max(dim=-1)
+        indices = (
+            indices
+            + torch.arange(grouped.shape[-2], device=indices.device) * grouped.shape[-1]
+        )
+        thresholds = values[..., None]
+        masked = (grouped >= thresholds).float().flatten(-2, -1)
+        decoded = masked @ W_dec + b_dec
+        ctx.save_for_backward(pre_acts, W_dec, b_dec, y, decoded)
+        return decoded.clone(), values, indices
+
+    @torch.compile(mode="max-autotune-no-cudagraphs")
+    @staticmethod
+    def backward(ctx, grad_output, *_):
+        # grad_output is inaccurate.
+        # we need to compute the expectation of the gradient;
+        # for MSE loss, that is just the gradient for the expectation
+        # (ignore FVU for now)
+
+        pre_acts, W_dec, b_dec, y, decoded = ctx.saved_tensors
+        k = ctx.k
+        grouped = pre_acts.unflatten(-1, (k, -1)).detach().requires_grad_(True)
+        with torch.set_grad_enabled(True):
+            expected_acts = grouped.softmax(dim=-1)
+        expected_flat = expected_acts.detach().flatten(-2, -1)
+        expected_out = expected_flat @ W_dec + b_dec
+        grad_output = 2 * (expected_out - y)
+
+        d = expected_flat.shape[-1]
+        d // k
+
+        # now we need to compute the gradient from grad_output
+        # to all the pre_acts (logprobs)
+        grad_post = grad_output @ W_dec.T
+        grad_expected = grad_post.unflatten(-1, (k, -1))
+
+        grad_expected = torch.zeros_like(grad_expected)
+        W_dec_grouped = W_dec.unflatten(0, (k, -1))
+        expectation_of_all = torch.einsum(
+            "...ke,keo->...ko", expected_flat.unflatten(-1, (k, -1)), W_dec_grouped
+        )
+
+        with torch.no_grad():
+            # feature_idces = torch.randint(
+            #     0, expectation_of_all.shape[-1],
+            #     expectation_of_all.shape[:-1] + (2,),
+            #     device=expectation_of_all.device,
+            # )
+            feature_idces = torch.multinomial(
+                expected_acts.reshape(-1, expected_acts.shape[-1]),
+                1,
+                replacement=False,
+            ).reshape(*expected_acts.shape[:-1], -1)
+            p_this_feature_is_picked = torch.gather(
+                expectation_of_all, -1, feature_idces
+            )
+            # expectation_of_all.sum(-2)[..., None, :] :: b, 1, o
+            # W_dec_grouped[:, feature, :] :: k, o
+            # feature_idces :: b, k, 4
+            # we want
+            # f(expectation_of_all) :: b, 1, 1, o
+            # g(W_dec_grouped) :: b, k, 4, o
+
+            indexed_grouped = eindex(
+                W_dec_grouped,
+                feature_idces,
+                "group [batch group index] hidden -> batch group index hidden",
+            )
+            expectation = (
+                expectation_of_all.sum(-2)[..., None, None, :]
+                - expectation_of_all[..., None, :]
+                + indexed_grouped
+                + b_dec
+            )
+
+            new_grad_output = 2 * (expectation - y[..., None, None, :])
+            new_grad_post = torch.einsum(
+                "...gko,gfo->...gkf", new_grad_output, W_dec_grouped
+            )
+            p_this_feature_is_picked = (
+                p_this_feature_is_picked
+                / p_this_feature_is_picked.sum(dim=-1, keepdim=True)
+            )
+            grad_expected = (p_this_feature_is_picked[..., None] * new_grad_post).sum(
+                dim=-2
+            )
+
+        # for feature in trange(grad_expected.shape[-1]):
+        #     p_this_feature_is_picked =
+        # expectation_of_all[..., feature]
+        #     expectation = expectation_of_all.sum(-2)[..., None, :]
+        # - expectation_of_all + W_dec_grouped[:, feature, :] + b_dec
+        #     new_grad_output = 2 * (expectation - y[..., None, :])
+        #     new_grad_post = torch.einsum("...go,gfo->...gf",
+        # new_grad_output, W_dec_grouped)
+        #     grad_expected += p_this_feature_is_picked[..., None]
+        # * new_grad_post
+
+        # for group in trange(grad_expected.shape[-2]):
+        #     indices = torch.arange(
+        #         d, device=grad_expected.device
+        #     )
+        #     mask = (indices > group * group_size)
+        # & (indices < (group + 1) * group_size)
+        #     expectation_of_others = (expected_flat * mask)
+        # @ W_dec + b_dec
+        #     for feature in range(grad_expected.shape[-1]):
+        #         p_this_feature_is_picked = expected_flat[..., group, feature]
+        #         expectation = expectation_of_others + W_dec[feature]
+        #         new_grad_output = 2 * (expectation - y)
+        #         new_grad_post = new_grad_output @ W_dec.T
+        #         new_grad_expected = new_grad_post.unflatten(
+        # -1, (k, -1))[..., group, :]
+        #         grad_expected[..., group, :] +=
+        # p_this_feature_is_picked[..., None] * new_grad_expected
+
+        # softmax backward pass
+        grad_pre = torch.autograd.grad(
+            expected_acts,
+            grouped,
+            grad_expected,
+            retain_graph=False,
+        )[0].flatten(-2, -1)
+
+        grad_input = grad_pre
+        grad_W_dec = expected_flat.T @ grad_output
+        grad_b_dec = grad_output.sum(0)
+
+        return (
+            grad_input,
+            grad_W_dec,
+            grad_b_dec,
+            None,
+            None,
+        )  # No gradient for y
 
 
 # Allow for alternate naming conventions
