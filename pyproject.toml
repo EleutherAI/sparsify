@@ -10,11 +10,12 @@ requires-python = ">=3.10"
 keywords = ["interpretability", "explainable-ai"]
 license = {text = "MIT License"}
 dependencies = [
-    "accelerate",   # For device_map in from_pretrained
+    "accelerate", # For device_map in from_pretrained
     "datasets",
+    "eindex-callum",
     "einops",
     "huggingface-hub",
-    "natsort",  # For sorting module names
+    "natsort", # For sorting module names
     "safetensors",
     "schedulefree",
     "simple-parsing",
@@ -47,3 +48,6 @@ line-length = 88
 # Such imports will be flagged with a dedicated message suggesting
 # that the import is either added to the module's __all__ symbol
 ignore-init-module-imports = true
+
+[tool.uv.sources]
+eindex-callum = { git = "https://github.com/callummcdougall/eindex.git" }

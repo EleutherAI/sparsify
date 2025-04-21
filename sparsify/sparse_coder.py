@@ -560,8 +560,8 @@ class OptimalDecoder(torch.autograd.Function):
         k = ctx.k
         grouped = pre_acts.unflatten(-1, (k, -1)).detach().requires_grad_(True)
         with torch.set_grad_enabled(True):
-            # expected_acts = (grouped + gumbel).softmax(dim=-1)
-            expected_acts = (grouped).softmax(dim=-1)
+            expected_acts = (grouped + gumbel).softmax(dim=-1)
+            # expected_acts = (grouped).softmax(dim=-1)
         expected_flat = expected_acts.detach().flatten(-2, -1)
 
         grad_expected = (grad_output @ W_dec.T).unflatten(-1, (k, -1))
