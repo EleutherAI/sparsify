@@ -535,7 +535,8 @@ class OptimalDecoder(torch.autograd.Function):
         ctx.k = k
         grouped = pre_acts.unflatten(-1, (k, -1))
         # gumbel softmax
-        grouped = grouped + torch.empty_like(grouped).exponential_().log().neg()
+        gumbel = torch.empty_like(grouped).exponential_().log().neg()
+        grouped = grouped + gumbel
         values, indices = grouped.max(dim=-1)
         indices = (
             indices
@@ -544,7 +545,7 @@ class OptimalDecoder(torch.autograd.Function):
         thresholds = values[..., None]
         masked = (grouped >= thresholds).float().flatten(-2, -1)
         decoded = masked @ W_dec + b_dec
-        ctx.save_for_backward(pre_acts, W_dec, b_dec, y, decoded)
+        ctx.save_for_backward(pre_acts, W_dec, b_dec, y, decoded, gumbel)
         return decoded.clone(), values, indices
 
     @torch.compile(mode="max-autotune-no-cudagraphs")
@@ -555,12 +556,36 @@ class OptimalDecoder(torch.autograd.Function):
         # for MSE loss, that is just the gradient for the expectation
         # (ignore FVU for now)
 
-        pre_acts, W_dec, b_dec, y, decoded = ctx.saved_tensors
+        pre_acts, W_dec, b_dec, y, decoded, gumbel = ctx.saved_tensors
         k = ctx.k
         grouped = pre_acts.unflatten(-1, (k, -1)).detach().requires_grad_(True)
         with torch.set_grad_enabled(True):
-            expected_acts = grouped.softmax(dim=-1)
+            # expected_acts = (grouped + gumbel).softmax(dim=-1)
+            expected_acts = (grouped).softmax(dim=-1)
         expected_flat = expected_acts.detach().flatten(-2, -1)
+
+        grad_expected = (grad_output @ W_dec.T).unflatten(-1, (k, -1))
+
+        # softmax backward pass
+        grad_pre = torch.autograd.grad(
+            expected_acts,
+            grouped,
+            grad_expected,
+            retain_graph=False,
+        )[0].flatten(-2, -1)
+
+        grad_input = grad_pre
+        grad_W_dec = expected_flat.T @ grad_output
+        grad_b_dec = grad_output.sum(0)
+
+        return (
+            grad_input,
+            grad_W_dec,
+            grad_b_dec,
+            None,
+            None,
+        )  # No gradient for y
+
         expected_out = expected_flat @ W_dec + b_dec
         grad_output = 2 * (expected_out - y)
 
