@@ -249,7 +249,7 @@ class SparseCoder(nn.Module):
     # Wrapping the forward in bf16 autocast improves performance by almost 2x
     def forward_generator(
         self, x: Tensor, *, dead_mask: Tensor | None = None
-    ) -> Generator[Optional[ForwardOutput], Tensor | None, None]:
+    ) -> Generator[Optional[ForwardOutput], Tensor | tuple | None, None]:
         with torch.autocast(
             "cuda",
             dtype=torch.bfloat16,
@@ -258,27 +258,28 @@ class SparseCoder(nn.Module):
             top_acts, top_indices, pre_acts = self.encode(x)
 
             y = None
-            first_pass = True
             for W_dec, W_skip, b_dec, is_last in zip(
                 (self.W_dec,) if not self.multi_target else self.W_decs,
                 (self.W_skip,) if not self.multi_target else self.W_skips,
                 (self.b_dec,) if not self.multi_target else self.b_decs,
                 (False,) * (self.cfg.n_targets - 1) + (True,),
             ):
-                if first_pass:
-                    first_pass = False
-                    y = yield
+                y = yield
 
                 # If we aren't given a distinct target, we're autoencoding
                 if y is None:
                     y = x
 
+                addition = 0
+                if isinstance(y, tuple):
+                    y, addition = y
                 assert isinstance(y, Tensor), "y must be a tensor."
 
                 # Decode
                 sae_out = self.decode(top_acts, top_indices, W_dec, b_dec)
                 if W_skip is not None:
                     sae_out += x.to(self.dtype) @ W_skip.mT
+                sae_out += addition
 
                 # Compute the residual
                 e = y - sae_out
@@ -331,7 +332,7 @@ class SparseCoder(nn.Module):
                     is_last,
                 )
 
-                y = yield result
+                yield result
 
     @torch.no_grad()
     def set_decoder_norm_to_unit_norm(self):

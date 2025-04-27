@@ -417,18 +417,20 @@ class Trainer:
                     else None
                 ),
             )  # type: ignore
-            next(out_generator)
             layer_generators[name] = out_generator
 
             output = 0
             to_delete = set()
-
             out = None
-            for hookpoint, out in (
-                (name, layer_generator.send(outputs))
-                for name, layer_generator in layer_generators.items()
-            ):
-                output += out.sae_out.reshape(out_shape).type_as(outputs)
+            for hookpoint, layer_generator in layer_generators.items():
+                next(layer_generator)
+                out = layer_generator.send(
+                    (
+                        outputs,
+                        output / len(layer_generators) if hookpoint == name else 0,
+                    )
+                )
+                output += out.sae_out
                 if out.is_last:
                     to_delete.add(hookpoint)
 
@@ -446,42 +448,32 @@ class Trainer:
 
             if self.cfg.loss_fn in ("ce", "kl"):
                 # Replace the normal output with the SAE output
-                return (output, *aux_out) if aux_out is not None else output
+                return (
+                    (output.reshape(out_shape).type_as(outputs), *aux_out)
+                    if aux_out is not None
+                    else output
+                )
             else:
                 assert self.cfg.loss_fn == "fvu"
 
-                if not cross_layer:
-                    # Metrics that only make sense for local
-                    avg_fvu[name] += float(
-                        self.maybe_all_reduce(out.fvu.detach()) / denom
+                # Metrics that only make sense for local
+                avg_fvu[name] += float(self.maybe_all_reduce(out.fvu.detach()) / denom)
+                if self.cfg.auxk_alpha > 0:
+                    avg_auxk_loss[name] += float(
+                        self.maybe_all_reduce(out.auxk_loss.detach()) / denom
                     )
-                    if self.cfg.auxk_alpha > 0:
-                        avg_auxk_loss[name] += float(
-                            self.maybe_all_reduce(out.auxk_loss.detach()) / denom
-                        )
-                    if self.cfg.sae.multi_topk:
-                        avg_multi_topk_fvu[name] += float(
-                            self.maybe_all_reduce(out.multi_topk_fvu.detach()) / denom
-                        )
-                    loss = (
-                        out.fvu
-                        + self.cfg.auxk_alpha * out.auxk_loss
-                        + out.multi_topk_fvu / 8
+                if self.cfg.sae.multi_topk:
+                    avg_multi_topk_fvu[name] += float(
+                        self.maybe_all_reduce(out.multi_topk_fvu.detach()) / denom
                     )
-                else:
-                    # Compute the residual
-                    e = outputs - output.view(outputs.shape)
-                    # Used as a denominator for putting everything on a reasonable scale
-                    total_variance = (outputs - outputs.mean(0)).pow(2).sum()
-
-                    l2_loss = e.pow(2).sum()
-                    fvu = l2_loss / total_variance
-                    avg_fvu[name] += float(self.maybe_all_reduce(fvu.detach()) / denom)
-
-                    loss = fvu + self.cfg.auxk_alpha * out.auxk_loss
+                loss = (
+                    out.fvu
+                    + self.cfg.auxk_alpha * out.auxk_loss
+                    + out.multi_topk_fvu / 8
+                )
 
                 # Do a "local" backward pass if we're not training end-to-end
-                loss.div(acc_steps).backward(retain_graph=not out.is_last)
+                loss.div(acc_steps).backward(retain_graph=True)
 
         k = self.get_current_k()
         for name, sae in self.saes.items():
