@@ -430,7 +430,9 @@ class Trainer:
             output = 0
             to_delete = set()
             out, hookpoint = None, None
+            to_restore = []
             for hookpoint, layer_mid in layer_mids.items():
+                layer_mid.detach()
                 out = layer_mid(
                     outputs,
                     addition=(
@@ -440,6 +442,7 @@ class Trainer:
                     ),
                     no_extras=hookpoint != name,
                 )
+                to_restore.append((layer_mid, out.is_last))
                 output += out.sae_out
                 if out.is_last:
                     to_delete.add(hookpoint)
@@ -488,9 +491,12 @@ class Trainer:
                 )
 
                 # Do a "local" backward pass if we're not training end-to-end
-                loss.div(acc_steps).backward(retain_graph=True)
-
+                loss.div(acc_steps).backward()
             del loss
+
+            for restorable, was_last in to_restore:
+                restorable.restore(was_last)
+
             gc.collect()
             torch.cuda.empty_cache()
 

@@ -55,6 +55,19 @@ class MidDecoder:
         self.dead_mask = dead_mask
         self._index = 0
 
+    def detach(self):
+        self.original_activations = self.activations
+        self.activations = self.activations.detach()
+        self.activations.requires_grad = True
+
+    def restore(self, is_last: bool = False):
+        grad = self.activations.grad
+        assert grad is not None, "Activations have no gradient."
+        self.activations = self.original_activations
+        torch.dot(self.activations.ravel(), grad.ravel()).backward(
+            retain_graph=not is_last
+        )
+
     def next(self):
         self._index += 1
 
