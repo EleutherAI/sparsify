@@ -60,7 +60,7 @@ class SparseCoder(nn.Module):
             # Transcoder initialization: use zeros
             if cfg.transcode:
                 if self.multi_target:
-                    self.W_decs = []
+                    self.W_decs = nn.ParameterList()
                     for _ in range(cfg.n_targets):
                         self.W_decs.append(
                             nn.Parameter(torch.zeros_like(self.encoder.weight.data))
@@ -79,8 +79,8 @@ class SparseCoder(nn.Module):
             self.W_dec = None
 
         if self.multi_target:
-            self.b_decs = []
-            self.W_skips = []
+            self.b_decs = nn.ParameterList()
+            self.W_skips = nn.ParameterList()
             for _ in range(cfg.n_targets):
                 self.b_decs.append(
                     nn.Parameter(torch.zeros(d_in, dtype=dtype, device=device))

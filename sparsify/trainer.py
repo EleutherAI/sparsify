@@ -1,3 +1,4 @@
+import gc
 from collections import defaultdict
 from dataclasses import asdict, replace
 from fnmatch import fnmatchcase
@@ -90,10 +91,15 @@ class Trainer:
                 name = f"{hook}/seed{seed}" if len(cfg.init_seeds) > 1 else hook
                 sae_cfg = replace(
                     cfg.sae,
-                    n_targets=min(
-                        cfg.cross_layer_step, len(self.cfg.hookpoints) - position - 1
-                    )
-                    + 1,
+                    n_targets=(
+                        min(
+                            cfg.cross_layer_step,
+                            len(self.cfg.hookpoints) - position - 1,
+                        )
+                        + 1
+                        if cfg.cross_layer_step > 0
+                        else 0
+                    ),
                 )
                 self.saes[name] = SparseCoder(
                     input_widths[hook], sae_cfg, device, dtype=torch.float32
@@ -421,26 +427,32 @@ class Trainer:
 
             output = 0
             to_delete = set()
-            out = None
+            out, hookpoint = None, None
             for hookpoint, layer_generator in layer_generators.items():
                 next(layer_generator)
                 out = layer_generator.send(
-                    (
+                    outputs
+                    if hookpoint != name
+                    else (
                         outputs,
-                        output / len(layer_generators) if hookpoint == name else 0,
+                        output / max(1, len(layer_generators)),
                     )
                 )
                 output += out.sae_out
                 if out.is_last:
                     to_delete.add(hookpoint)
-
-            for name in to_delete:
-                layer_generators[name].close()
-                del layer_generators[name]
-
+            if self.cfg.loss_fn == "fvu":
+                del output
             # last output guaranteed to be the current layer
+            assert hookpoint == name
             assert isinstance(out, ForwardOutput)
-            assert isinstance(output, Tensor)
+
+            for hookpoint in to_delete:
+                layer_generators[hookpoint].close()
+                del layer_generators[hookpoint]
+
+            gc.collect()
+            torch.cuda.empty_cache()
 
             # Update the did_fire mask
             did_fire[name][out.latent_indices.flatten()] = True
@@ -474,6 +486,10 @@ class Trainer:
 
                 # Do a "local" backward pass if we're not training end-to-end
                 loss.div(acc_steps).backward(retain_graph=True)
+
+            del loss
+            gc.collect()
+            torch.cuda.empty_cache()
 
         k = self.get_current_k()
         for name, sae in self.saes.items():
@@ -534,6 +550,9 @@ class Trainer:
             finally:
                 for handle in handles:
                     handle.remove()
+                layer_generators.clear()
+                gc.collect()
+                torch.cuda.empty_cache()
 
             # Check if we need to actually do a training step
             step, substep = divmod(self.global_step + 1, self.cfg.grad_acc_steps)
