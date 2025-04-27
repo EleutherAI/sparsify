@@ -102,8 +102,13 @@ class TrainConfig(Serializable):
     """How many layers ahead to train the sparse coder on.
     If 0, train only on the same layer."""
 
-    distribute_modules: bool = False
-    """Store one copy of each sparse coder, instead of copying them across devices."""
+    tp: int = 1
+    """Number of tensor parallel ranks to use."""
+
+    @property
+    def distribute_modules(self) -> bool:
+        """Whether to distribute the modules across ranks."""
+        return self.tp > 1
 
     save_every: int = 1000
     """Save sparse coders every `save_every` steps."""

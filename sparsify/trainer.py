@@ -12,7 +12,8 @@ from natsort import natsorted
 from safetensors.torch import load_model
 from schedulefree import ScheduleFreeWrapper
 from torch import Tensor, nn
-from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor.device_mesh import DeviceMesh
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import PreTrainedModel, get_linear_schedule_with_warmup
@@ -31,7 +32,9 @@ class Trainer:
         cfg: TrainConfig,
         dataset: HfDataset | MemmapDataset,
         model: PreTrainedModel,
+        mesh: DeviceMesh | None = None,
     ):
+        self.mesh = mesh
         # Store the whole model, including any potential causal LM wrapper
         self.model = model
 
@@ -60,10 +63,9 @@ class Trainer:
 
         self.cfg = cfg
         self.dataset = dataset
-        self.distribute_modules()
 
         device = model.device
-        input_widths = resolve_widths(model, cfg.hookpoints)
+        input_widths = resolve_widths(model, cfg.hookpoints, mesh=self.mesh)
         unique_widths = set(input_widths.values())
 
         if cfg.distribute_modules and len(unique_widths) > 1:
@@ -77,12 +79,7 @@ class Trainer:
         print(f"Initializing SAEs with random seed(s) {cfg.init_seeds}")
         self.saes = {}
         for position, hook in enumerate(
-            self.local_hookpoints(),
-            start=(
-                0
-                if not cfg.distribute_modules
-                else dist.get_rank() * len(self.local_hookpoints())
-            ),
+            self.cfg.hookpoints,
         ):
             for seed in cfg.init_seeds:
                 torch.manual_seed(seed)
@@ -102,7 +99,7 @@ class Trainer:
                     ),
                 )
                 self.saes[name] = SparseCoder(
-                    input_widths[hook], sae_cfg, device, dtype=torch.float32
+                    input_widths[hook], sae_cfg, device, dtype=torch.float32, mesh=mesh
                 )
 
         assert isinstance(dataset, Sized)
@@ -194,7 +191,7 @@ class Trainer:
         self.final_k = self.cfg.sae.k
 
         self.best_loss = (
-            {name: float("inf") for name in self.local_hookpoints()}
+            {name: float("inf") for name in self.cfg.hookpoints}
             if self.cfg.loss_fn == "fvu"
             else float("inf")
         )
@@ -258,7 +255,6 @@ class Trainer:
         self.model.requires_grad_(False)
 
         rank_zero = not dist.is_initialized() or dist.get_rank() == 0
-        ddp = dist.is_initialized() and not self.cfg.distribute_modules
 
         wandb = None
         if self.cfg.log_to_wandb and rank_zero:
@@ -325,17 +321,20 @@ class Trainer:
         avg_ce = 0.0
         avg_kl = 0.0
         avg_losses = (
-            {name: float("inf") for name in self.local_hookpoints()}
+            {name: float("inf") for name in self.cfg.hookpoints}
             if self.cfg.loss_fn == "fvu"
             else float("inf")
         )
 
         if self.cfg.loss_fn == "ce":
             batch = next(iter(dl))
-            x = batch["input_ids"].to(device)
+            x = batch["input_ids"]
+            if self.mesh is not None:
+                x = DTensor.from_local(x, self.mesh, [Shard(0), Replicate()])
+            else:
+                x = x.to(device)
 
             clean_loss = self.model(x, labels=x).loss
-            self.maybe_all_reduce(clean_loss)
             if rank_zero:
                 print(f"Initial CE loss: {clean_loss.item():.4f}")
 
@@ -349,7 +348,6 @@ class Trainer:
             name: self.model.base_model.get_submodule(name)
             for name in self.cfg.hookpoints
         }
-        maybe_wrapped: dict[str, DDP] | dict[str, SparseCoder] = {}
         module_to_name = {v: k for k, v in name_to_module.items()}
 
         layer_mids = {}
@@ -370,25 +368,6 @@ class Trainer:
             # Remember the original output shape since we'll need it for e2e training
             out_shape = outputs.shape
 
-            # Scatter and gather the hidden states across ranks if necessary
-            if self.cfg.distribute_modules:
-                world_outputs = outputs.new_empty(
-                    outputs.shape[0] * dist.get_world_size(), *outputs.shape[1:]
-                )
-                dist.all_gather_into_tensor(world_outputs, outputs)
-                outputs = world_outputs
-
-                # Don't bother with the communication overhead if we're autoencoding
-                if self.cfg.sae.transcode:
-                    world_inputs = inputs.new_empty(
-                        inputs.shape[0] * dist.get_world_size(), *inputs.shape[1:]
-                    )
-                    dist.all_gather_into_tensor(world_inputs, inputs)
-                    inputs = world_inputs
-
-                if name not in self.module_plan[dist.get_rank()]:
-                    return
-
             # Flatten the batch and sequence dimensions
             outputs = outputs.flatten(0, 1)
             inputs = inputs.flatten(0, 1) if self.cfg.sae.transcode else outputs
@@ -400,21 +379,29 @@ class Trainer:
                 # This is mathematically equivalent to Anthropic's proposal of
                 # subtracting the decoder bias
                 if self.cfg.sae.transcode:
-                    mean = self.maybe_all_reduce(inputs.mean(0)).to(raw.dtype)
-                    mean_image = -mean @ raw.encoder.weight.data.T
+                    mean = inputs.mean(0).to(raw.dtype)
+                    mean = (
+                        DTensor.from_local(mean, self.mesh["tp"], [Shard(0)])
+                        if self.mesh is not None
+                        else mean
+                    )
+                    # mean_image = -mean @ raw.encoder.weight.data.T
+                    mean_image = raw.encoder(-mean)  # - raw.encoder.bias.data
                     raw.encoder.bias.data = mean_image
 
-                mean = self.maybe_all_reduce(outputs.mean(0))
+                mean = outputs.mean(0)
                 if not cross_layer:
                     raw.b_dec.data = mean.to(raw.dtype)
                 else:
+                    # the current layer must be what handles the bias,
+                    # not the contributing previous layers
                     raw.b_decs[0].data = mean.to(raw.dtype)
 
             # Make sure the W_dec is still unit-norm if we're autoencoding
             if raw.cfg.normalize_decoder and not self.cfg.sae.transcode:
                 raw.set_decoder_norm_to_unit_norm()
 
-            wrapped = maybe_wrapped[name]
+            wrapped = self.saes[name]
             out_mid = wrapped(
                 x=inputs,
                 y=outputs,
@@ -462,7 +449,7 @@ class Trainer:
 
             # Update the did_fire mask
             did_fire[name][out.latent_indices.flatten()] = True
-            self.maybe_all_reduce(did_fire[name], "max")  # max is boolean "any"
+            self.maybe_all_reduce(did_fire[name], "max")
 
             if self.cfg.loss_fn in ("ce", "kl"):
                 # Replace the normal output with the SAE output
@@ -475,14 +462,12 @@ class Trainer:
                 assert self.cfg.loss_fn == "fvu"
 
                 # Metrics that only make sense for local
-                avg_fvu[name] += float(self.maybe_all_reduce(out.fvu.detach()) / denom)
+                avg_fvu[name] += float(out.fvu.detach() / denom)
                 if self.cfg.auxk_alpha > 0:
-                    avg_auxk_loss[name] += float(
-                        self.maybe_all_reduce(out.auxk_loss.detach()) / denom
-                    )
+                    avg_auxk_loss[name] += float(out.auxk_loss.detach() / denom)
                 if self.cfg.sae.multi_topk:
                     avg_multi_topk_fvu[name] += float(
-                        self.maybe_all_reduce(out.multi_topk_fvu.detach()) / denom
+                        out.multi_topk_fvu.detach() / denom
                     )
                 loss = (
                     out.fvu
@@ -505,20 +490,11 @@ class Trainer:
             sae.cfg.k = k
 
         for batch in dl:
-            x = batch["input_ids"].to(device)
-
-            if not maybe_wrapped:
-                # Wrap the SAEs with Distributed Data Parallel. We have to do this
-                # after we set the decoder bias, otherwise DDP will not register
-                # gradients flowing to the bias after the first step.
-                maybe_wrapped = (
-                    {
-                        name: DDP(sae, device_ids=[dist.get_rank()])
-                        for name, sae in self.saes.items()
-                    }
-                    if ddp
-                    else self.saes
-                )
+            x = batch["input_ids"]
+            if self.mesh is not None:
+                x = DTensor.from_local(x, self.mesh, [Shard(0), Replicate()])
+            else:
+                x = x.to(device)
 
             # Bookkeeping for dead feature detection
             N = x.numel()
@@ -541,7 +517,7 @@ class Trainer:
                         ce = self.model(x, labels=x).loss
                         ce.div(acc_steps).backward()
 
-                        avg_ce += float(self.maybe_all_reduce(ce.detach()) / denom)
+                        avg_ce += float(ce.detach() / denom)
 
                         avg_losses = avg_ce
                     case "kl":
@@ -549,7 +525,7 @@ class Trainer:
                         kl = -torch.sum(clean_probs * dirty_lps, dim=-1).mean()
                         kl.div(acc_steps).backward()
 
-                        avg_kl += float(self.maybe_all_reduce(kl) / denom)
+                        avg_kl += float(kl / denom)
                         avg_losses = avg_kl
                     case "fvu":
                         self.model(x)
@@ -651,55 +627,28 @@ class Trainer:
 
         pbar.close()
 
-    def local_hookpoints(self) -> list[str]:
-        return (
-            self.module_plan[dist.get_rank()]
-            if self.module_plan
-            else self.cfg.hookpoints
-        )
-
-    def maybe_all_cat(self, x: Tensor) -> Tensor:
-        """Concatenate a tensor across all processes."""
-        if not dist.is_initialized() or self.cfg.distribute_modules:
-            return x
-
-        buffer = x.new_empty([dist.get_world_size() * x.shape[0], *x.shape[1:]])
-        dist.all_gather_into_tensor(buffer, x)
-        return buffer
-
     def maybe_all_reduce(self, x: Tensor, op: str = "mean") -> Tensor:
-        if not dist.is_initialized() or self.cfg.distribute_modules:
+        if not dist.is_initialized() or self.mesh is None:
             return x
 
         if op == "sum":
-            dist.all_reduce(x, op=dist.ReduceOp.SUM)
+            dist_op = dist.ReduceOp.SUM
         elif op == "mean":
-            dist.all_reduce(x, op=dist.ReduceOp.SUM)
-            x /= dist.get_world_size()
+            dist_op = dist.ReduceOp.SUM
         elif op == "max":
-            dist.all_reduce(x, op=dist.ReduceOp.MAX)
+            dist_op = dist.ReduceOp.MAX
         else:
             raise ValueError(f"Unknown reduction op '{op}'")
+        dist.all_reduce(
+            x,
+            op=dist_op,
+            group=self.mesh.get_group("dp"),
+        )
+
+        if op == "mean":
+            x /= self.mesh.shape[0]
 
         return x
-
-    def distribute_modules(self):
-        """Prepare a plan for distributing modules across ranks."""
-        if not self.cfg.distribute_modules:
-            self.module_plan = []
-            print(f"Training on modules: {self.cfg.hookpoints}")
-            return
-
-        layers_per_rank, rem = divmod(len(self.cfg.hookpoints), dist.get_world_size())
-        assert rem == 0, "Number of modules must be divisible by world size"
-
-        # Each rank gets a subset of the layers
-        self.module_plan = [
-            self.cfg.hookpoints[start : start + layers_per_rank]
-            for start in range(0, len(self.cfg.hookpoints), layers_per_rank)
-        ]
-        for rank, modules in enumerate(self.module_plan):
-            print(f"Rank {rank} modules: {modules}")
 
     def _checkpoint(self, saes: dict[str, SparseCoder], path: str, rank_zero: bool):
         """Save SAEs and training state to disk."""

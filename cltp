@@ -1,5 +1,4 @@
 #!/bin/bash
 WANDB_ENTITY=eleutherai uv run torchrun --nproc_per_node gpu -m sparsify \
---distribute_modules=1 \
 "HuggingFaceTB/SmolLM2-135M" --transcode=True \
 --run_name clt/$1 ${@:2}

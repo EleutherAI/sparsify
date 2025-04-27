@@ -1,9 +1,10 @@
 import os
-from typing import Any, Type, TypeVar, cast
+from typing import Any, Optional, Type, TypeVar, cast
 
 import torch
-from accelerate.utils import send_to_device
 from torch import Tensor, nn
+from torch.distributed.tensor import distribute_tensor
+from torch.distributed.tensor.device_mesh import DeviceMesh
 from transformers import PreTrainedModel
 
 T = TypeVar("T")
@@ -30,11 +31,11 @@ def get_layer_list(model: PreTrainedModel) -> tuple[str, nn.ModuleList]:
     return candidates[0]
 
 
-@torch.inference_mode()
 def resolve_widths(
     model: PreTrainedModel,
     module_names: list[str],
     dim: int = -1,
+    mesh: Optional[DeviceMesh] = None,
 ) -> dict[str, int]:
     """Find number of output dimensions for the specified modules."""
     module_to_name = {
@@ -51,12 +52,16 @@ def resolve_widths(
         shapes[name] = output.shape[dim]
 
     handles = [mod.register_forward_hook(hook) for mod in module_to_name]
-    dummy = send_to_device(model.dummy_inputs, model.device)
-    try:
-        model(**dummy)
-    finally:
-        for handle in handles:
-            handle.remove()
+    with torch.inference_mode() if mesh is None else torch.no_grad():
+        dummy = {
+            k: v if mesh is None else distribute_tensor(v, mesh)
+            for k, v in model.dummy_inputs.items()
+        }
+        try:
+            model(**dummy)
+        finally:
+            for handle in handles:
+                handle.remove()
 
     return shapes
 

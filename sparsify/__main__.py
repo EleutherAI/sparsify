@@ -9,6 +9,7 @@ import torch.distributed as dist
 from datasets import Dataset, load_dataset
 from safetensors.torch import load_model
 from simple_parsing import field, parse
+from torch.distributed.tensor import distribute_module, init_device_mesh
 from transformers import (
     AutoModel,
     AutoModelForCausalLM,
@@ -138,48 +139,66 @@ def load_artifacts(
 
 
 def run():
+    args = parse(RunConfig)
+
     local_rank = os.environ.get("LOCAL_RANK")
-    ddp = local_rank is not None
-    rank = int(local_rank) if ddp else 0
+    distributed = local_rank is not None
+    rank = int(local_rank) if distributed else 0
 
-    if ddp:
-        torch.cuda.set_device(int(local_rank))
-
+    if distributed:
+        torch.cuda.set_device(rank)
         # Increase the default timeout in order to account for slow downloads
         # and data preprocessing on the main rank
         dist.init_process_group(
             "nccl", device_id=torch.device(rank), timeout=timedelta(weeks=1)
         )
+        dist.barrier()
+        world_size = dist.get_world_size()
+        mesh = init_device_mesh(
+            "cuda",
+            (world_size // args.tp, args.tp),
+            mesh_dim_names=("dp", "tp"),
+        )
+        dp_rank = mesh.get_coordinate()[0]  # type: ignore
 
         if rank == 0:
             print(f"Using DDP/TP across {dist.get_world_size()} GPUs.")
 
-    args = parse(RunConfig)
+        dist.barrier()
+    else:
+        mesh = None
+        dp_rank = 0
 
     # Prevent ranks other than 0 from printing
     with nullcontext() if rank == 0 else redirect_stdout(None):
         # Awkward hack to prevent other ranks from duplicating data preprocessing
-        if not ddp or rank == 0:
+        if not distributed or rank == 0:
             model, dataset = load_artifacts(args, rank)
-        if ddp:
+        if distributed:
             dist.barrier()
             if rank != 0:
                 model, dataset = load_artifacts(args, rank)
+            dist.barrier()
+
+            model = distribute_module(
+                model,
+                mesh,
+            )
 
             # Drop examples that are indivisible across processes to prevent deadlock
-            remainder_examples = len(dataset) % dist.get_world_size()
+            remainder_examples = len(dataset) % mesh.shape[0]
             dataset = dataset.select(range(len(dataset) - remainder_examples))
 
-            dataset = dataset.shard(dist.get_world_size(), rank)
+            dataset = dataset.shard(mesh.shape[0], dp_rank)
 
             # Drop examples that are indivisible across processes to prevent deadlock
-            remainder_examples = len(dataset) % dist.get_world_size()
+            remainder_examples = len(dataset) % mesh.shape[0]
             dataset = dataset.select(range(len(dataset) - remainder_examples))
 
         print(f"Training on '{args.dataset}' (split '{args.split}')")
         print(f"Storing model weights in {model.dtype}")
 
-        trainer = Trainer(args, dataset, model)
+        trainer = Trainer(args, dataset, model, mesh)
         if args.resume:
             trainer.load_state(f"checkpoints/{args.run_name}" or "checkpoints/unnamed")
         elif args.finetune:

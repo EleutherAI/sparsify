@@ -5,10 +5,14 @@ from typing import NamedTuple, Optional
 
 import einops
 import torch
+import torch.distributed.tensor
+import torch.distributed.tensor.parallel
 from huggingface_hub import snapshot_download
 from natsort import natsorted
 from safetensors.torch import load_model, save_model
 from torch import Tensor, nn
+from torch.distributed import tensor as dtensor
+from torch.distributed.tensor.device_mesh import DeviceMesh
 
 from .config import SparseCoderConfig
 from .fused_encoder import EncoderOutput, fused_encoder
@@ -184,29 +188,45 @@ class SparseCoder(nn.Module):
         dtype: torch.dtype | None = None,
         *,
         decoder: bool = True,
+        mesh: Optional[DeviceMesh] = None,
     ):
         super().__init__()
         self.cfg = cfg
         self.d_in = d_in
         self.num_latents = cfg.num_latents or d_in * cfg.expansion_factor
         self.multi_target = cfg.n_targets > 0 and cfg.transcode
+        self.mesh = mesh
 
         self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
         self.encoder.bias.data.zero_()
+        if mesh is not None:
+            self.encoder = torch.distributed.tensor.parallel.parallelize_module(
+                self.encoder,
+                mesh["tp"],
+                torch.distributed.tensor.parallel.RowwiseParallel(),
+            )
 
         if decoder:
             # Transcoder initialization: use zeros
             if cfg.transcode:
+
+                def copy_encoder():
+                    if mesh is not None:
+                        return dtensor.zeros(
+                            (self.num_latents, d_in),
+                            dtype=dtype,
+                            device_mesh=mesh,
+                            placements=[dtensor.Replicate(), dtensor.Shard(1)],
+                        )
+                    else:
+                        return torch.zeros_like(self.encoder.weight.data)
+
                 if self.multi_target:
                     self.W_decs = nn.ParameterList()
                     for _ in range(cfg.n_targets):
-                        self.W_decs.append(
-                            nn.Parameter(torch.zeros_like(self.encoder.weight.data))
-                        )
+                        self.W_decs.append(nn.Parameter(copy_encoder()))
                 else:
-                    self.W_dec = nn.Parameter(
-                        torch.zeros_like(self.encoder.weight.data)
-                    )
+                    self.W_dec = nn.Parameter(torch.zeros_like(copy_encoder()))
 
             # Sparse autoencoder initialization: use the transpose of encoder weights
             else:
