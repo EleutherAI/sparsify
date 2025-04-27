@@ -1,5 +1,5 @@
 from collections import defaultdict
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from fnmatch import fnmatchcase
 from glob import glob
 from typing import Sized
@@ -20,7 +20,7 @@ from .config import TrainConfig
 from .data import MemmapDataset
 from .muon import Muon
 from .sign_sgd import SignSGD
-from .sparse_coder import SparseCoder
+from .sparse_coder import ForwardOutput, SparseCoder
 from .utils import get_layer_list, resolve_widths, set_submodule
 
 
@@ -75,14 +75,28 @@ class Trainer:
         # Initialize all the SAEs
         print(f"Initializing SAEs with random seed(s) {cfg.init_seeds}")
         self.saes = {}
-        for hook in self.local_hookpoints():
+        for position, hook in enumerate(
+            self.local_hookpoints(),
+            start=(
+                0
+                if not cfg.distribute_modules
+                else dist.get_rank() * len(self.local_hookpoints())
+            ),
+        ):
             for seed in cfg.init_seeds:
                 torch.manual_seed(seed)
 
                 # Add suffix to the name to disambiguate multiple seeds
                 name = f"{hook}/seed{seed}" if len(cfg.init_seeds) > 1 else hook
+                sae_cfg = replace(
+                    cfg.sae,
+                    n_targets=min(
+                        cfg.cross_layer_step, len(self.cfg.hookpoints) - position - 1
+                    )
+                    + 1,
+                )
                 self.saes[name] = SparseCoder(
-                    input_widths[hook], cfg.sae, device, dtype=torch.float32
+                    input_widths[hook], sae_cfg, device, dtype=torch.float32
                 )
 
         assert isinstance(dataset, Sized)
@@ -296,6 +310,8 @@ class Trainer:
         denom = acc_steps * self.cfg.wandb_log_frequency
         num_tokens_in_step = 0
 
+        cross_layer = self.cfg.cross_layer_step > 0
+
         # For logging purposes
         avg_auxk_loss = defaultdict(float)
         avg_fvu = defaultdict(float)
@@ -329,6 +345,8 @@ class Trainer:
         }
         maybe_wrapped: dict[str, DDP] | dict[str, SparseCoder] = {}
         module_to_name = {v: k for k, v in name_to_module.items()}
+
+        layer_generators = {}
 
         def hook(module: nn.Module, inputs, outputs):
             aux_out = None
@@ -381,22 +399,46 @@ class Trainer:
                     raw.encoder.bias.data = mean_image
 
                 mean = self.maybe_all_reduce(outputs.mean(0))
-                raw.b_dec.data = mean.to(raw.dtype)
+                if not cross_layer:
+                    raw.b_dec.data = mean.to(raw.dtype)
+                else:
+                    raw.b_decs[0].data = mean.to(raw.dtype)
 
             # Make sure the W_dec is still unit-norm if we're autoencoding
             if raw.cfg.normalize_decoder and not self.cfg.sae.transcode:
                 raw.set_decoder_norm_to_unit_norm()
 
             wrapped = maybe_wrapped[name]
-            out = wrapped(
+            out_generator = wrapped.forward_generator(
                 x=inputs,
-                y=outputs,
                 dead_mask=(
                     self.num_tokens_since_fired[name] > self.cfg.dead_feature_threshold
                     if self.cfg.auxk_alpha > 0
                     else None
                 ),
-            )
+            )  # type: ignore
+            next(out_generator)
+            layer_generators[name] = out_generator
+
+            output = 0
+            to_delete = set()
+
+            out = None
+            for hookpoint, out in (
+                (name, layer_generator.send(outputs))
+                for name, layer_generator in layer_generators.items()
+            ):
+                output += out.sae_out.reshape(out_shape).type_as(outputs)
+                if out.is_last:
+                    to_delete.add(hookpoint)
+
+            for name in to_delete:
+                layer_generators[name].close()
+                del layer_generators[name]
+
+            # last output guaranteed to be the current layer
+            assert isinstance(out, ForwardOutput)
+            assert isinstance(output, Tensor)
 
             # Update the did_fire mask
             did_fire[name][out.latent_indices.flatten()] = True
@@ -404,25 +446,42 @@ class Trainer:
 
             if self.cfg.loss_fn in ("ce", "kl"):
                 # Replace the normal output with the SAE output
-                output = out.sae_out.reshape(out_shape).type_as(outputs)
                 return (output, *aux_out) if aux_out is not None else output
+            else:
+                assert self.cfg.loss_fn == "fvu"
 
-            # Metrics that only make sense for local
-            avg_fvu[name] += float(self.maybe_all_reduce(out.fvu.detach()) / denom)
-            if self.cfg.auxk_alpha > 0:
-                avg_auxk_loss[name] += float(
-                    self.maybe_all_reduce(out.auxk_loss.detach()) / denom
-                )
-            if self.cfg.sae.multi_topk:
-                avg_multi_topk_fvu[name] += float(
-                    self.maybe_all_reduce(out.multi_topk_fvu.detach()) / denom
-                )
+                if not cross_layer:
+                    # Metrics that only make sense for local
+                    avg_fvu[name] += float(
+                        self.maybe_all_reduce(out.fvu.detach()) / denom
+                    )
+                    if self.cfg.auxk_alpha > 0:
+                        avg_auxk_loss[name] += float(
+                            self.maybe_all_reduce(out.auxk_loss.detach()) / denom
+                        )
+                    if self.cfg.sae.multi_topk:
+                        avg_multi_topk_fvu[name] += float(
+                            self.maybe_all_reduce(out.multi_topk_fvu.detach()) / denom
+                        )
+                    loss = (
+                        out.fvu
+                        + self.cfg.auxk_alpha * out.auxk_loss
+                        + out.multi_topk_fvu / 8
+                    )
+                else:
+                    # Compute the residual
+                    e = outputs - output.view(outputs.shape)
+                    # Used as a denominator for putting everything on a reasonable scale
+                    total_variance = (outputs - outputs.mean(0)).pow(2).sum()
 
-            # Do a "local" backward pass if we're not training end-to-end
-            loss = (
-                out.fvu + self.cfg.auxk_alpha * out.auxk_loss + out.multi_topk_fvu / 8
-            )
-            loss.div(acc_steps).backward()
+                    l2_loss = e.pow(2).sum()
+                    fvu = l2_loss / total_variance
+                    avg_fvu[name] += float(self.maybe_all_reduce(fvu.detach()) / denom)
+
+                    loss = fvu + self.cfg.auxk_alpha * out.auxk_loss
+
+                # Do a "local" backward pass if we're not training end-to-end
+                loss.div(acc_steps).backward(retain_graph=not out.is_last)
 
         k = self.get_current_k()
         for name, sae in self.saes.items():

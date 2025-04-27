@@ -161,3 +161,8 @@ cython_debug/
 
 checkpoints/
 wandb/
+
+tr*
+/sae-ckpts
+/sae-pkm
+run_all

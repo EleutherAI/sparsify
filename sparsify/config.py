@@ -35,6 +35,9 @@ class SparseCoderConfig(Serializable):
     transcode: bool = False
     """Whether we want to predict the output of a module given its input."""
 
+    n_targets: int = 0
+    """Number of targets to predict. Only used if `transcode` is True."""
+
 
 # Support different naming conventions for the same configuration
 SaeConfig = SparseCoderConfig
@@ -94,6 +97,10 @@ class TrainConfig(Serializable):
 
     layer_stride: int = 1
     """Stride between layers to train sparse coders on."""
+
+    cross_layer_step: int = 0
+    """How many layers ahead to train the sparse coder on.
+    If 0, train only on the same layer."""
 
     distribute_modules: bool = False
     """Store one copy of each sparse coder, instead of copying them across devices."""

@@ -1,7 +1,7 @@
 import json
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import NamedTuple
+from typing import Generator, NamedTuple, Optional
 
 import einops
 import torch
@@ -33,6 +33,9 @@ class ForwardOutput(NamedTuple):
     multi_topk_fvu: Tensor
     """Multi-TopK FVU, if applicable."""
 
+    is_last: bool = False
+    """Whether this is the last target in a multi-target setup."""
+
 
 class SparseCoder(nn.Module):
     def __init__(
@@ -48,6 +51,7 @@ class SparseCoder(nn.Module):
         self.cfg = cfg
         self.d_in = d_in
         self.num_latents = cfg.num_latents or d_in * cfg.expansion_factor
+        self.multi_target = cfg.n_targets > 0 and cfg.transcode
 
         self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
         self.encoder.bias.data.zero_()
@@ -55,7 +59,16 @@ class SparseCoder(nn.Module):
         if decoder:
             # Transcoder initialization: use zeros
             if cfg.transcode:
-                self.W_dec = nn.Parameter(torch.zeros_like(self.encoder.weight.data))
+                if self.multi_target:
+                    self.W_decs = []
+                    for _ in range(cfg.n_targets):
+                        self.W_decs.append(
+                            nn.Parameter(torch.zeros_like(self.encoder.weight.data))
+                        )
+                else:
+                    self.W_dec = nn.Parameter(
+                        torch.zeros_like(self.encoder.weight.data)
+                    )
 
             # Sparse autoencoder initialization: use the transpose of encoder weights
             else:
@@ -65,12 +78,28 @@ class SparseCoder(nn.Module):
         else:
             self.W_dec = None
 
-        self.b_dec = nn.Parameter(torch.zeros(d_in, dtype=dtype, device=device))
-        self.W_skip = (
-            nn.Parameter(torch.zeros(d_in, d_in, device=device, dtype=dtype))
-            if cfg.skip_connection
-            else None
-        )
+        if self.multi_target:
+            self.b_decs = []
+            self.W_skips = []
+            for _ in range(cfg.n_targets):
+                self.b_decs.append(
+                    nn.Parameter(torch.zeros(d_in, dtype=dtype, device=device))
+                )
+                if cfg.skip_connection:
+                    self.W_skips.append(
+                        nn.Parameter(
+                            torch.zeros(d_in, d_in, device=device, dtype=dtype)
+                        )
+                    )
+                else:
+                    self.W_skips.append(None)
+        else:
+            self.b_dec = nn.Parameter(torch.zeros(d_in, dtype=dtype, device=device))
+            self.W_skip = (
+                nn.Parameter(torch.zeros(d_in, d_in, device=device, dtype=dtype))
+                if cfg.skip_connection
+                else None
+            )
 
     @staticmethod
     def load_many(
@@ -185,13 +214,23 @@ class SparseCoder(nn.Module):
             x, self.encoder.weight, self.encoder.bias, self.cfg.k, self.cfg.activation
         )
 
-    def decode(self, top_acts: Tensor, top_indices: Tensor) -> Tensor:
-        assert self.W_dec is not None, "Decoder weight was not initialized."
+    def decode(
+        self,
+        top_acts: Tensor,
+        top_indices: Tensor,
+        W_dec: Optional[Tensor] = None,
+        b_dec: Optional[Tensor] = None,
+    ) -> Tensor:
+        if W_dec is None:
+            W_dec = self.W_dec
+        if b_dec is None:
+            b_dec = self.b_dec
 
-        y = decoder_impl(top_indices, top_acts.to(self.dtype), self.W_dec.mT)
-        return y + self.b_dec
+        assert W_dec is not None, "Decoder weight was not initialized."
 
-    # Wrapping the forward in bf16 autocast improves performance by almost 2x
+        y = decoder_impl(top_indices, top_acts.to(self.dtype), W_dec.mT)
+        return y + b_dec
+
     @torch.autocast(
         "cuda",
         dtype=torch.bfloat16,
@@ -200,89 +239,125 @@ class SparseCoder(nn.Module):
     def forward(
         self, x: Tensor, y: Tensor | None = None, *, dead_mask: Tensor | None = None
     ) -> ForwardOutput:
-        top_acts, top_indices, pre_acts = self.encode(x)
+        generator = self.forward_generator(x, dead_mask=dead_mask)
+        next(generator)
+        result = generator.send(y)
+        assert isinstance(result, ForwardOutput)
+        generator.close()
+        return result
 
-        # If we aren't given a distinct target, we're autoencoding
-        if y is None:
-            y = x
+    # Wrapping the forward in bf16 autocast improves performance by almost 2x
+    def forward_generator(
+        self, x: Tensor, *, dead_mask: Tensor | None = None
+    ) -> Generator[Optional[ForwardOutput], Tensor | None, None]:
+        with torch.autocast(
+            "cuda",
+            dtype=torch.bfloat16,
+            enabled=torch.cuda.is_bf16_supported(),
+        ):
+            top_acts, top_indices, pre_acts = self.encode(x)
 
-        # Decode
-        sae_out = self.decode(top_acts, top_indices)
-        if self.W_skip is not None:
-            sae_out += x.to(self.dtype) @ self.W_skip.mT
+            y = None
+            first_pass = True
+            for W_dec, W_skip, b_dec, is_last in zip(
+                (self.W_dec,) if not self.multi_target else self.W_decs,
+                (self.W_skip,) if not self.multi_target else self.W_skips,
+                (self.b_dec,) if not self.multi_target else self.b_decs,
+                (False,) * (self.cfg.n_targets - 1) + (True,),
+            ):
+                if first_pass:
+                    first_pass = False
+                    y = yield
 
-        # Compute the residual
-        e = y - sae_out
+                # If we aren't given a distinct target, we're autoencoding
+                if y is None:
+                    y = x
 
-        # Used as a denominator for putting everything on a reasonable scale
-        total_variance = (y - y.mean(0)).pow(2).sum()
+                assert isinstance(y, Tensor), "y must be a tensor."
 
-        # Second decoder pass for AuxK loss
-        if dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
-            # Heuristic from Appendix B.1 in the paper
-            k_aux = y.shape[-1] // 2
+                # Decode
+                sae_out = self.decode(top_acts, top_indices, W_dec, b_dec)
+                if W_skip is not None:
+                    sae_out += x.to(self.dtype) @ W_skip.mT
 
-            # Reduce the scale of the loss if there are a small number of dead latents
-            scale = min(num_dead / k_aux, 1.0)
-            k_aux = min(k_aux, num_dead)
+                # Compute the residual
+                e = y - sae_out
 
-            # Don't include living latents in this loss
-            auxk_latents = torch.where(dead_mask[None], pre_acts, -torch.inf)
+                # Used as a denominator for putting everything on a reasonable scale
+                total_variance = (y - y.mean(0)).pow(2).sum()
 
-            # Top-k dead latents
-            auxk_acts, auxk_indices = auxk_latents.topk(k_aux, sorted=False)
+                l2_loss = e.pow(2).sum()
+                fvu = l2_loss / total_variance
 
-            # Encourage the top ~50% of dead latents to predict the residual of the
-            # top k living latents
-            e_hat = self.decode(auxk_acts, auxk_indices)
-            auxk_loss = (e_hat - e.detach()).pow(2).sum()
-            auxk_loss = scale * auxk_loss / total_variance
-        else:
-            auxk_loss = sae_out.new_tensor(0.0)
+                # Second decoder pass for AuxK loss
+                if dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
+                    # Heuristic from Appendix B.1 in the paper
+                    k_aux = y.shape[-1] // 2
 
-        l2_loss = e.pow(2).sum()
-        fvu = l2_loss / total_variance
+                    # Reduce the scale of the loss
+                    # if there are a small number of dead latents
+                    scale = min(num_dead / k_aux, 1.0)
+                    k_aux = min(k_aux, num_dead)
 
-        if self.cfg.multi_topk:
-            top_acts, top_indices = pre_acts.topk(4 * self.cfg.k, sorted=False)
-            sae_out = self.decode(top_acts, top_indices)
+                    # Don't include living latents in this loss
+                    auxk_latents = torch.where(dead_mask[None], pre_acts, -torch.inf)
 
-            multi_topk_fvu = (sae_out - y).pow(2).sum() / total_variance
-        else:
-            multi_topk_fvu = sae_out.new_tensor(0.0)
+                    # Top-k dead latents
+                    auxk_acts, auxk_indices = auxk_latents.topk(k_aux, sorted=False)
 
-        return ForwardOutput(
-            sae_out,
-            top_acts,
-            top_indices,
-            fvu,
-            auxk_loss,
-            multi_topk_fvu,
-        )
+                    # Encourage the top ~50% of dead latents to
+                    # predict the residual of the top k living latents
+                    e_hat = self.decode(auxk_acts, auxk_indices)
+                    auxk_loss = (e_hat - e.detach()).pow(2).sum()
+                    auxk_loss = scale * auxk_loss / total_variance
+                else:
+                    auxk_loss = sae_out.new_tensor(0.0)
+
+                if self.cfg.multi_topk:
+                    top_acts, top_indices = pre_acts.topk(4 * self.cfg.k, sorted=False)
+                    sae_out = self.decode(top_acts, top_indices)
+
+                    multi_topk_fvu = (sae_out - y).pow(2).sum() / total_variance
+                else:
+                    multi_topk_fvu = sae_out.new_tensor(0.0)
+
+                result = ForwardOutput(
+                    sae_out,
+                    top_acts,
+                    top_indices,
+                    fvu,
+                    auxk_loss,
+                    multi_topk_fvu,
+                    is_last,
+                )
+
+                y = yield result
 
     @torch.no_grad()
     def set_decoder_norm_to_unit_norm(self):
-        assert self.W_dec is not None, "Decoder weight was not initialized."
+        for W_dec in self.W_decs if self.multi_target else (self.W_dec,):
+            assert W_dec is not None, "Decoder weight was not initialized."
 
-        eps = torch.finfo(self.W_dec.dtype).eps
-        norm = torch.norm(self.W_dec.data, dim=1, keepdim=True)
-        self.W_dec.data /= norm + eps
+            eps = torch.finfo(W_dec.dtype).eps
+            norm = torch.norm(W_dec.data, dim=1, keepdim=True)
+            W_dec.data /= norm + eps
 
     @torch.no_grad()
     def remove_gradient_parallel_to_decoder_directions(self):
-        assert self.W_dec is not None, "Decoder weight was not initialized."
-        assert self.W_dec.grad is not None  # keep pyright happy
+        for W_dec in self.W_decs if self.multi_target else (self.W_dec,):
+            assert W_dec is not None, "Decoder weight was not initialized."
+            assert W_dec.grad is not None  # keep pyright happy
 
-        parallel_component = einops.einsum(
-            self.W_dec.grad,
-            self.W_dec.data,
-            "d_sae d_in, d_sae d_in -> d_sae",
-        )
-        self.W_dec.grad -= einops.einsum(
-            parallel_component,
-            self.W_dec.data,
-            "d_sae, d_sae d_in -> d_sae d_in",
-        )
+            parallel_component = einops.einsum(
+                W_dec.grad,
+                W_dec.data,
+                "d_sae d_in, d_sae d_in -> d_sae",
+            )
+            W_dec.grad -= einops.einsum(
+                parallel_component,
+                W_dec.data,
+                "d_sae, d_sae d_in -> d_sae d_in",
+            )
 
 
 # Allow for alternate naming conventions
