@@ -352,7 +352,7 @@ class Trainer:
         maybe_wrapped: dict[str, DDP] | dict[str, SparseCoder] = {}
         module_to_name = {v: k for k, v in name_to_module.items()}
 
-        layer_generators = {}
+        layer_mids = {}
 
         def hook(module: nn.Module, inputs, outputs):
             aux_out = None
@@ -415,41 +415,44 @@ class Trainer:
                 raw.set_decoder_norm_to_unit_norm()
 
             wrapped = maybe_wrapped[name]
-            out_generator = wrapped.forward_generator(
+            out_mid = wrapped(
                 x=inputs,
+                y=outputs,
                 dead_mask=(
                     self.num_tokens_since_fired[name] > self.cfg.dead_feature_threshold
                     if self.cfg.auxk_alpha > 0
                     else None
                 ),
+                return_mid_decoder=True,
             )  # type: ignore
-            layer_generators[name] = out_generator
+            layer_mids[name] = out_mid
 
             output = 0
             to_delete = set()
             out, hookpoint = None, None
-            for hookpoint, layer_generator in layer_generators.items():
-                next(layer_generator)
-                out = layer_generator.send(
-                    outputs
-                    if hookpoint != name
-                    else (
-                        outputs,
-                        output / max(1, len(layer_generators)),
-                    )
+            for hookpoint, layer_mid in layer_mids.items():
+                out = layer_mid(
+                    outputs,
+                    addition=(
+                        0
+                        if hookpoint != name
+                        else (output / max(1, len(layer_mids) - 1))
+                    ),
+                    no_extras=hookpoint != name,
                 )
                 output += out.sae_out
                 if out.is_last:
                     to_delete.add(hookpoint)
             if self.cfg.loss_fn == "fvu":
                 del output
+            else:
+                assert isinstance(output, Tensor)
             # last output guaranteed to be the current layer
             assert hookpoint == name
             assert isinstance(out, ForwardOutput)
 
             for hookpoint in to_delete:
-                layer_generators[hookpoint].close()
-                del layer_generators[hookpoint]
+                del layer_mids[hookpoint]
 
             gc.collect()
             torch.cuda.empty_cache()
@@ -550,7 +553,7 @@ class Trainer:
             finally:
                 for handle in handles:
                     handle.remove()
-                layer_generators.clear()
+                layer_mids.clear()
                 gc.collect()
                 torch.cuda.empty_cache()
 

@@ -152,7 +152,7 @@ def run():
         )
 
         if rank == 0:
-            print(f"Using DDP across {dist.get_world_size()} GPUs.")
+            print(f"Using DDP/TP across {dist.get_world_size()} GPUs.")
 
     args = parse(RunConfig)
 

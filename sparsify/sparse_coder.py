@@ -1,7 +1,7 @@
 import json
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Generator, NamedTuple, Optional
+from typing import NamedTuple, Optional
 
 import einops
 import torch
@@ -35,6 +35,131 @@ class ForwardOutput(NamedTuple):
 
     is_last: bool = False
     """Whether this is the last target in a multi-target setup."""
+
+
+class MidDecoder:
+    def __init__(
+        self,
+        sparse_coder: "SparseCoder",
+        x: Tensor,
+        activations: Tensor,
+        indices: Tensor,
+        pre_acts: Optional[Tensor] = None,
+        dead_mask: Optional[Tensor] = None,
+    ):
+        self.sparse_coder = sparse_coder
+        self.x = x
+        self.activations = activations
+        self.indices = indices
+        self.pre_acts = pre_acts
+        self.dead_mask = dead_mask
+        self._index = 0
+
+    def next(self):
+        self._index += 1
+
+    @torch.autocast(
+        "cuda",
+        dtype=torch.bfloat16,
+        enabled=torch.cuda.is_bf16_supported(),
+    )
+    def __call__(
+        self,
+        y: Tensor | None,
+        index: Optional[int] = None,
+        addition: float | Tensor = 0,
+        no_extras: bool = False,
+    ) -> ForwardOutput:
+        # If we aren't given a distinct target, we're autoencoding
+        if y is None:
+            y = self.x
+
+        assert isinstance(y, Tensor), "y must be a tensor."
+        if index is None:
+            index = self._index
+            self.next()
+        is_last = self._index >= self.sparse_coder.cfg.n_targets
+
+        # Decode
+        sae_out = self.sparse_coder.decode(self.activations, self.indices, index)
+        W_skip = (
+            self.sparse_coder.W_skips[index]
+            if self.sparse_coder.multi_target
+            else self.sparse_coder.W_skip
+        )
+        if W_skip is not None:
+            sae_out += self.x.to(self.sparse_coder.dtype) @ W_skip.mT
+        sae_out += addition
+
+        if no_extras:
+            return ForwardOutput(
+                sae_out,
+                self.activations,
+                self.indices,
+                sae_out.new_tensor(0.0),
+                sae_out.new_tensor(0.0),
+                sae_out.new_tensor(0.0),
+                is_last,
+            )
+        else:
+            # Compute the residual
+            e = y - sae_out
+
+            # Used as a denominator for putting everything on a reasonable scale
+            total_variance = (y - y.mean(0)).pow(2).sum()
+
+            l2_loss = e.pow(2).sum()
+            fvu = l2_loss / total_variance
+
+            # Second decoder pass for AuxK loss
+            if (
+                self.dead_mask is not None
+                and self.pre_acts is not None
+                and (num_dead := int(self.dead_mask.sum())) > 0
+            ):
+                # Heuristic from Appendix B.1 in the paper
+                k_aux = y.shape[-1] // 2
+
+                # Reduce the scale of the loss
+                # if there are a small number of dead latents
+                scale = min(num_dead / k_aux, 1.0)
+                k_aux = min(k_aux, num_dead)
+
+                # Don't include living latents in this loss
+                auxk_latents = torch.where(
+                    self.dead_mask[None], self.pre_acts, -torch.inf
+                )
+
+                # Top-k dead latents
+                auxk_acts, auxk_indices = auxk_latents.topk(k_aux, sorted=False)
+
+                # Encourage the top ~50% of dead latents to
+                # predict the residual of the top k living latents
+                e_hat = self.sparse_coder.decode(auxk_acts, auxk_indices, index)
+                auxk_loss = (e_hat - e.detach()).pow(2).sum()
+                auxk_loss = scale * auxk_loss / total_variance
+            else:
+                auxk_loss = sae_out.new_tensor(0.0)
+
+            if self.sparse_coder.cfg.multi_topk and self.pre_acts is not None:
+                top_acts, top_indices = self.pre_acts.topk(
+                    4 * self.sparse_coder.cfg.k, sorted=False
+                )
+                sae_out = self.sparse_coder.decode(top_acts, top_indices, index)
+
+                multi_topk_fvu = (sae_out - y).pow(2).sum() / total_variance
+            else:
+                multi_topk_fvu = sae_out.new_tensor(0.0)
+
+        return ForwardOutput(
+            sae_out,
+            self.activations,
+            self.indices,
+            fvu,
+            auxk_loss,
+            multi_topk_fvu,
+            is_last,
+        )
 
 
 class SparseCoder(nn.Module):
@@ -218,13 +343,10 @@ class SparseCoder(nn.Module):
         self,
         top_acts: Tensor,
         top_indices: Tensor,
-        W_dec: Optional[Tensor] = None,
-        b_dec: Optional[Tensor] = None,
+        index: int = 0,
     ) -> Tensor:
-        if W_dec is None:
-            W_dec = self.W_dec
-        if b_dec is None:
-            b_dec = self.b_dec
+        W_dec = self.W_decs[index] if self.multi_target else self.W_dec
+        b_dec = self.b_decs[index] if self.multi_target else self.b_dec
 
         assert W_dec is not None, "Decoder weight was not initialized."
 
@@ -237,102 +359,21 @@ class SparseCoder(nn.Module):
         enabled=torch.cuda.is_bf16_supported(),
     )
     def forward(
-        self, x: Tensor, y: Tensor | None = None, *, dead_mask: Tensor | None = None
-    ) -> ForwardOutput:
-        generator = self.forward_generator(x, dead_mask=dead_mask)
-        next(generator)
-        result = generator.send(y)
-        assert isinstance(result, ForwardOutput)
-        generator.close()
-        return result
-
-    # Wrapping the forward in bf16 autocast improves performance by almost 2x
-    def forward_generator(
-        self, x: Tensor, *, dead_mask: Tensor | None = None
-    ) -> Generator[Optional[ForwardOutput], Tensor | tuple | None, None]:
-        with torch.autocast(
-            "cuda",
-            dtype=torch.bfloat16,
-            enabled=torch.cuda.is_bf16_supported(),
-        ):
-            top_acts, top_indices, pre_acts = self.encode(x)
-
-            y = None
-            for W_dec, W_skip, b_dec, is_last in zip(
-                (self.W_dec,) if not self.multi_target else self.W_decs,
-                (self.W_skip,) if not self.multi_target else self.W_skips,
-                (self.b_dec,) if not self.multi_target else self.b_decs,
-                (False,) * (self.cfg.n_targets - 1) + (True,),
-            ):
-                y = yield
-
-                # If we aren't given a distinct target, we're autoencoding
-                if y is None:
-                    y = x
-
-                addition = 0
-                if isinstance(y, tuple):
-                    y, addition = y
-                assert isinstance(y, Tensor), "y must be a tensor."
-
-                # Decode
-                sae_out = self.decode(top_acts, top_indices, W_dec, b_dec)
-                if W_skip is not None:
-                    sae_out += x.to(self.dtype) @ W_skip.mT
-                sae_out += addition
-
-                # Compute the residual
-                e = y - sae_out
-
-                # Used as a denominator for putting everything on a reasonable scale
-                total_variance = (y - y.mean(0)).pow(2).sum()
-
-                l2_loss = e.pow(2).sum()
-                fvu = l2_loss / total_variance
-
-                # Second decoder pass for AuxK loss
-                if dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
-                    # Heuristic from Appendix B.1 in the paper
-                    k_aux = y.shape[-1] // 2
-
-                    # Reduce the scale of the loss
-                    # if there are a small number of dead latents
-                    scale = min(num_dead / k_aux, 1.0)
-                    k_aux = min(k_aux, num_dead)
-
-                    # Don't include living latents in this loss
-                    auxk_latents = torch.where(dead_mask[None], pre_acts, -torch.inf)
-
-                    # Top-k dead latents
-                    auxk_acts, auxk_indices = auxk_latents.topk(k_aux, sorted=False)
-
-                    # Encourage the top ~50% of dead latents to
-                    # predict the residual of the top k living latents
-                    e_hat = self.decode(auxk_acts, auxk_indices)
-                    auxk_loss = (e_hat - e.detach()).pow(2).sum()
-                    auxk_loss = scale * auxk_loss / total_variance
-                else:
-                    auxk_loss = sae_out.new_tensor(0.0)
-
-                if self.cfg.multi_topk:
-                    top_acts, top_indices = pre_acts.topk(4 * self.cfg.k, sorted=False)
-                    sae_out = self.decode(top_acts, top_indices)
-
-                    multi_topk_fvu = (sae_out - y).pow(2).sum() / total_variance
-                else:
-                    multi_topk_fvu = sae_out.new_tensor(0.0)
-
-                result = ForwardOutput(
-                    sae_out,
-                    top_acts,
-                    top_indices,
-                    fvu,
-                    auxk_loss,
-                    multi_topk_fvu,
-                    is_last,
-                )
-
-                yield result
+        self,
+        x: Tensor,
+        y: Tensor | None = None,
+        *,
+        dead_mask: Tensor | None = None,
+        return_mid_decoder: bool = False,
+    ) -> ForwardOutput | MidDecoder:
+        top_acts, top_indices, pre_acts = self.encode(x)
+        if self.multi_target:
+            pre_acts = None
+        mid_decoder = MidDecoder(self, x, top_acts, top_indices, dead_mask, pre_acts)
+        if self.multi_target or return_mid_decoder:
+            return mid_decoder
+        else:
+            return mid_decoder(0, y)
 
     @torch.no_grad()
     def set_decoder_norm_to_unit_norm(self):
