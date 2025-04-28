@@ -19,6 +19,9 @@ class EncoderOutput(NamedTuple):
     """Activations before the top-k selection."""
 
 
+CONTRIB_BATCH_SIZE = 4096
+
+
 class FusedEncoder(torch.autograd.Function):
     @staticmethod
     @torch.compile(disable=True)
@@ -45,8 +48,8 @@ class FusedEncoder(torch.autograd.Function):
                 src_dst = [(i + 1) % tp_size for i in range(tp_size)]
                 result_values, result_indices = local_values, local_indices
                 local_values, local_indices = (
-                    local_values.T.contiguous(),
-                    local_indices.T.contiguous(),
+                    local_values.T.flatten(),
+                    local_indices.T.flatten(),
                 )
                 # for some reason, this is necessary
                 # (sigterm without)
@@ -54,12 +57,12 @@ class FusedEncoder(torch.autograd.Function):
                 for _ in range(tp_size):
                     # TODO non-permute op
                     next_local_values = permute_tensor(
-                        local_values.ravel(),
+                        local_values,
                         src_dst,
                         mesh["tp"],
                     )
                     next_local_indices = permute_tensor(
-                        local_indices.ravel(), src_dst, mesh["tp"]
+                        local_indices, src_dst, mesh["tp"]
                     )
                     rotated_values = next_local_values.view(result_values.shape[::-1]).T
                     rotated_indices = next_local_indices.view(
@@ -123,72 +126,6 @@ class FusedEncoder(torch.autograd.Function):
                 per_sample_weights=grad_values.type_as(weight),
             )
 
-        # --- Grad w.r.t. weight ---
-        if ctx.needs_input_grad[1]:
-            grad_weight = torch.zeros_like(weight)
-
-            # Accumulate contributions into the correct rows of grad_weight.
-            _, D = input.shape
-            if not isinstance(grad_weight, dtensor.DTensor):
-                # Compute contributions from each top-k element:
-                # computed as grad_values * input for each top-k location.
-                contributions = grad_values.unsqueeze(2) * input.unsqueeze(1)
-                # Flatten contributions to shape (N*k, D)
-                contributions = contributions.reshape(-1, D)
-                # print(grad_weight)  # (M, D); TP sharded along dim=0
-                # print(indices.flatten())  # (N*k); DP sharded along dim=0
-                # print(contributions)  # (N*k, D); DP sharded along dim=0
-                grad_weight.index_add_(
-                    0, indices.flatten(), contributions.type_as(weight)
-                )
-            else:
-                mesh = grad_weight.device_mesh
-                dp_size, tp_size = mesh.shape
-                local_grad_weight = grad_weight.to_local()
-                # local_weight = weight.to_local()
-                local_indices = indices.flatten().to_local()
-                local_values = grad_values.flatten().to_local()
-                local_input = input.flatten().to_local()
-                for _ in range(dp_size):
-                    # TODO filtering indices
-                    # TODO use COO backward kernel?
-
-                    local_contributions = local_values.view(
-                        -1, ctx.k, 1
-                    ) * local_input.view(-1, 1, D)
-                    # perform local update
-                    # TODO filtering indices
-                    local_grad_weight.index_add_(
-                        0,
-                        local_indices,
-                        local_contributions.reshape(-1, D).type_as(weight),
-                    )
-
-                    # example_indices = torch.arange(len(local_indices),
-                    # device=local_indices.device) // ctx.k
-                    # result = triton_coo_sparse_dense_matmul(
-                    #     torch.stack([example_indices, local_indices]),
-                    #     local_values.float(),
-                    #     local_input.view(-1, D).float(),
-                    #     N=local_weight.shape[0],
-                    #     # out=local_grad_weight,
-                    # )
-                    # local_grad_weight += result * 0
-
-                    # embedding_bag_bw_rev_indices(
-                    #     local_indices.view(-1, ctx.k),
-                    #     local_weight,
-                    #     local_values.view(-1, ctx.k),
-                    #     local_input,
-                    #     local_grad_weight,
-                    # )
-
-                    # rotate indices/inputs/values
-                    src_dst = [(i + 1) % dp_size for i in range(dp_size)]
-                    local_indices = permute_tensor(local_indices, src_dst, mesh["dp"])
-                    local_values = permute_tensor(local_values, src_dst, mesh["dp"])
-                    local_input = permute_tensor(local_input, src_dst, mesh["dp"])
-
         # --- Grad w.r.t. bias ---
         if bias is not None and ctx.needs_input_grad[2]:
             if isinstance(bias, dtensor.DTensor):
@@ -212,6 +149,51 @@ class FusedEncoder(torch.autograd.Function):
                 grad_bias = torch.zeros_like(bias)
                 grad_bias.index_add_(
                     0, indices.flatten(), grad_values.flatten().type_as(bias)
+                )
+
+        # --- Grad w.r.t. weight ---
+        if ctx.needs_input_grad[1]:
+            grad_weight = torch.zeros_like(weight)
+
+            # Accumulate contributions into the correct rows of grad_weight.
+            _, D = input.shape
+            if not isinstance(grad_weight, dtensor.DTensor):
+                # Compute contributions from each top-k element:
+                # computed as grad_values * input for each top-k location.
+                contributions = grad_values.unsqueeze(2) * input.unsqueeze(1)
+                # Flatten contributions to shape (N*k, D)
+                contributions = contributions.reshape(-1, D)
+                # print(grad_weight)  # (M, D); TP sharded along dim=0
+                # print(indices.flatten())  # (N*k); DP sharded along dim=0
+                # print(contributions)  # (N*k, D); DP sharded along dim=0
+                grad_weight.index_add_(
+                    0, indices.flatten(), contributions.type_as(weight)
+                )
+            else:
+                mesh = grad_weight.device_mesh
+                dp_size, tp_size = mesh.shape
+                local_grad_weight = grad_weight.to_local()
+                # local_weight = weight.to_local()
+                # local_indices = indices.flatten().to_local()
+                # local_values = grad_values.flatten().to_local()
+                # local_input = input.to_local().clone()
+                # local_size = input.to_local().shape[0]
+                gathered_input = input.redistribute(
+                    mesh, (dtensor.Replicate(), dtensor.Replicate())
+                ).to_local()
+                gathered_indices = indices.redistribute(
+                    mesh, (dtensor.Replicate(), dtensor.Replicate())
+                ).to_local()
+                gathered_values = grad_values.redistribute(
+                    mesh, (dtensor.Replicate(), dtensor.Replicate())
+                ).to_local()
+                contributions = gathered_values.unsqueeze(2) * gathered_input.unsqueeze(
+                    1
+                )
+                local_grad_weight.index_add_(
+                    0,
+                    gathered_indices.flatten(),
+                    contributions.reshape(-1, D).type_as(weight),
                 )
 
         # The k parameter is an int, so return None for its gradient.

@@ -69,9 +69,6 @@ class MidDecoder:
         assert grad is not None, "Activations have no gradient."
         self.activations = self.original_activations
         self.activations.backward(grad, retain_graph=not is_last)
-        # torch.dot(self.activations.ravel(), grad.ravel()).backward(
-        #     retain_graph=not is_last
-        # )
 
     def next(self):
         self._index += 1
