@@ -41,9 +41,9 @@ class FusedEncoder(torch.autograd.Function):
             if isinstance(preacts, dtensor.DTensor):
                 # TODO leo gao's ring topk
                 mesh = preacts.device_mesh
-                local_values, local_indices = preacts.to_local().topk(
-                    k, dim=1, sorted=False
-                )
+                local_acts = preacts.to_local()
+                local_values, local_indices = local_acts.topk(k, dim=1, sorted=False)
+                local_indices += mesh.get_local_rank(1) * local_acts.shape[1]
                 tp_size = mesh.shape[1]
                 src_dst = [(i + 1) % tp_size for i in range(tp_size)]
                 result_values, result_indices = local_values, local_indices
@@ -52,8 +52,7 @@ class FusedEncoder(torch.autograd.Function):
                     local_indices.T.flatten(),
                 )
                 # for some reason, this is necessary
-                # (sigterm without)
-                # torch.distributed.barrier()
+                # (sigsegv without)
                 torch.distributed.barrier(group=mesh.get_group(1))
                 for _ in range(tp_size):
                     # TODO non-permute op
@@ -127,6 +126,12 @@ class FusedEncoder(torch.autograd.Function):
                 per_sample_weights=grad_values.type_as(weight),
             )
 
+        if isinstance(grad_values, dtensor.DTensor):
+            mesh = grad_values.device_mesh
+            local_size = weight.to_local().shape[0]
+            start_feature = mesh.get_local_rank(1) * local_size
+            end_feature = start_feature + local_size
+
         # --- Grad w.r.t. bias ---
         if bias is not None and ctx.needs_input_grad[2]:
             if isinstance(bias, dtensor.DTensor):
@@ -140,6 +145,13 @@ class FusedEncoder(torch.autograd.Function):
                 all_values = all_values.redistribute(
                     mesh, (dtensor.Replicate(), dtensor.Replicate())
                 ).to_local()
+
+                # TODO bespoke all-to-all gradient communication
+                # likely won't be necessary, the encoder backward pass is fast
+                mask = (all_indices >= start_feature) & (all_indices < end_feature)
+                all_indices = all_indices[mask] - start_feature
+                all_values = all_values[mask]
+
                 grad_bias.index_add_(
                     0, all_indices, all_values.type_as(bias.to_local())
                 )
@@ -185,10 +197,17 @@ class FusedEncoder(torch.autograd.Function):
                 contributions = gathered_values.unsqueeze(2) * gathered_input.unsqueeze(
                     1
                 )
+                indices = gathered_indices.flatten()
+                contributions = contributions.reshape(-1, D).type_as(weight)
+
+                mask = (indices >= start_feature) & (indices < end_feature)
+                indices = indices[mask] - start_feature
+                contributions = contributions[mask]
+
                 local_grad_weight.index_add_(
                     0,
-                    gathered_indices.flatten(),
-                    contributions.reshape(-1, D).type_as(weight),
+                    indices,
+                    contributions,
                 )
 
         # The k parameter is an int, so return None for its gradient.
