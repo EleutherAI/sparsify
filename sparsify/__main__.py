@@ -190,14 +190,16 @@ def run():
                     mesh,
                 )
 
+            # cache on all processes separately if the model is not distributed
+            example_world_size = mesh.shape[0] if DISTRIBUTE_MODEL else world_size
             # Drop examples that are indivisible across processes to prevent deadlock
-            remainder_examples = len(dataset) % mesh.shape[0]
+            remainder_examples = len(dataset) % example_world_size
             dataset = dataset.select(range(len(dataset) - remainder_examples))
 
-            dataset = dataset.shard(mesh.shape[0], dp_rank)
+            dataset = dataset.shard(example_world_size, dp_rank)
 
             # Drop examples that are indivisible across processes to prevent deadlock
-            remainder_examples = len(dataset) % mesh.shape[0]
+            remainder_examples = len(dataset) % example_world_size
             dataset = dataset.select(range(len(dataset) - remainder_examples))
 
         print(f"Training on '{args.dataset}' (split '{args.split}')")

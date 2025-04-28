@@ -60,15 +60,17 @@ class MidDecoder:
         self._index = 0
 
     def detach(self):
-        self.original_activations = self.activations
-        self.activations = self.activations.detach()
-        self.activations.requires_grad = True
+        if not hasattr(self, "original_activations"):
+            self.original_activations = self.activations
+            self.activations = self.activations.detach()
+            self.activations.requires_grad = True
 
     def restore(self, is_last: bool = False):
         grad = self.activations.grad
         assert grad is not None, "Activations have no gradient."
         self.activations = self.original_activations
         self.activations.backward(grad, retain_graph=not is_last)
+        del self.original_activations
 
     def next(self):
         self._index += 1

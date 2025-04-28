@@ -383,10 +383,9 @@ class Trainer:
             inputs = inputs.flatten(0, 1) if self.cfg.sae.transcode else outputs
 
             if self.mesh is not None and not DISTRIBUTE_MODEL:
-                inputs = DTensor.from_local(inputs, self.mesh, [Shard(0), Replicate()])
-                outputs = DTensor.from_local(
-                    outputs, self.mesh, [Shard(0), Replicate()]
-                )
+                inputs = DTensor.from_local(inputs, self.mesh, [Shard(0), Shard(0)])
+                inputs = inputs.redistribute(self.mesh, [Shard(0), Replicate()])
+                outputs = DTensor.from_local(outputs, self.mesh, [Shard(0), Shard(0)])
                 outputs = outputs.redistribute(self.mesh, [Shard(0), Shard(1)])
 
             # On the first iteration, initialize the encoder and decoder biases
@@ -398,7 +397,14 @@ class Trainer:
                 # This is mathematically equivalent to Anthropic's proposal of
                 # subtracting the decoder bias
                 if self.cfg.sae.transcode:
-                    mean = inputs.mean(0).to(raw.dtype)
+                    if self.mesh is not None and self.mesh.shape[0] == 1:
+                        # fix annoying SIGSEGV
+                        mean = inputs.to_local().mean(0).to(raw.dtype)
+                        mean = DTensor.from_local(
+                            mean, self.mesh, [Replicate(), Replicate()]
+                        )
+                    else:
+                        mean = inputs.mean(0).to(raw.dtype)
                     mean, weight, bias = (
                         -mean,
                         wrapped.encoder.weight.data,
@@ -407,7 +413,11 @@ class Trainer:
                     mean_image = torch.nn.functional.linear(mean, weight, bias)
                     raw.encoder.bias.data[:] = mean_image
 
-                mean = outputs.mean(0)
+                if self.mesh is not None and self.mesh.shape[0] == 1:
+                    mean = outputs.to_local().mean(0).to(raw.dtype)
+                    mean = DTensor.from_local(mean, self.mesh, [Replicate(), Shard(0)])
+                else:
+                    mean = outputs.mean(0)
                 if not cross_layer:
                     raw.b_dec.data[:] = mean.to(raw.dtype)
                 else:
@@ -500,7 +510,8 @@ class Trainer:
             del loss
 
             for restorable, was_last in to_restore:
-                restorable.restore(was_last)
+                if was_last:
+                    restorable.restore(True)
 
             gc.collect()
             torch.cuda.empty_cache()
@@ -618,11 +629,6 @@ class Trainer:
                             info[f"auxk/{name}"] = avg_auxk_loss[name]
                         if self.cfg.sae.multi_topk:
                             info[f"multi_topk_fvu/{name}"] = avg_multi_topk_fvu[name]
-
-                    if self.cfg.distribute_modules:
-                        outputs = [{} for _ in range(dist.get_world_size())]
-                        dist.gather_object(info, outputs if rank_zero else None)
-                        info.update({k: v for out in outputs for k, v in out.items()})
 
                     if rank_zero:
                         info["k"] = k

@@ -53,7 +53,8 @@ class FusedEncoder(torch.autograd.Function):
                 )
                 # for some reason, this is necessary
                 # (sigterm without)
-                torch.distributed.barrier()
+                # torch.distributed.barrier()
+                torch.distributed.barrier(group=mesh.get_group(1))
                 for _ in range(tp_size):
                     # TODO non-permute op
                     next_local_values = permute_tensor(
@@ -171,13 +172,7 @@ class FusedEncoder(torch.autograd.Function):
                 )
             else:
                 mesh = grad_weight.device_mesh
-                dp_size, tp_size = mesh.shape
                 local_grad_weight = grad_weight.to_local()
-                # local_weight = weight.to_local()
-                # local_indices = indices.flatten().to_local()
-                # local_values = grad_values.flatten().to_local()
-                # local_input = input.to_local().clone()
-                # local_size = input.to_local().shape[0]
                 gathered_input = input.redistribute(
                     mesh, (dtensor.Replicate(), dtensor.Replicate())
                 ).to_local()
