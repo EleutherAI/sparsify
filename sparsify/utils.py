@@ -3,8 +3,9 @@ from typing import Any, Optional, Type, TypeVar, cast
 
 import torch
 from torch import Tensor, nn
-from torch.distributed.tensor import distribute_tensor
+from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 from torch.distributed.tensor.device_mesh import DeviceMesh
+from torch.distributed.tensor.experimental import local_map
 from transformers import PreTrainedModel
 
 T = TypeVar("T")
@@ -54,7 +55,7 @@ def resolve_widths(
     handles = [mod.register_forward_hook(hook) for mod in module_to_name]
     with torch.inference_mode() if mesh is None else torch.no_grad():
         dummy = {
-            k: v if mesh is None else distribute_tensor(v, mesh)
+            k: v.to(model.device) if mesh is None else distribute_tensor(v, mesh)
             for k, v in model.dummy_inputs.items()
         }
         try:
@@ -95,6 +96,42 @@ def triton_decode(top_indices: Tensor, top_acts: Tensor, W_dec: Tensor):
     return xformers_embedding_bag(top_indices, W_dec.mT, top_acts)
 
 
+def parallelize_decoder(decoder):
+    """
+    Decorator to make the decoder function work on torch.DTensor.
+    """
+
+    def wrapper(top_indices: Tensor, top_acts: Tensor, W_dec: Tensor):
+        # Check if the input is a DTensor
+        if (
+            isinstance(top_indices, DTensor)
+            and isinstance(top_acts, DTensor)
+            and isinstance(W_dec, DTensor)
+        ):
+            assert top_indices.device_mesh == top_acts.device_mesh == W_dec.device_mesh
+            assert top_indices.placements == top_acts.placements
+            placement = {}
+            for i, p in enumerate(W_dec.placements):
+                if isinstance(p, Shard) and p.dim == 1:
+                    placement[i] = Shard(1)
+            for i, p in enumerate(top_indices.placements):
+                if isinstance(p, Shard) and p.dim == 0:
+                    placement[i] = Shard(0)
+            placement = [
+                placement.get(i, Replicate()) for i in range(len(W_dec.placements))
+            ]
+            # Use local_map to apply the decoder function on each local tensor
+            return local_map(
+                decoder,
+                placement,
+            )(top_indices, top_acts, W_dec)
+        else:
+            # If not a DTensor, call the decoder function directly
+            return decoder(top_indices, top_acts, W_dec)
+
+    return wrapper
+
+
 try:
     from .xformers import xformers_embedding_bag
 except ImportError:
@@ -106,3 +143,4 @@ else:
         decoder_impl = eager_decode
     else:
         decoder_impl = triton_decode
+decoder_impl = parallelize_decoder(decoder_impl)

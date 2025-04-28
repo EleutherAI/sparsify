@@ -10,7 +10,7 @@ import torch.distributed as dist
 from datasets import Dataset as HfDataset
 from natsort import natsorted
 from safetensors.torch import load_model
-from schedulefree import ScheduleFreeWrapper
+from schedulefree import ScheduleFreeWrapper, ScheduleFreeWrapperReference
 from torch import Tensor, nn
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.device_mesh import DeviceMesh
@@ -24,6 +24,8 @@ from .muon import Muon
 from .sign_sgd import SignSGD
 from .sparse_coder import ForwardOutput, SparseCoder
 from .utils import get_layer_list, resolve_widths, set_submodule
+
+ScheduleFreeWrapperType = (ScheduleFreeWrapper, ScheduleFreeWrapperReference)
 
 
 class Trainer:
@@ -65,7 +67,7 @@ class Trainer:
         self.dataset = dataset
 
         device = model.device
-        input_widths = resolve_widths(model, cfg.hookpoints, mesh=self.mesh)
+        input_widths = resolve_widths(model, cfg.hookpoints)  # mesh=self.mesh
         unique_widths = set(input_widths.values())
 
         if cfg.distribute_modules and len(unique_widths) > 1:
@@ -160,8 +162,6 @@ class Trainer:
                     ),
                 ]
             case "signum":
-                from schedulefree import ScheduleFreeWrapper
-
                 pgs = [
                     dict(
                         params=sae.parameters(),
@@ -171,7 +171,10 @@ class Trainer:
                 ]
                 lrs = [f"{lr:.2e}" for lr in sorted(set(pg["lr"] for pg in pgs))]
 
-                opt = ScheduleFreeWrapper(SignSGD(pgs), momentum=0.95)
+                if self.mesh is not None:
+                    opt = ScheduleFreeWrapperReference(SignSGD(pgs), momentum=0.95)
+                else:
+                    opt = ScheduleFreeWrapper(SignSGD(pgs), momentum=0.95)
                 opt.train()
 
                 self.optimizers = [opt]
@@ -328,11 +331,7 @@ class Trainer:
 
         if self.cfg.loss_fn == "ce":
             batch = next(iter(dl))
-            x = batch["input_ids"]
-            if self.mesh is not None:
-                x = DTensor.from_local(x, self.mesh, [Shard(0), Replicate()])
-            else:
-                x = x.to(device)
+            x = batch["input_ids"].to(device)
 
             clean_loss = self.model(x, labels=x).loss
             if rank_zero:
@@ -350,6 +349,7 @@ class Trainer:
         }
         module_to_name = {v: k for k, v in name_to_module.items()}
 
+        # maybe_wrapped: dict[str, DDP | SparseCoder | FSDP] = {}
         layer_mids = {}
 
         def hook(module: nn.Module, inputs, outputs):
@@ -372,36 +372,43 @@ class Trainer:
             outputs = outputs.flatten(0, 1)
             inputs = inputs.flatten(0, 1) if self.cfg.sae.transcode else outputs
 
+            if self.mesh is not None:
+                inputs = DTensor.from_local(inputs, self.mesh, [Shard(0), Replicate()])
+                outputs = DTensor.from_local(
+                    outputs, self.mesh, [Shard(0), Replicate()]
+                )
+                outputs = outputs.redistribute(self.mesh, [Shard(0), Shard(1)])
+
             # On the first iteration, initialize the encoder and decoder biases
             raw = self.saes[name]
+            # wrapped = maybe_wrapped[name]
+            wrapped = raw
             if self.global_step == 0 and not self.cfg.finetune:
                 # Ensure the preactivations are centered at initialization
                 # This is mathematically equivalent to Anthropic's proposal of
                 # subtracting the decoder bias
                 if self.cfg.sae.transcode:
                     mean = inputs.mean(0).to(raw.dtype)
-                    mean = (
-                        DTensor.from_local(mean, self.mesh["tp"], [Shard(0)])
-                        if self.mesh is not None
-                        else mean
+                    mean, weight, bias = (
+                        -mean,
+                        wrapped.encoder.weight.data,
+                        wrapped.encoder.bias.data * 0,
                     )
-                    # mean_image = -mean @ raw.encoder.weight.data.T
-                    mean_image = raw.encoder(-mean)  # - raw.encoder.bias.data
-                    raw.encoder.bias.data = mean_image
+                    mean_image = torch.nn.functional.linear(mean, weight, bias)
+                    raw.encoder.bias.data[:] = mean_image
 
                 mean = outputs.mean(0)
                 if not cross_layer:
-                    raw.b_dec.data = mean.to(raw.dtype)
+                    raw.b_dec.data[:] = mean.to(raw.dtype)
                 else:
                     # the current layer must be what handles the bias,
                     # not the contributing previous layers
-                    raw.b_decs[0].data = mean.to(raw.dtype)
+                    raw.b_decs[0].data[:] = mean.to(raw.dtype)
 
             # Make sure the W_dec is still unit-norm if we're autoencoding
             if raw.cfg.normalize_decoder and not self.cfg.sae.transcode:
                 raw.set_decoder_norm_to_unit_norm()
 
-            wrapped = self.saes[name]
             out_mid = wrapped(
                 x=inputs,
                 y=outputs,
@@ -448,7 +455,10 @@ class Trainer:
             torch.cuda.empty_cache()
 
             # Update the did_fire mask
-            did_fire[name][out.latent_indices.flatten()] = True
+            latent_indices = out.latent_indices.flatten()
+            if isinstance(latent_indices, DTensor):
+                latent_indices = latent_indices.to_local()
+            did_fire[name][latent_indices] = True
             self.maybe_all_reduce(did_fire[name], "max")
 
             if self.cfg.loss_fn in ("ce", "kl"):
@@ -490,11 +500,11 @@ class Trainer:
             sae.cfg.k = k
 
         for batch in dl:
-            x = batch["input_ids"]
-            if self.mesh is not None:
-                x = DTensor.from_local(x, self.mesh, [Shard(0), Replicate()])
-            else:
-                x = x.to(device)
+            x = batch["input_ids"].to(device)
+            # if self.mesh is not None:
+            #     x = DTensor.from_local(x, self.mesh, [Shard(0), Replicate()])
+            # else:
+            #     x = x.to(device)
 
             # Bookkeeping for dead feature detection
             N = x.numel()
@@ -655,7 +665,7 @@ class Trainer:
         print("Saving checkpoint")
 
         for optimizer in self.optimizers:
-            if isinstance(optimizer, ScheduleFreeWrapper):
+            if isinstance(optimizer, ScheduleFreeWrapperType):
                 optimizer.eval()
 
         for name, sae in saes.items():
@@ -678,7 +688,7 @@ class Trainer:
             self.cfg.save_json(f"{path}/config.json")
 
         for optimizer in self.optimizers:
-            if isinstance(optimizer, ScheduleFreeWrapper):
+            if isinstance(optimizer, ScheduleFreeWrapperType):
                 optimizer.train()
 
         rank = 0 if rank_zero else dist.get_rank()

@@ -68,9 +68,10 @@ class MidDecoder:
         grad = self.activations.grad
         assert grad is not None, "Activations have no gradient."
         self.activations = self.original_activations
-        torch.dot(self.activations.ravel(), grad.ravel()).backward(
-            retain_graph=not is_last
-        )
+        self.activations.backward(grad, retain_graph=not is_last)
+        # torch.dot(self.activations.ravel(), grad.ravel()).backward(
+        #     retain_graph=not is_last
+        # )
 
     def next(self):
         self._index += 1
@@ -200,33 +201,52 @@ class SparseCoder(nn.Module):
         self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
         self.encoder.bias.data.zero_()
         if mesh is not None:
-            self.encoder = torch.distributed.tensor.parallel.parallelize_module(
-                self.encoder,
-                mesh["tp"],
-                torch.distributed.tensor.parallel.RowwiseParallel(),
+            self.encoder.register_parameter(
+                "weight",
+                nn.Parameter(
+                    dtensor.distribute_tensor(
+                        self.encoder.weight.data,
+                        mesh,
+                        placements=[
+                            dtensor.Replicate(),
+                            dtensor.Shard(0),
+                        ],
+                    )
+                ),
+            )
+            self.encoder.register_parameter(
+                "bias",
+                nn.Parameter(
+                    dtensor.distribute_tensor(
+                        self.encoder.bias.data,
+                        mesh,
+                        placements=[dtensor.Replicate(), dtensor.Shard(0)],
+                    )
+                ),
             )
 
         if decoder:
             # Transcoder initialization: use zeros
             if cfg.transcode:
 
-                def copy_encoder():
+                def create_W_dec():
                     if mesh is not None:
-                        return dtensor.zeros(
+                        result = dtensor.zeros(
                             (self.num_latents, d_in),
                             dtype=dtype,
                             device_mesh=mesh,
                             placements=[dtensor.Replicate(), dtensor.Shard(1)],
                         )
                     else:
-                        return torch.zeros_like(self.encoder.weight.data)
+                        result = torch.zeros_like(self.encoder.weight.data)
+                    return nn.Parameter(result)
 
                 if self.multi_target:
                     self.W_decs = nn.ParameterList()
                     for _ in range(cfg.n_targets):
-                        self.W_decs.append(nn.Parameter(copy_encoder()))
+                        self.W_decs.append(create_W_dec())
                 else:
-                    self.W_dec = nn.Parameter(torch.zeros_like(copy_encoder()))
+                    self.W_dec = create_W_dec()
 
             # Sparse autoencoder initialization: use the transpose of encoder weights
             else:
@@ -236,28 +256,41 @@ class SparseCoder(nn.Module):
         else:
             self.W_dec = None
 
+        def create_bias():
+            if mesh is not None:
+                result = dtensor.zeros(
+                    (self.d_in,),
+                    dtype=dtype,
+                    device_mesh=mesh,
+                    placements=[dtensor.Replicate(), dtensor.Shard(0)],
+                )
+            else:
+                result = torch.zeros(self.d_in, device=device, dtype=dtype)
+            return nn.Parameter(result)
+
+        def create_W_skip():
+            if not cfg.skip_connection:
+                return None
+            if mesh is not None:
+                result = dtensor.zeros(
+                    (self.d_in, self.d_in),
+                    dtype=dtype,
+                    device_mesh=mesh,
+                    placements=[dtensor.Replicate(), dtensor.Shard(1)],
+                )
+            else:
+                result = torch.zeros(self.d_in, self.d_in, device=device, dtype=dtype)
+            return nn.Parameter(result)
+
         if self.multi_target:
             self.b_decs = nn.ParameterList()
             self.W_skips = nn.ParameterList()
             for _ in range(cfg.n_targets):
-                self.b_decs.append(
-                    nn.Parameter(torch.zeros(d_in, dtype=dtype, device=device))
-                )
-                if cfg.skip_connection:
-                    self.W_skips.append(
-                        nn.Parameter(
-                            torch.zeros(d_in, d_in, device=device, dtype=dtype)
-                        )
-                    )
-                else:
-                    self.W_skips.append(None)
+                self.b_decs.append(create_bias())
+                self.W_skips.append(create_W_skip())
         else:
-            self.b_dec = nn.Parameter(torch.zeros(d_in, dtype=dtype, device=device))
-            self.W_skip = (
-                nn.Parameter(torch.zeros(d_in, d_in, device=device, dtype=dtype))
-                if cfg.skip_connection
-                else None
-            )
+            self.b_dec = create_bias()
+            self.W_skip = create_W_skip()
 
     @staticmethod
     def load_many(

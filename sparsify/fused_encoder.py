@@ -1,7 +1,9 @@
 from typing import Literal, NamedTuple
 
 import torch
+import torch.distributed.tensor as dtensor
 import torch.nn.functional as F
+from torch.distributed._functional_collectives import permute_tensor
 
 
 class EncoderOutput(NamedTuple):
@@ -51,7 +53,8 @@ class FusedEncoder(torch.autograd.Function):
         return values, indices, preacts
 
     @staticmethod
-    @torch.compile
+    @torch.compile(disable=True)
+    @torch.no_grad()
     def backward(ctx, grad_values, grad_indices, grad_preacts):
         input, weight, bias, indices = ctx.saved_tensors
         grad_input = grad_weight = grad_bias = None
@@ -68,22 +71,71 @@ class FusedEncoder(torch.autograd.Function):
         # --- Grad w.r.t. weight ---
         if ctx.needs_input_grad[1]:
             grad_weight = torch.zeros_like(weight)
-            # Compute contributions from each top-k element:
-            # computed as grad_values * input for each top-k location.
-            contributions = grad_values.unsqueeze(2) * input.unsqueeze(1)
-            _, _, D = contributions.shape
-            # Flatten contributions to shape (N*k, D)
-            contributions = contributions.reshape(-1, D)
 
             # Accumulate contributions into the correct rows of grad_weight.
-            grad_weight.index_add_(0, indices.flatten(), contributions.type_as(weight))
+            _, D = input.shape
+            if not isinstance(grad_weight, dtensor.DTensor):
+                # Compute contributions from each top-k element:
+                # computed as grad_values * input for each top-k location.
+                contributions = grad_values.unsqueeze(2) * input.unsqueeze(1)
+                # Flatten contributions to shape (N*k, D)
+                contributions = contributions.reshape(-1, D)
+                # print(grad_weight)  # (M, D); TP sharded along dim=0
+                # print(indices.flatten())  # (N*k); DP sharded along dim=0
+                # print(contributions)  # (N*k, D); DP sharded along dim=0
+                grad_weight.index_add_(
+                    0, indices.flatten(), contributions.type_as(weight)
+                )
+            else:
+                mesh = grad_weight.device_mesh
+                dp_size, tp_size = mesh.shape
+                local_grad_weight = grad_weight.to_local()
+                local_indices = indices.flatten().to_local()
+                local_values = grad_values.flatten().to_local()
+                local_input = input.flatten().to_local()
+                for _ in range(dp_size):
+                    # 1) compute contributions from each top-k element
+                    # computed as grad_values * input for each top-k location.
+                    local_contributions = local_values.view(
+                        -1, ctx.k, 1
+                    ) * local_input.view(-1, 1, D)
+                    # 3) perform local update
+                    # TODO filtering indices
+                    local_grad_weight.index_add_(
+                        0,
+                        local_indices,
+                        local_contributions.reshape(-1, D).type_as(weight),
+                    )
+                    # 4) rotate indices/inputs/values
+                    src_dst = [(i + 1) % dp_size for i in range(dp_size)]
+                    local_indices = permute_tensor(local_indices, src_dst, mesh["dp"])
+                    local_values = permute_tensor(local_values, src_dst, mesh["dp"])
+                    local_input = permute_tensor(local_input, src_dst, mesh["dp"])
 
         # --- Grad w.r.t. bias ---
         if bias is not None and ctx.needs_input_grad[2]:
-            grad_bias = torch.zeros_like(bias)
-            grad_bias.index_add_(
-                0, indices.flatten(), grad_values.flatten().type_as(bias)
-            )
+            if isinstance(bias, dtensor.DTensor):
+                mesh = bias.device_mesh
+                grad_bias = torch.zeros_like(bias.to_local())
+                all_indices = indices.flatten()
+                all_indices = all_indices.redistribute(
+                    mesh, (dtensor.Replicate(), dtensor.Replicate())
+                ).to_local()
+                all_values = grad_values.flatten()
+                all_values = all_values.redistribute(
+                    mesh, (dtensor.Replicate(), dtensor.Replicate())
+                ).to_local()
+                grad_bias.index_add_(
+                    0, all_indices, all_values.type_as(bias.to_local())
+                )
+                grad_bias = dtensor.DTensor.from_local(
+                    grad_bias, mesh, (dtensor.Replicate(), dtensor.Shard(0))
+                )
+            else:
+                grad_bias = torch.zeros_like(bias)
+                grad_bias.index_add_(
+                    0, indices.flatten(), grad_values.flatten().type_as(bias)
+                )
 
         # The k parameter is an int, so return None for its gradient.
         return grad_input, grad_weight, grad_bias, None, None

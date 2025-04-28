@@ -9,7 +9,7 @@ import torch.distributed as dist
 from datasets import Dataset, load_dataset
 from safetensors.torch import load_model
 from simple_parsing import field, parse
-from torch.distributed.tensor import distribute_module, init_device_mesh
+from torch.distributed.tensor import init_device_mesh
 from transformers import (
     AutoModel,
     AutoModelForCausalLM,
@@ -180,10 +180,10 @@ def run():
                 model, dataset = load_artifacts(args, rank)
             dist.barrier()
 
-            model = distribute_module(
-                model,
-                mesh,
-            )
+            # model = distribute_module(
+            #     model,
+            #     mesh,
+            # )
 
             # Drop examples that are indivisible across processes to prevent deadlock
             remainder_examples = len(dataset) % mesh.shape[0]
