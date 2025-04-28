@@ -5,6 +5,8 @@ import torch.distributed.tensor as dtensor
 import torch.nn.functional as F
 from torch.distributed._functional_collectives import permute_tensor
 
+from .xformers import embedding_bag_bw_rev_indices
+
 
 class EncoderOutput(NamedTuple):
     top_acts: torch.Tensor
@@ -90,23 +92,21 @@ class FusedEncoder(torch.autograd.Function):
                 mesh = grad_weight.device_mesh
                 dp_size, tp_size = mesh.shape
                 local_grad_weight = grad_weight.to_local()
+                local_weight = weight.to_local()
                 local_indices = indices.flatten().to_local()
                 local_values = grad_values.flatten().to_local()
                 local_input = input.flatten().to_local()
                 for _ in range(dp_size):
-                    # 1) compute contributions from each top-k element
-                    # computed as grad_values * input for each top-k location.
-                    local_contributions = local_values.view(
-                        -1, ctx.k, 1
-                    ) * local_input.view(-1, 1, D)
-                    # 3) perform local update
                     # TODO filtering indices
-                    local_grad_weight.index_add_(
-                        0,
-                        local_indices,
-                        local_contributions.reshape(-1, D).type_as(weight),
+                    # TODO use COO backward kernel?
+                    embedding_bag_bw_rev_indices(
+                        local_indices.view(-1, ctx.k),
+                        local_weight,
+                        local_values.view(-1, ctx.k),
+                        local_input,
+                        local_grad_weight,
                     )
-                    # 4) rotate indices/inputs/values
+                    # rotate indices/inputs/values
                     src_dst = [(i + 1) % dp_size for i in range(dp_size)]
                     local_indices = permute_tensor(local_indices, src_dst, mesh["dp"])
                     local_values = permute_tensor(local_values, src_dst, mesh["dp"])

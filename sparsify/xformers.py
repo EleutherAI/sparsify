@@ -141,6 +141,8 @@ def embedding_bag_bw_rev_indices(
     weight: Tensor,
     per_sample_weights: Tensor,
     gradient: Tensor,
+    weight_grad: Tensor | None = None,
+    per_sample_weights_grad: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     # Returns: [weight.grad, per_sample_weights.grad]
 
@@ -161,8 +163,10 @@ def embedding_bag_bw_rev_indices(
         bag_size=bag_size,
         num_warps=1,
     )
-    weight_grad = torch.empty_like(weight)
-    per_sample_weights_grad = torch.empty_like(per_sample_weights)
+    if weight_grad is None:
+        weight_grad = torch.empty_like(weight)
+    if per_sample_weights_grad is None:
+        per_sample_weights_grad = torch.empty_like(per_sample_weights)
     BLOCK_SIZE = 8
     assert (K % BLOCK_SIZE) == 0
     aggregate_gradient_for_embedding_k[(K // BLOCK_SIZE,)](
