@@ -14,6 +14,7 @@ from schedulefree import ScheduleFreeWrapper, ScheduleFreeWrapperReference
 from torch import Tensor, nn
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.device_mesh import DeviceMesh
+from torch.distributed.tensor.experimental import implicit_replication
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import PreTrainedModel, get_linear_schedule_with_warmup
@@ -67,7 +68,8 @@ class Trainer:
         self.dataset = dataset
 
         device = model.device
-        input_widths = resolve_widths(model, cfg.hookpoints)  # mesh=self.mesh
+        with implicit_replication():
+            input_widths = resolve_widths(model, cfg.hookpoints, mesh=self.mesh)
         unique_widths = set(input_widths.values())
 
         if cfg.distribute_modules and len(unique_widths) > 1:
@@ -331,9 +333,10 @@ class Trainer:
 
         if self.cfg.loss_fn == "ce":
             batch = next(iter(dl))
-            x = batch["input_ids"].to(device)
+            x = self.input_ids_to_mesh(batch["input_ids"])
 
-            clean_loss = self.model(x, labels=x).loss
+            with implicit_replication():
+                clean_loss = self.model(x, labels=x).loss
             if rank_zero:
                 print(f"Initial CE loss: {clean_loss.item():.4f}")
 
@@ -371,13 +374,6 @@ class Trainer:
             # Flatten the batch and sequence dimensions
             outputs = outputs.flatten(0, 1)
             inputs = inputs.flatten(0, 1) if self.cfg.sae.transcode else outputs
-
-            if self.mesh is not None:
-                inputs = DTensor.from_local(inputs, self.mesh, [Shard(0), Replicate()])
-                outputs = DTensor.from_local(
-                    outputs, self.mesh, [Shard(0), Replicate()]
-                )
-                outputs = outputs.redistribute(self.mesh, [Shard(0), Shard(1)])
 
             # On the first iteration, initialize the encoder and decoder biases
             raw = self.saes[name]
@@ -500,48 +496,46 @@ class Trainer:
             sae.cfg.k = k
 
         for batch in dl:
-            x = batch["input_ids"].to(device)
-            # if self.mesh is not None:
-            #     x = DTensor.from_local(x, self.mesh, [Shard(0), Replicate()])
-            # else:
-            #     x = x.to(device)
+            x = self.input_ids_to_mesh(batch["input_ids"])
 
             # Bookkeeping for dead feature detection
             N = x.numel()
             num_tokens_in_step += N
 
             # Compute clean logits if using KL loss
-            clean_probs = (
-                self.model(x).logits.softmax(dim=-1)
-                if self.cfg.loss_fn == "kl"
-                else None
-            )
+            with implicit_replication():
+                clean_probs = (
+                    self.model(x).logits.softmax(dim=-1)
+                    if self.cfg.loss_fn == "kl"
+                    else None
+                )
 
             # Forward pass on the model to get the next batch of activations
             handles = [
                 mod.register_forward_hook(hook) for mod in name_to_module.values()
             ]
             try:
-                match self.cfg.loss_fn:
-                    case "ce":
-                        ce = self.model(x, labels=x).loss
-                        ce.div(acc_steps).backward()
+                with implicit_replication():
+                    match self.cfg.loss_fn:
+                        case "ce":
+                            ce = self.model(x, labels=x).loss
+                            ce.div(acc_steps).backward()
 
-                        avg_ce += float(ce.detach() / denom)
+                            avg_ce += float(ce.detach() / denom)
 
-                        avg_losses = avg_ce
-                    case "kl":
-                        dirty_lps = self.model(x).logits.log_softmax(dim=-1)
-                        kl = -torch.sum(clean_probs * dirty_lps, dim=-1).mean()
-                        kl.div(acc_steps).backward()
+                            avg_losses = avg_ce
+                        case "kl":
+                            dirty_lps = self.model(x).logits.log_softmax(dim=-1)
+                            kl = -torch.sum(clean_probs * dirty_lps, dim=-1).mean()
+                            kl.div(acc_steps).backward()
 
-                        avg_kl += float(kl / denom)
-                        avg_losses = avg_kl
-                    case "fvu":
-                        self.model(x)
-                        avg_losses = dict(avg_fvu)
-                    case other:
-                        raise ValueError(f"Unknown loss function '{other}'")
+                            avg_kl += float(kl / denom)
+                            avg_losses = avg_kl
+                        case "fvu":
+                            self.model(x)
+                            avg_losses = dict(avg_fvu)
+                        case other:
+                            raise ValueError(f"Unknown loss function '{other}'")
             finally:
                 for handle in handles:
                     handle.remove()
@@ -636,6 +630,13 @@ class Trainer:
             self.save_best(avg_losses)
 
         pbar.close()
+
+    def input_ids_to_mesh(self, x: Tensor) -> Tensor:
+        if self.mesh is not None:
+            x = DTensor.from_local(x, self.mesh, [Shard(0), Replicate()])
+        else:
+            x = x.to(self.model.device)
+        return x
 
     def maybe_all_reduce(self, x: Tensor, op: str = "mean") -> Tensor:
         if not dist.is_initialized() or self.mesh is None:
