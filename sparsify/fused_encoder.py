@@ -21,7 +21,7 @@ class EncoderOutput(NamedTuple):
 
 class FusedEncoder(torch.autograd.Function):
     @staticmethod
-    @torch.compile
+    @torch.compile(disable=True)
     def forward(
         ctx, input, weight, bias, k: int, activation: Literal["groupmax", "topk"]
     ):
@@ -35,7 +35,60 @@ class FusedEncoder(torch.autograd.Function):
 
         # Get top-k values and indices for each row
         if activation == "topk":
-            values, indices = torch.topk(preacts, k, dim=-1, sorted=False)
+            if isinstance(preacts, dtensor.DTensor):
+                # TODO leo gao's ring topk
+                mesh = preacts.device_mesh
+                local_values, local_indices = preacts.to_local().topk(
+                    k, dim=1, sorted=False
+                )
+                tp_size = mesh.shape[1]
+                src_dst = [(i + 1) % tp_size for i in range(tp_size)]
+                result_values, result_indices = local_values, local_indices
+                local_values, local_indices = (
+                    local_values.T.contiguous(),
+                    local_indices.T.contiguous(),
+                )
+                # for some reason, this is necessary
+                # (sigterm without)
+                torch.distributed.barrier()
+                for _ in range(tp_size):
+                    # TODO non-permute op
+                    next_local_values = permute_tensor(
+                        local_values.ravel(),
+                        src_dst,
+                        mesh["tp"],
+                    )
+                    next_local_indices = permute_tensor(
+                        local_indices.ravel(), src_dst, mesh["tp"]
+                    )
+                    rotated_values = next_local_values.view(result_values.shape[::-1]).T
+                    rotated_indices = next_local_indices.view(
+                        result_indices.shape[::-1]
+                    ).T
+                    # TODO faster merge
+                    combined_values = torch.cat((result_values, rotated_values), dim=1)
+                    combined_indices = torch.cat(
+                        (result_indices, rotated_indices), dim=1
+                    )
+                    result_values, result_indices_ = combined_values.topk(
+                        k, dim=1, sorted=False
+                    )
+                    result_indices = torch.gather(combined_indices, 1, result_indices_)
+                    local_values = next_local_values
+                    local_indices = next_local_indices
+
+                values = dtensor.DTensor.from_local(
+                    result_values,
+                    mesh,
+                    (dtensor.Shard(0), dtensor.Replicate()),
+                )
+                indices = dtensor.DTensor.from_local(
+                    result_indices,
+                    mesh,
+                    (dtensor.Shard(0), dtensor.Replicate()),
+                )
+            else:
+                values, indices = torch.topk(preacts, k, dim=-1, sorted=False)
         elif activation == "groupmax":
             values, indices = preacts.unflatten(-1, (k, -1)).max(dim=-1)
 

@@ -200,28 +200,64 @@ class SparseCoder(nn.Module):
 
         self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
         self.encoder.bias.data.zero_()
-        if mesh is not None:
+        if mesh is None:
+            self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
+            self.encoder.bias.data.zero_()
+        else:
+            self.encoder = nn.Linear(
+                d_in,
+                self.num_latents // mesh.shape[1],
+                device=device,
+                dtype=dtype,
+            )
+            self.encoder.bias.data.zero_()
+            scaling = 1 / self.encoder.weight.shape[1] ** 0.5
             self.encoder.register_parameter(
                 "weight",
                 nn.Parameter(
-                    dtensor.distribute_tensor(
-                        self.encoder.weight.data,
+                    # default torch initialization
+                    dtensor.rand(
+                        (self.num_latents, d_in),
+                        dtype=dtype,
+                        device_mesh=mesh,
+                        placements=[dtensor.Replicate(), dtensor.Shard(0)],
+                    )
+                    * (2.0 * scaling)
+                    - scaling
+                    # dtensor.DTensor.from_local(
+                    #     # self.encoder.weight.data,
+                    #     mesh,
+                    #     placements=[
+                    #         dtensor.Replicate(),
+                    #         dtensor.Shard(0),
+                    #     ],
+                    # )
+                    # dtensor.distribute_tensor(
+                    #     self.encoder.weight.data,
+                    #     mesh,
+                    #     placements=[
+                    #         dtensor.Replicate(),
+                    #         dtensor.Shard(0),
+                    #     ],
+                    # )
+                ),
+            )
+            self.encoder.register_parameter(
+                "bias",
+                nn.Parameter(
+                    dtensor.DTensor.from_local(
+                        self.encoder.bias.data,
                         mesh,
                         placements=[
                             dtensor.Replicate(),
                             dtensor.Shard(0),
                         ],
                     )
-                ),
-            )
-            self.encoder.register_parameter(
-                "bias",
-                nn.Parameter(
-                    dtensor.distribute_tensor(
-                        self.encoder.bias.data,
-                        mesh,
-                        placements=[dtensor.Replicate(), dtensor.Shard(0)],
-                    )
+                    # dtensor.distribute_tensor(
+                    #     self.encoder.bias.data,
+                    #     mesh,
+                    #     placements=[dtensor.Replicate(), dtensor.Shard(0)],
+                    # )
                 ),
             )
 
@@ -276,7 +312,7 @@ class SparseCoder(nn.Module):
                     (self.d_in, self.d_in),
                     dtype=dtype,
                     device_mesh=mesh,
-                    placements=[dtensor.Replicate(), dtensor.Shard(1)],
+                    placements=[dtensor.Replicate(), dtensor.Shard(0)],
                 )
             else:
                 result = torch.zeros(self.d_in, self.d_in, device=device, dtype=dtype)
@@ -416,7 +452,7 @@ class SparseCoder(nn.Module):
 
         assert W_dec is not None, "Decoder weight was not initialized."
 
-        y = decoder_impl(top_indices, top_acts.to(self.dtype), W_dec.mT)
+        y = decoder_impl(top_indices, top_acts.to(self.dtype), W_dec)
         return y + b_dec
 
     @torch.autocast(
@@ -435,6 +471,7 @@ class SparseCoder(nn.Module):
         top_acts, top_indices, pre_acts = self.encode(x)
         if self.multi_target:
             pre_acts = None
+
         mid_decoder = MidDecoder(self, x, top_acts, top_indices, dead_mask, pre_acts)
         if self.multi_target or return_mid_decoder:
             return mid_decoder

@@ -87,13 +87,13 @@ def set_submodule(model: nn.Module, submodule_path: str, new_submodule: nn.Modul
 # Fallback implementation of SAE decoder
 def eager_decode(top_indices: Tensor, top_acts: Tensor, W_dec: Tensor):
     return nn.functional.embedding_bag(
-        top_indices, W_dec.mT, per_sample_weights=top_acts, mode="sum"
+        top_indices, W_dec, per_sample_weights=top_acts, mode="sum"
     )
 
 
 # Triton implementation of SAE decoder
 def triton_decode(top_indices: Tensor, top_acts: Tensor, W_dec: Tensor):
-    return xformers_embedding_bag(top_indices, W_dec.mT, top_acts)
+    return xformers_embedding_bag(top_indices, W_dec, top_acts)
 
 
 def parallelize_decoder(decoder):
