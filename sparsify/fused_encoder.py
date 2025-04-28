@@ -5,7 +5,7 @@ import torch.distributed.tensor as dtensor
 import torch.nn.functional as F
 from torch.distributed._functional_collectives import permute_tensor
 
-from .xformers import embedding_bag_bw_rev_indices
+# from .xformers import embedding_bag_bw_rev_indices
 
 
 class EncoderOutput(NamedTuple):
@@ -92,20 +92,44 @@ class FusedEncoder(torch.autograd.Function):
                 mesh = grad_weight.device_mesh
                 dp_size, tp_size = mesh.shape
                 local_grad_weight = grad_weight.to_local()
-                local_weight = weight.to_local()
+                # local_weight = weight.to_local()
                 local_indices = indices.flatten().to_local()
                 local_values = grad_values.flatten().to_local()
                 local_input = input.flatten().to_local()
                 for _ in range(dp_size):
                     # TODO filtering indices
                     # TODO use COO backward kernel?
-                    embedding_bag_bw_rev_indices(
-                        local_indices.view(-1, ctx.k),
-                        local_weight,
-                        local_values.view(-1, ctx.k),
-                        local_input,
-                        local_grad_weight,
+
+                    local_contributions = local_values.view(
+                        -1, ctx.k, 1
+                    ) * local_input.view(-1, 1, D)
+                    # perform local update
+                    # TODO filtering indices
+                    local_grad_weight.index_add_(
+                        0,
+                        local_indices,
+                        local_contributions.reshape(-1, D).type_as(weight),
                     )
+
+                    # example_indices = torch.arange(len(local_indices),
+                    # device=local_indices.device) // ctx.k
+                    # result = triton_coo_sparse_dense_matmul(
+                    #     torch.stack([example_indices, local_indices]),
+                    #     local_values.float(),
+                    #     local_input.view(-1, D).float(),
+                    #     N=local_weight.shape[0],
+                    #     # out=local_grad_weight,
+                    # )
+                    # local_grad_weight += result * 0
+
+                    # embedding_bag_bw_rev_indices(
+                    #     local_indices.view(-1, ctx.k),
+                    #     local_weight,
+                    #     local_values.view(-1, ctx.k),
+                    #     local_input,
+                    #     local_grad_weight,
+                    # )
+
                     # rotate indices/inputs/values
                     src_dst = [(i + 1) % dp_size for i in range(dp_size)]
                     local_indices = permute_tensor(local_indices, src_dst, mesh["dp"])

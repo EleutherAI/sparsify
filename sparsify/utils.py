@@ -144,3 +144,5 @@ else:
     else:
         decoder_impl = triton_decode
 decoder_impl = parallelize_decoder(decoder_impl)
+
+DISTRIBUTE_MODEL: bool = False

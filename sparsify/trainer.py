@@ -1,5 +1,6 @@
 import gc
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import asdict, replace
 from fnmatch import fnmatchcase
 from glob import glob
@@ -24,9 +25,13 @@ from .data import MemmapDataset
 from .muon import Muon
 from .sign_sgd import SignSGD
 from .sparse_coder import ForwardOutput, SparseCoder
-from .utils import get_layer_list, resolve_widths, set_submodule
+from .utils import DISTRIBUTE_MODEL, get_layer_list, resolve_widths, set_submodule
 
 ScheduleFreeWrapperType = (ScheduleFreeWrapper, ScheduleFreeWrapperReference)
+if not DISTRIBUTE_MODEL:
+
+    def implicit_replication():
+        return nullcontext()
 
 
 class Trainer:
@@ -69,7 +74,9 @@ class Trainer:
 
         device = model.device
         with implicit_replication():
-            input_widths = resolve_widths(model, cfg.hookpoints, mesh=self.mesh)
+            input_widths = resolve_widths(
+                model, cfg.hookpoints, mesh=self.mesh if DISTRIBUTE_MODEL else None
+            )
         unique_widths = set(input_widths.values())
 
         if cfg.distribute_modules and len(unique_widths) > 1:
@@ -375,6 +382,13 @@ class Trainer:
             outputs = outputs.flatten(0, 1)
             inputs = inputs.flatten(0, 1) if self.cfg.sae.transcode else outputs
 
+            if self.mesh is not None and not DISTRIBUTE_MODEL:
+                inputs = DTensor.from_local(inputs, self.mesh, [Shard(0), Replicate()])
+                outputs = DTensor.from_local(
+                    outputs, self.mesh, [Shard(0), Replicate()]
+                )
+                outputs = outputs.redistribute(self.mesh, [Shard(0), Shard(1)])
+
             # On the first iteration, initialize the encoder and decoder biases
             raw = self.saes[name]
             # wrapped = maybe_wrapped[name]
@@ -632,7 +646,7 @@ class Trainer:
         pbar.close()
 
     def input_ids_to_mesh(self, x: Tensor) -> Tensor:
-        if self.mesh is not None:
+        if self.mesh is not None and DISTRIBUTE_MODEL:
             x = DTensor.from_local(x, self.mesh, [Shard(0), Replicate()])
         else:
             x = x.to(self.model.device)

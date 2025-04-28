@@ -20,6 +20,7 @@ from transformers import (
 
 from .data import MemmapDataset, chunk_and_tokenize
 from .trainer import TrainConfig, Trainer
+from .utils import DISTRIBUTE_MODEL
 
 
 @dataclass
@@ -95,6 +96,9 @@ def load_artifacts(
         torch_dtype=dtype,
         token=args.hf_token,
     )
+    if torch.distributed.is_initialized() and DISTRIBUTE_MODEL:
+        # TODO: sdpa doesn't shard correctly
+        model.config._attn_implementation = "eager"
 
     # For memmap-style datasets
     if args.dataset.endswith(".bin"):
@@ -180,10 +184,11 @@ def run():
                 model, dataset = load_artifacts(args, rank)
             dist.barrier()
 
-            model = distribute_module(
-                model,
-                mesh,
-            )
+            if DISTRIBUTE_MODEL:
+                model = distribute_module(
+                    model,
+                    mesh,
+                )
 
             # Drop examples that are indivisible across processes to prevent deadlock
             remainder_examples = len(dataset) % mesh.shape[0]
