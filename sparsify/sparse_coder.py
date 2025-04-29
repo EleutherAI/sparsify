@@ -8,14 +8,14 @@ import einops
 import torch
 from huggingface_hub import snapshot_download
 from natsort import natsorted
-from safetensors.torch import load_file, load_model, save_file
+from safetensors.torch import load_model
 from torch import Tensor, nn
 from torch.distributed import tensor as dtensor
 from torch.distributed.tensor.device_mesh import DeviceMesh
 
 from .config import SparseCoderConfig
 from .fused_encoder import EncoderOutput, fused_encoder
-from .utils import decoder_impl, sharded_axis
+from .utils import decoder_impl, load_sharded, save_sharded
 
 
 class ForwardOutput(NamedTuple):
@@ -393,100 +393,32 @@ class SparseCoder(nn.Module):
                 strict=strict,
             )
         else:
-            current_state_dict = self.state_dict()
-            if torch.distributed.get_rank() == 0:
-                shard_dims = sharded_axis(current_state_dict)
-                cpu_state_dict = load_file(
-                    filename,
-                    device="cpu",
-                )
-                dp_size, tp_size = self.mesh.shape
-                partitioned_state_dict = {
-                    k: (
-                        v.chunk(tp_size, dim=shard_dims[k])
-                        if shard_dims[k] is not None
-                        else [v] * tp_size
-                    )
-                    for k, v in cpu_state_dict.items()
-                }
-                state_dicts = [
-                    {k: v[i] for k, v in partitioned_state_dict.items()}
-                    for i in range(tp_size)
-                ]
-                state_dicts *= dp_size
-                torch.distributed.barrier()
-                torch.distributed.scatter_object_list(
-                    [None],
-                    state_dicts,
-                    src=0,
-                )
-                cpu_state_dict = state_dicts[0]
-            else:
-                torch.distributed.barrier()
-                obj_list = [None]
-                torch.distributed.scatter_object_list(
-                    obj_list,
-                    None,
-                    src=0,
-                )
-                cpu_state_dict = obj_list[0]
-            state_dict = {k: v.to(self.device) for k, v in cpu_state_dict.items()}
-            state_dict = {
-                k: dtensor.DTensor.from_local(
-                    v, self.mesh, current_state_dict[k].placements
-                )
-                for k, v in state_dict.items()
-            }
+            state_dict = load_sharded(
+                filename,
+                self.state_dict(),
+                self.mesh,
+            )
             self.load_state_dict(state_dict, strict=strict)
             torch.distributed.barrier()
 
     def save_to_disk(self, path: Path | str):
         torch.distributed.barrier()
-        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-            path = Path(path)
+        path = Path(path)
+        if (
+            not torch.distributed.is_initialized()
+        ) or torch.distributed.get_rank() == 0:
             path.mkdir(parents=True, exist_ok=True)
-        if self.mesh is not None and self.mesh.get_local_rank(0) != 0:
-            torch.distributed.barrier()
-            return
 
-        base_state_dict = self.state_dict()
-        cpu_state_dict = {k: v.to_local().cpu() for k, v in base_state_dict.items()}
-        if self.mesh is None:
-            state_dict = cpu_state_dict
-        else:
-            state_dict = {}
-            shard_dims = sharded_axis(base_state_dict)
-            for k, v in cpu_state_dict.items():
-                replicated_dim = shard_dims[k]
-                if replicated_dim is None:
-                    state_dict[k] = v
-                    continue
-                out_tensor = (
-                    [torch.empty_like(v) for _ in range(self.mesh.shape[1])]
-                    if torch.distributed.get_rank() == 0
-                    else []
+        filename = str(path / "sae.safetensors")
+        if save_sharded(self.state_dict(), filename, mesh=self.mesh):
+            with open(path / "cfg.json", "w") as f:
+                json.dump(
+                    {
+                        **self.cfg.to_dict(),
+                        "d_in": self.d_in,
+                    },
+                    f,
                 )
-                torch.distributed.gather_object(
-                    v,
-                    out_tensor,
-                    dst=0,
-                    group=self.mesh.get_group(1),
-                )
-                if torch.distributed.get_rank() == 0:
-                    out_tensor = torch.cat(out_tensor, dim=replicated_dim)
-                    state_dict[k] = out_tensor
-            if torch.distributed.get_rank() != 0:
-                torch.distributed.barrier()
-                return
-        save_file(state_dict, str(path / "sae.safetensors"))
-        with open(path / "cfg.json", "w") as f:
-            json.dump(
-                {
-                    **self.cfg.to_dict(),
-                    "d_in": self.d_in,
-                },
-                f,
-            )
         torch.distributed.barrier()
 
     @property

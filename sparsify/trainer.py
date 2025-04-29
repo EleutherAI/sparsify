@@ -24,7 +24,14 @@ from .data import MemmapDataset
 from .muon import Muon
 from .sign_sgd import SignSGD
 from .sparse_coder import ForwardOutput, SparseCoder
-from .utils import DISTRIBUTE_MODEL, get_layer_list, resolve_widths, set_submodule
+from .utils import (
+    DISTRIBUTE_MODEL,
+    get_layer_list,
+    load_sharded,
+    resolve_widths,
+    save_sharded,
+    set_submodule,
+)
 
 ScheduleFreeWrapperType = (ScheduleFreeWrapper, ScheduleFreeWrapperReference)
 if not DISTRIBUTE_MODEL:
@@ -242,9 +249,21 @@ class Trainer:
             scheduler.load_state_dict(lr_state)
 
         for i, optimizer in enumerate(self.optimizers):
-            opt_state = torch.load(
-                f"{path}/optimizer_{i}.pt", map_location=device, weights_only=True
-            )
+            if self.mesh is None:
+                opt_state = torch.load(
+                    f"{path}/optimizer_{i}.pt", map_location=device, weights_only=True
+                )
+            else:
+                # we haven't stepped the optimizer yet, so the buffers aren't filled
+                # we need to perform a fake step
+                optimizer.step()
+                optimizer.zero_grad()
+                opt_state = load_sharded(
+                    f"{path}/optimizer_{i}.pt",
+                    optimizer.state_dict(),
+                    self.mesh,
+                    load_st=False,
+                )
             optimizer.load_state_dict(opt_state)
 
         for name, sae in self.saes.items():
@@ -693,13 +712,18 @@ class Trainer:
 
             sae.save_to_disk(f"{path}/{name}")
 
+        for i, optimizer in enumerate(self.optimizers):
+            save_sharded(
+                optimizer.state_dict(),
+                f"{path}/optimizer_{i}.pt",
+                self.mesh,
+                save_st=False,
+            )
+
         rank_zero = not dist.is_initialized() or dist.get_rank() == 0
         if rank_zero:
             for i, scheduler in enumerate(self.lr_schedulers):
                 torch.save(scheduler.state_dict(), f"{path}/lr_scheduler_{i}.pt")
-
-            for i, optimizer in enumerate(self.optimizers):
-                torch.save(optimizer.state_dict(), f"{path}/optimizer_{i}.pt")
 
             torch.save(
                 {"global_step": self.global_step},

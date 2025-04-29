@@ -154,7 +154,9 @@ def run():
         # Increase the default timeout in order to account for slow downloads
         # and data preprocessing on the main rank
         dist.init_process_group(
-            device_id=torch.device(rank), timeout=timedelta(weeks=1)
+            "cpu:gloo,cuda:nccl",
+            device_id=torch.device(rank),
+            timeout=timedelta(weeks=1),
         )
         dist.barrier()
         world_size = dist.get_world_size()

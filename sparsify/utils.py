@@ -1,7 +1,9 @@
 import os
+from collections import defaultdict
 from typing import Any, Optional, Type, TypeVar, cast
 
 import torch
+from safetensors.torch import load_file, save_file
 from torch import Tensor, nn
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 from torch.distributed.tensor.device_mesh import DeviceMesh
@@ -108,6 +110,168 @@ def sharded_axis(
         else:
             sharded_axes[key] = sharding[1].dim
     return sharded_axes
+
+
+def flatten_dict(d):
+    if isinstance(d, list):
+        combined = {}
+        for i, x in enumerate(d):
+            for k, v in flatten_dict(x).items():
+                combined[(("list", i),) + k] = v
+        return combined
+    elif isinstance(d, dict):
+        combined = {}
+        for k, v in d.items():
+            for k2, v2 in flatten_dict(v).items():
+                combined[(k,) + k2] = v2
+        return combined
+    else:
+        return {(): d}
+
+
+def unflatten_dict(d, path_here=()):
+    if len(d) == 0:
+        return {}
+    if len(d) == 1 and next(iter(d.keys())) == ():
+        return d[()]
+    by_first_key = defaultdict(dict)
+    for k, v in d.items():
+        by_first_key[k[0]][k[1:]] = v
+    first_first_key = next(iter(by_first_key.keys()))
+    if (
+        isinstance(first_first_key, tuple)
+        and len(first_first_key) == 2
+        and first_first_key[0] == "list"
+    ):
+        return [unflatten_dict(by_first_key[k]) for k in sorted(by_first_key.keys())]
+    else:
+        return {k: unflatten_dict(v, path_here + (k,)) for k, v in by_first_key.items()}
+
+
+def save_sharded(
+    start_state_dict: dict[str, DTensor | torch.Tensor | Any],
+    filename: str,
+    mesh: Optional[DeviceMesh] = None,
+    save_st: bool = True,
+):
+    if mesh is not None and mesh.get_local_rank(0) != 0:
+        torch.distributed.barrier()
+        return False
+
+    if not save_st:
+        start_state_dict = flatten_dict(start_state_dict)
+
+    tensor_state_dict = {
+        k: v
+        for k, v in start_state_dict.items()
+        if isinstance(v, (DTensor, torch.Tensor))
+    }
+    non_tensor_state_dict = {
+        k: v
+        for k, v in start_state_dict.items()
+        if not isinstance(v, (DTensor, torch.Tensor))
+    }
+    if mesh is None:
+        state_dict = {k: v.cpu() for k, v in tensor_state_dict.items()}
+    else:
+        cpu_state_dict = {k: v.to_local().cpu() for k, v in tensor_state_dict.items()}
+        state_dict = {}
+        shard_dims = sharded_axis(tensor_state_dict)
+
+        for k, v in cpu_state_dict.items():
+            replicated_dim = shard_dims[k]
+            if replicated_dim is None:
+                state_dict[k] = v
+                continue
+            out_tensor = (
+                [torch.empty_like(v) for _ in range(mesh.shape[1])]
+                if torch.distributed.get_rank() == 0
+                else []
+            )
+            torch.distributed.gather_object(
+                v,
+                out_tensor,
+                dst=0,
+                group=mesh.get_group(1),
+            )
+            if torch.distributed.get_rank() == 0:
+                out_tensor = torch.cat(out_tensor, dim=replicated_dim)
+                state_dict[k] = out_tensor
+        if torch.distributed.get_rank() != 0:
+            torch.distributed.barrier()
+            return False
+    state_dict = non_tensor_state_dict | state_dict
+    if save_st:
+        save_file(state_dict, filename)
+    else:
+        torch.save(state_dict, filename)
+    torch.distributed.barrier()
+    return True
+
+
+def load_sharded(
+    filename: str,
+    current_state_dict: dict[str, DTensor],
+    mesh: DeviceMesh,
+    load_st: bool = True,
+):
+    torch.distributed.barrier()
+    if not load_st:
+        current_state_dict = flatten_dict(current_state_dict)
+        current_state_dict = {
+            k: v for k, v in current_state_dict.items() if isinstance(v, DTensor)
+        }
+    if torch.distributed.get_rank() == 0:
+        shard_dims = sharded_axis(current_state_dict)
+        if load_st:
+            cpu_state_dict = load_file(
+                filename,
+                device="cpu",
+            )
+        else:
+            cpu_state_dict = torch.load(filename, map_location="cpu")
+        dp_size, tp_size = mesh.shape
+        partitioned_state_dict = {
+            k: (
+                v.chunk(tp_size, dim=shard_dims[k])
+                if shard_dims.get(k) is not None
+                else [v] * tp_size
+            )
+            for k, v in cpu_state_dict.items()
+        }
+        state_dicts = [
+            {k: v[i] for k, v in partitioned_state_dict.items()} for i in range(tp_size)
+        ]
+        state_dicts *= dp_size
+        torch.distributed.barrier()
+        torch.distributed.scatter_object_list(
+            [None],
+            state_dicts,
+            src=0,
+        )
+        cpu_state_dict = state_dicts[0]
+    else:
+        torch.distributed.barrier()
+        obj_list = [None]
+        torch.distributed.scatter_object_list(
+            obj_list,
+            None,
+            src=0,
+        )
+        cpu_state_dict = obj_list[0]
+    state_dict = {
+        k: (
+            DTensor.from_local(
+                v.to(torch.get_default_device()), mesh, current_state_dict[k].placements
+            )
+            if isinstance(v, torch.Tensor)
+            else v
+        )
+        for k, v in cpu_state_dict.items()
+    }
+    if not load_st:
+        state_dict = unflatten_dict(state_dict)
+    return state_dict
 
 
 # Fallback implementation of SAE decoder
