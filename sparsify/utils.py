@@ -84,6 +84,32 @@ def set_submodule(model: nn.Module, submodule_path: str, new_submodule: nn.Modul
     setattr(parent_module, last_name, new_submodule)
 
 
+def sharded_axis(
+    state_dict: dict[str, DTensor],
+) -> dict[str, Optional[int]]:
+    """
+    Checks which axis each DTensor is sharded on.
+    Returns a dictionary mapping each key to the axis it is sharded on,
+    or None if it is not sharded.
+
+    Args:
+        state_dict (dict[str, DTensor]): The state dictionary containing DTensors.
+
+    Returns:
+        dict[str, Optional[int]]: A dictionary mapping each key to the
+        axis it is sharded on.
+    """
+    sharded_axes = {}
+    for key, tensor in state_dict.items():
+        sharding = tensor.placements
+        assert isinstance(sharding[0], Replicate)
+        if not isinstance(sharding[1], Shard):
+            sharded_axes[key] = None
+        else:
+            sharded_axes[key] = sharding[1].dim
+    return sharded_axes
+
+
 # Fallback implementation of SAE decoder
 def eager_decode(top_indices: Tensor, top_acts: Tensor, W_dec: Tensor):
     return nn.functional.embedding_bag(

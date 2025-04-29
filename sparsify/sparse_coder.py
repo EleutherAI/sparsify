@@ -1,22 +1,21 @@
 import json
+import os
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import NamedTuple, Optional
 
 import einops
 import torch
-import torch.distributed.tensor
-import torch.distributed.tensor.parallel
 from huggingface_hub import snapshot_download
 from natsort import natsorted
-from safetensors.torch import load_model, save_model
+from safetensors.torch import load_file, load_model, save_file
 from torch import Tensor, nn
 from torch.distributed import tensor as dtensor
 from torch.distributed.tensor.device_mesh import DeviceMesh
 
 from .config import SparseCoderConfig
 from .fused_encoder import EncoderOutput, fused_encoder
-from .utils import decoder_impl
+from .utils import decoder_impl, sharded_axis
 
 
 class ForwardOutput(NamedTuple):
@@ -223,22 +222,6 @@ class SparseCoder(nn.Module):
                     )
                     * (2.0 * scaling)
                     - scaling
-                    # dtensor.DTensor.from_local(
-                    #     # self.encoder.weight.data,
-                    #     mesh,
-                    #     placements=[
-                    #         dtensor.Replicate(),
-                    #         dtensor.Shard(0),
-                    #     ],
-                    # )
-                    # dtensor.distribute_tensor(
-                    #     self.encoder.weight.data,
-                    #     mesh,
-                    #     placements=[
-                    #         dtensor.Replicate(),
-                    #         dtensor.Shard(0),
-                    #     ],
-                    # )
                 ),
             )
             self.encoder.register_parameter(
@@ -252,11 +235,6 @@ class SparseCoder(nn.Module):
                             dtensor.Shard(0),
                         ],
                     )
-                    # dtensor.distribute_tensor(
-                    #     self.encoder.bias.data,
-                    #     mesh,
-                    #     placements=[dtensor.Replicate(), dtensor.Shard(0)],
-                    # )
                 ),
             )
 
@@ -391,6 +369,7 @@ class SparseCoder(nn.Module):
         device: str | torch.device = "cpu",
         *,
         decoder: bool = True,
+        mesh: Optional[DeviceMesh] = None,
     ) -> "SparseCoder":
         path = Path(path)
 
@@ -399,21 +378,107 @@ class SparseCoder(nn.Module):
             d_in = cfg_dict.pop("d_in")
             cfg = SparseCoderConfig.from_dict(cfg_dict, drop_extra_fields=True)
 
-        sae = SparseCoder(d_in, cfg, device=device, decoder=decoder)
-        load_model(
-            model=sae,
-            filename=str(path / "sae.safetensors"),
-            device=str(device),
-            # TODO: Maybe be more fine-grained about this in the future?
-            strict=decoder,
-        )
+        sae = SparseCoder(d_in, cfg, device=device, decoder=decoder, mesh=mesh)
+        sae.load_state(path, strict=decoder)
         return sae
 
-    def save_to_disk(self, path: Path | str):
-        path = Path(path)
-        path.mkdir(parents=True, exist_ok=True)
+    def load_state(self, path: os.PathLike, strict: bool = True):
+        filename = str(Path(path) / "sae.safetensors")
+        if self.mesh is None:
+            load_model(
+                model=self,
+                filename=filename,
+                device=str(self.device),
+                # TODO: Maybe be more fine-grained about this in the future?
+                strict=strict,
+            )
+        else:
+            current_state_dict = self.state_dict()
+            if torch.distributed.get_rank() == 0:
+                shard_dims = sharded_axis(current_state_dict)
+                cpu_state_dict = load_file(
+                    filename,
+                    device="cpu",
+                )
+                dp_size, tp_size = self.mesh.shape
+                partitioned_state_dict = {
+                    k: (
+                        v.chunk(tp_size, dim=shard_dims[k])
+                        if shard_dims[k] is not None
+                        else [v] * tp_size
+                    )
+                    for k, v in cpu_state_dict.items()
+                }
+                state_dicts = [
+                    {k: v[i] for k, v in partitioned_state_dict.items()}
+                    for i in range(tp_size)
+                ]
+                state_dicts *= dp_size
+                torch.distributed.barrier()
+                torch.distributed.scatter_object_list(
+                    [None],
+                    state_dicts,
+                    src=0,
+                )
+                cpu_state_dict = state_dicts[0]
+            else:
+                torch.distributed.barrier()
+                obj_list = [None]
+                torch.distributed.scatter_object_list(
+                    obj_list,
+                    None,
+                    src=0,
+                )
+                cpu_state_dict = obj_list[0]
+            state_dict = {k: v.to(self.device) for k, v in cpu_state_dict.items()}
+            state_dict = {
+                k: dtensor.DTensor.from_local(
+                    v, self.mesh, current_state_dict[k].placements
+                )
+                for k, v in state_dict.items()
+            }
+            self.load_state_dict(state_dict, strict=strict)
+            torch.distributed.barrier()
 
-        save_model(self, str(path / "sae.safetensors"))
+    def save_to_disk(self, path: Path | str):
+        torch.distributed.barrier()
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            path = Path(path)
+            path.mkdir(parents=True, exist_ok=True)
+        if self.mesh is not None and self.mesh.get_local_rank(0) != 0:
+            torch.distributed.barrier()
+            return
+
+        base_state_dict = self.state_dict()
+        cpu_state_dict = {k: v.to_local().cpu() for k, v in base_state_dict.items()}
+        if self.mesh is None:
+            state_dict = cpu_state_dict
+        else:
+            state_dict = {}
+            shard_dims = sharded_axis(base_state_dict)
+            for k, v in cpu_state_dict.items():
+                replicated_dim = shard_dims[k]
+                if replicated_dim is None:
+                    state_dict[k] = v
+                    continue
+                out_tensor = (
+                    [torch.empty_like(v) for _ in range(self.mesh.shape[1])]
+                    if torch.distributed.get_rank() == 0
+                    else []
+                )
+                torch.distributed.gather_object(
+                    v,
+                    out_tensor,
+                    dst=0,
+                    group=self.mesh.get_group(1),
+                )
+                if torch.distributed.get_rank() == 0:
+                    out_tensor = torch.cat(out_tensor, dim=replicated_dim)
+                    state_dict[k] = out_tensor
+            if torch.distributed.get_rank() != 0:
+                torch.distributed.barrier()
+                return
+        save_file(state_dict, str(path / "sae.safetensors"))
         with open(path / "cfg.json", "w") as f:
             json.dump(
                 {
@@ -422,6 +487,7 @@ class SparseCoder(nn.Module):
                 },
                 f,
             )
+        torch.distributed.barrier()
 
     @property
     def device(self):

@@ -10,7 +10,6 @@ import torch
 import torch.distributed as dist
 from datasets import Dataset as HfDataset
 from natsort import natsorted
-from safetensors.torch import load_model
 from schedulefree import ScheduleFreeWrapper, ScheduleFreeWrapperReference
 from torch import Tensor, nn
 from torch.distributed.tensor import DTensor, Replicate, Shard
@@ -221,7 +220,7 @@ class Trainer:
         for file in glob(f"{path}/rank_*_state.pt"):
             rank_state = torch.load(file, map_location=device, weights_only=True)
 
-            for k in self.local_hookpoints():
+            for k in self.cfg.hookpoints:
                 if k in rank_state["num_tokens_since_fired"]:
                     self.num_tokens_since_fired[k] = rank_state[
                         "num_tokens_since_fired"
@@ -249,7 +248,7 @@ class Trainer:
             optimizer.load_state_dict(opt_state)
 
         for name, sae in self.saes.items():
-            load_model(sae, f"{path}/{name}/sae.safetensors", device=str(device))
+            sae.load_state(f"{path}/{name}")
 
     def get_current_k(self) -> int:
         """Get the current k value based on a linear decay schedule."""
@@ -681,7 +680,7 @@ class Trainer:
 
         return x
 
-    def _checkpoint(self, saes: dict[str, SparseCoder], path: str, rank_zero: bool):
+    def _checkpoint(self, saes: dict[str, SparseCoder], path: str):
         """Save SAEs and training state to disk."""
         print("Saving checkpoint")
 
@@ -694,6 +693,7 @@ class Trainer:
 
             sae.save_to_disk(f"{path}/{name}")
 
+        rank_zero = not dist.is_initialized() or dist.get_rank() == 0
         if rank_zero:
             for i, scheduler in enumerate(self.lr_schedulers):
                 torch.save(scheduler.state_dict(), f"{path}/lr_scheduler_{i}.pt")
@@ -720,19 +720,14 @@ class Trainer:
             },
             f"{path}/rank_{rank}_state.pt",
         )
+        if dist.is_initialized():
+            dist.barrier()
 
     def save(self):
         """Save the SAEs and training state to disk."""
         path = f'{self.cfg.save_dir}/{self.cfg.run_name or "unnamed"}'
 
-        rank_zero = not dist.is_initialized() or dist.get_rank() == 0
-
-        if rank_zero or self.cfg.distribute_modules:
-            self._checkpoint(self.saes, path, rank_zero)
-
-        # Barrier to ensure all ranks have saved before continuing
-        if dist.is_initialized():
-            dist.barrier()
+        self._checkpoint(self.saes, path)
 
     def save_best(self, avg_loss: float | dict[str, float]):
         """Save individual sparse coders to disk if they have the lowest loss."""
@@ -745,15 +740,13 @@ class Trainer:
                     self.best_loss[name] = avg_loss[name]  # type: ignore
 
                     if rank_zero or self.cfg.distribute_modules:
-                        self._checkpoint(
-                            {name: self.saes[name]}, f"{base_path}/{name}", rank_zero
-                        )
+                        self._checkpoint({name: self.saes[name]}, f"{base_path}/{name}")
         else:
             if avg_loss < self.best_loss:  # type: ignore
                 self.best_loss = avg_loss  # type: ignore
 
                 if rank_zero or self.cfg.distribute_modules:
-                    self._checkpoint(self.saes, base_path, rank_zero)
+                    self._checkpoint(self.saes, base_path)
 
         # Barrier to ensure all ranks have saved before continuing
         if dist.is_initialized():
