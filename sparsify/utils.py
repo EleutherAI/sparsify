@@ -20,6 +20,12 @@ def assert_type(typ: Type[T], obj: Any) -> T:
     return cast(typ, obj)
 
 
+def barrier():
+    """Synchronize all processes."""
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+
 def get_layer_list(model: PreTrainedModel) -> tuple[str, nn.ModuleList]:
     """Get the list of layers to train SAEs on."""
     N = assert_type(int, model.config.num_hidden_layers)

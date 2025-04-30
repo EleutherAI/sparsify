@@ -25,6 +25,7 @@ from .sign_sgd import SignSGD
 from .sparse_coder import ForwardOutput, SparseCoder
 from .utils import (
     DISTRIBUTE_MODEL,
+    barrier,
     get_layer_list,
     load_sharded,
     resolve_widths,
@@ -380,7 +381,7 @@ class Trainer:
         layer_mids = {}
 
         def hook(module: nn.Module, inputs, outputs):
-            torch.distributed.barrier()
+            barrier()
 
             aux_out = None
 
@@ -530,18 +531,18 @@ class Trainer:
                 loss.div(acc_steps).backward()
             del loss
 
-            torch.distributed.barrier()
+            barrier()
             for restorable, was_last in to_restore:
                 if was_last:
                     restorable.restore(True)
-            torch.distributed.barrier()
+            barrier()
 
         k = self.get_current_k()
         for name, sae in self.saes.items():
             sae.cfg.k = k
 
         for batch in dl:
-            torch.distributed.barrier()
+            barrier()
             x = self.input_ids_to_mesh(batch["input_ids"])
 
             # Bookkeeping for dead feature detection
@@ -562,7 +563,7 @@ class Trainer:
             ]
             try:
                 with implicit_replication():
-                    torch.distributed.barrier()
+                    barrier()
                     match self.cfg.loss_fn:
                         case "ce":
                             ce = self.model(x, labels=x).loss
@@ -584,7 +585,7 @@ class Trainer:
                         case other:
                             raise ValueError(f"Unknown loss function '{other}'")
             finally:
-                torch.distributed.barrier()
+                barrier()
                 for handle in handles:
                     handle.remove()
                 layer_mids.clear()

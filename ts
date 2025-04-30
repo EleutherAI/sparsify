@@ -6,3 +6,10 @@ roneneldan/TinyStories-33M roneneldan/TinyStories \
 --hookpoints h.0.mlp h.1.mlp h.2.mlp h.3.mlp \
 --cross_layer=4 \
 --run_name clt-ts/$1 ${@:2}
+exit
+WANDB_ENTITY=eleutherai uv run python -m sparsify \
+roneneldan/TinyStories-33M roneneldan/TinyStories \
+--transcode=True --skip_connection=True \
+--expansion_factor=32 \
+--hookpoints h.0.mlp h.1.mlp h.2.mlp h.3.mlp \
+--run_name clt-ts/$1 ${@:2}
