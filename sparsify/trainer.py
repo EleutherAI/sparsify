@@ -1,4 +1,3 @@
-import gc
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import asdict, replace
@@ -489,9 +488,6 @@ class Trainer:
             for hookpoint in to_delete:
                 del layer_mids[hookpoint]
 
-            gc.collect()
-            torch.cuda.empty_cache()
-
             # Update the did_fire mask
             latent_indices = out.latent_indices.flatten()
             if isinstance(latent_indices, DTensor):
@@ -530,9 +526,6 @@ class Trainer:
             for restorable, was_last in to_restore:
                 if was_last:
                     restorable.restore(True)
-
-            gc.collect()
-            torch.cuda.empty_cache()
 
         k = self.get_current_k()
         for name, sae in self.saes.items():
@@ -583,8 +576,6 @@ class Trainer:
                 for handle in handles:
                     handle.remove()
                 layer_mids.clear()
-                gc.collect()
-                torch.cuda.empty_cache()
 
             # Check if we need to actually do a training step
             step, substep = divmod(self.global_step + 1, self.cfg.grad_acc_steps)
