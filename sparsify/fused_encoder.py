@@ -24,7 +24,7 @@ CONTRIB_BATCH_SIZE = 4096
 
 class FusedEncoder(torch.autograd.Function):
     @staticmethod
-    @torch.compile(disable=True)
+    @torch.compile
     def forward(
         ctx, input, weight, bias, k: int, activation: Literal["groupmax", "topk"]
     ):
@@ -45,24 +45,22 @@ class FusedEncoder(torch.autograd.Function):
                 local_values, local_indices = local_acts.topk(k, dim=1, sorted=False)
                 local_indices += mesh.get_local_rank(1) * local_acts.shape[1]
                 tp_size = mesh.shape[1]
+                tp_group = mesh.get_group(1)
                 src_dst = [(i + 1) % tp_size for i in range(tp_size)]
                 result_values, result_indices = local_values, local_indices
                 local_values, local_indices = (
                     local_values.T.flatten(),
                     local_indices.T.flatten(),
                 )
-                # for some reason, this is necessary
-                # (sigsegv without)
-                # torch.distributed.barrier(group=mesh.get_group(1))
                 for _ in range(tp_size):
                     # TODO non-permute op
                     next_local_values = permute_tensor(
                         local_values,
                         src_dst,
-                        mesh["tp"],
+                        tp_group,
                     )
                     next_local_indices = permute_tensor(
-                        local_indices, src_dst, mesh["tp"]
+                        local_indices, src_dst, tp_group
                     )
                     rotated_values = next_local_values.view(result_values.shape[::-1]).T
                     rotated_indices = next_local_indices.view(
@@ -111,7 +109,7 @@ class FusedEncoder(torch.autograd.Function):
         return values, indices, preacts
 
     @staticmethod
-    @torch.compile(disable=True)
+    @torch.compile
     @torch.no_grad()
     def backward(ctx, grad_values, grad_indices, grad_preacts):
         input, weight, bias, indices = ctx.saved_tensors

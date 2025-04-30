@@ -440,8 +440,8 @@ class SparseCoder(nn.Module):
 
     def decode(
         self,
-        top_acts: Tensor,
-        top_indices: Tensor,
+        top_acts: Tensor | dtensor.DTensor,
+        top_indices: Tensor | dtensor.DTensor,
         index: int = 0,
     ) -> Tensor:
         W_dec = self.W_decs[index] if self.multi_target else self.W_dec

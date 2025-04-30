@@ -7,7 +7,6 @@ from safetensors.torch import load_file, save_file
 from torch import Tensor, nn
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 from torch.distributed.tensor.device_mesh import DeviceMesh
-from torch.distributed.tensor.experimental import local_map
 from transformers import PreTrainedModel
 
 T = TypeVar("T")
@@ -291,7 +290,12 @@ def parallelize_decoder(decoder):
     Decorator to make the decoder function work on torch.DTensor.
     """
 
-    def wrapper(top_indices: Tensor, top_acts: Tensor, W_dec: Tensor):
+    @torch.compile
+    def wrapper(
+        top_indices: Tensor | DTensor,
+        top_acts: Tensor | DTensor,
+        W_dec: Tensor | DTensor,
+    ):
         # Check if the input is a DTensor
         if (
             isinstance(top_indices, DTensor)
@@ -310,11 +314,19 @@ def parallelize_decoder(decoder):
             placement = [
                 placement.get(i, Replicate()) for i in range(len(W_dec.placements))
             ]
-            # Use local_map to apply the decoder function on each local tensor
-            return local_map(
-                decoder,
-                placement,
-            )(top_indices, top_acts, W_dec)
+            result_local = decoder(
+                top_indices.to_local(), top_acts.to_local(), W_dec.to_local()
+            )
+            result = DTensor.from_local(
+                result_local, top_indices.device_mesh, placement
+            )
+            return result
+
+            # # Use local_map to apply the decoder function on each local tensor
+            # return local_map(
+            #     decoder,
+            #     placement,
+            # )(top_indices, top_acts, W_dec)
         else:
             # If not a DTensor, call the decoder function directly
             return decoder(top_indices, top_acts, W_dec)

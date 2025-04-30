@@ -185,10 +185,10 @@ class Trainer:
                 ]
                 lrs = [f"{lr:.2e}" for lr in sorted(set(pg["lr"] for pg in pgs))]
 
-                if self.mesh is not None:
-                    opt = ScheduleFreeWrapperReference(SignSGD(pgs), momentum=0.95)
-                else:
-                    opt = ScheduleFreeWrapper(SignSGD(pgs), momentum=0.95)
+                # if self.mesh is not None:
+                #     opt = ScheduleFreeWrapperReference(SignSGD(pgs), momentum=0.95)
+                # else:
+                opt = ScheduleFreeWrapper(SignSGD(pgs), momentum=0.95)
                 opt.train()
 
                 self.optimizers = [opt]

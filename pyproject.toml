@@ -30,6 +30,20 @@ dev = [
 [project.scripts]
 sparsify = "sparsify.__main__:run"
 
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+[tool.uv]
+prerelease = "allow"
+[tool.uv.sources]
+torch = [
+    { index = "pytorch" },
+]
+triton = [
+    { index = "pytorch" }
+]
+
 [tool.pyright]
 include = ["sparsify*"]
 reportPrivateImportUsage = false
