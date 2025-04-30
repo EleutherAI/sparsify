@@ -366,7 +366,7 @@ class Trainer:
 
             # If doing end-to-end transcoders, then we don't actually want to run the
             # modules that we're replacing
-            if self.cfg.sae.transcode:
+            if self.cfg.sae.transcode and self.cfg.remove_transcoded_modules:
                 for point in self.cfg.hookpoints:
                     set_submodule(self.model.base_model, point, nn.Identity())
 
@@ -380,6 +380,8 @@ class Trainer:
         layer_mids = {}
 
         def hook(module: nn.Module, inputs, outputs):
+            torch.distributed.barrier()
+
             aux_out = None
 
             # Maybe unpack tuple inputs and outputs
@@ -474,7 +476,10 @@ class Trainer:
                     no_extras=hookpoint != name,
                 )
                 to_restore.append((layer_mid, out.is_last))
-                output += out.sae_out
+                if hookpoint == name:
+                    output = out.sae_out
+                else:
+                    output += out.sae_out
                 if out.is_last:
                     to_delete.add(hookpoint)
             if self.cfg.loss_fn == "fvu":
@@ -496,6 +501,8 @@ class Trainer:
             self.maybe_all_reduce(did_fire[name], "max")
 
             if self.cfg.loss_fn in ("ce", "kl"):
+                # reshard outputs
+                output = output.redistribute(self.mesh, [Shard(0), Shard(0)]).to_local()
                 # Replace the normal output with the SAE output
                 return (
                     (output.reshape(out_shape).type_as(outputs), *aux_out)
@@ -523,15 +530,18 @@ class Trainer:
                 loss.div(acc_steps).backward()
             del loss
 
+            torch.distributed.barrier()
             for restorable, was_last in to_restore:
                 if was_last:
                     restorable.restore(True)
+            torch.distributed.barrier()
 
         k = self.get_current_k()
         for name, sae in self.saes.items():
             sae.cfg.k = k
 
         for batch in dl:
+            torch.distributed.barrier()
             x = self.input_ids_to_mesh(batch["input_ids"])
 
             # Bookkeeping for dead feature detection
@@ -552,6 +562,7 @@ class Trainer:
             ]
             try:
                 with implicit_replication():
+                    torch.distributed.barrier()
                     match self.cfg.loss_fn:
                         case "ce":
                             ce = self.model(x, labels=x).loss
@@ -573,6 +584,7 @@ class Trainer:
                         case other:
                             raise ValueError(f"Unknown loss function '{other}'")
             finally:
+                torch.distributed.barrier()
                 for handle in handles:
                     handle.remove()
                 layer_mids.clear()

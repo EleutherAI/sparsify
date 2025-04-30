@@ -52,23 +52,23 @@ class MidDecoder:
     ):
         self.sparse_coder = sparse_coder
         self.x = x
-        self.activations = activations
-        self.indices = indices
+        self.latent_acts = activations
+        self.latent_indices = indices
         self.pre_acts = pre_acts
         self.dead_mask = dead_mask
         self._index = 0
 
     def detach(self):
         if not hasattr(self, "original_activations"):
-            self.original_activations = self.activations
-            self.activations = self.activations.detach()
-            self.activations.requires_grad = True
+            self.original_activations = self.latent_acts
+            self.latent_acts = self.latent_acts.detach()
+            self.latent_acts.requires_grad = True
 
     def restore(self, is_last: bool = False):
-        grad = self.activations.grad
+        grad = self.latent_acts.grad
         assert grad is not None, "Activations have no gradient."
-        self.activations = self.original_activations
-        self.activations.backward(grad, retain_graph=not is_last)
+        self.latent_acts = self.original_activations
+        self.latent_acts.backward(grad, retain_graph=not is_last)
         del self.original_activations
 
     def next(self):
@@ -89,6 +89,10 @@ class MidDecoder:
         # If we aren't given a distinct target, we're autoencoding
         if y is None:
             y = self.x
+            if isinstance(y, dtensor.DTensor):
+                y = y.redistribute(
+                    y.device_mesh, (dtensor.Replicate(), dtensor.Shard(1))
+                )
 
         assert isinstance(y, Tensor), "y must be a tensor."
         if index is None:
@@ -97,7 +101,7 @@ class MidDecoder:
         is_last = self._index >= self.sparse_coder.cfg.n_targets
 
         # Decode
-        sae_out = self.sparse_coder.decode(self.activations, self.indices, index)
+        sae_out = self.sparse_coder.decode(self.latent_acts, self.latent_indices, index)
         W_skip = (
             self.sparse_coder.W_skips[index]
             if self.sparse_coder.multi_target
@@ -110,8 +114,8 @@ class MidDecoder:
         if no_extras:
             return ForwardOutput(
                 sae_out,
-                self.activations,
-                self.indices,
+                self.latent_acts,
+                self.latent_indices,
                 sae_out.new_tensor(0.0),
                 sae_out.new_tensor(0.0),
                 sae_out.new_tensor(0.0),
@@ -169,8 +173,8 @@ class MidDecoder:
 
         return ForwardOutput(
             sae_out,
-            self.activations,
-            self.indices,
+            self.latent_acts,
+            self.latent_indices,
             fvu,
             auxk_loss,
             multi_topk_fvu,

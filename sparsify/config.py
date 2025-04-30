@@ -65,6 +65,9 @@ class TrainConfig(Serializable):
     - `kl`: KL divergence of the final model logits w.r.t. the original logits.
     """
 
+    remove_transcoded_modules: bool = False
+    """Don't run modules that are replaced for transcoders with CE loss."""
+
     optimizer: Literal["adam", "muon", "signum"] = "signum"
     """Optimizer to use."""
 
