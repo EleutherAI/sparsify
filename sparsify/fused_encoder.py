@@ -5,7 +5,7 @@ import torch.distributed.tensor as dtensor
 import torch.nn.functional as F
 from torch.distributed._functional_collectives import permute_tensor
 
-# from .xformers import embedding_bag_bw_rev_indices
+from .kernels import triton_sparse_transpose_dense_matmul
 
 
 class EncoderOutput(NamedTuple):
@@ -53,7 +53,7 @@ class FusedEncoder(torch.autograd.Function):
                 )
                 # for some reason, this is necessary
                 # (sigsegv without)
-                torch.distributed.barrier(group=mesh.get_group(1))
+                # torch.distributed.barrier(group=mesh.get_group(1))
                 for _ in range(tp_size):
                     # TODO non-permute op
                     next_local_values = permute_tensor(
@@ -194,20 +194,19 @@ class FusedEncoder(torch.autograd.Function):
                 gathered_values = grad_values.redistribute(
                     mesh, (dtensor.Replicate(), dtensor.Replicate())
                 ).to_local()
-                contributions = gathered_values.unsqueeze(2) * gathered_input.unsqueeze(
-                    1
-                )
-                indices = gathered_indices.flatten()
-                contributions = contributions.reshape(-1, D).type_as(weight)
 
+                indices = gathered_indices.view(-1, ctx.k)
+                values = gathered_values.view(-1, ctx.k)
                 mask = (indices >= start_feature) & (indices < end_feature)
-                indices = indices[mask] - start_feature
-                contributions = contributions[mask]
-
-                local_grad_weight.index_add_(
-                    0,
+                values *= mask.type_as(values)
+                indices = (indices - start_feature).clamp(
+                    0, local_grad_weight.shape[0] - 1
+                )
+                local_grad_weight += triton_sparse_transpose_dense_matmul(
                     indices,
-                    contributions,
+                    values.float(),
+                    gathered_input,
+                    N=local_grad_weight.shape[0],
                 )
 
         # The k parameter is an int, so return None for its gradient.
