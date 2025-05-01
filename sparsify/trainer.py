@@ -222,6 +222,8 @@ class Trainer:
             else float("inf")
         )
 
+        self.model.eval()
+
         barrier()
 
     def load_state(self, path: str):
@@ -258,6 +260,10 @@ class Trainer:
             )
             scheduler.load_state_dict(lr_state)
 
+        if self.mesh is not None:
+            for sae in self.saes.values():
+                for param in sae.parameters():
+                    param.grad = torch.zeros_like(param)
         for i, optimizer in enumerate(self.optimizers):
             if self.mesh is None:
                 opt_state = torch.load(
@@ -328,6 +334,9 @@ class Trainer:
             assert hasattr(self.dataset, "select"), "Dataset must implement `select`"
 
             n = self.global_step * self.cfg.batch_size
+            if self.cfg.restart_epoch:
+                n = 0
+                num_batches += len(self.dataset) // self.cfg.batch_size
             ds = self.dataset.select(range(n, len(self.dataset)))  # type: ignore
         else:
             ds = self.dataset

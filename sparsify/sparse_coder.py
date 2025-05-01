@@ -74,6 +74,14 @@ class MidDecoder:
     def next(self):
         self._index += 1
 
+    @property
+    def current_w_dec(self):
+        return (
+            self.sparse_coder.W_decs[self._index]
+            if self.sparse_coder.multi_target
+            else self.sparse_coder.W_dec
+        )
+
     @torch.autocast(
         "cuda",
         dtype=torch.bfloat16,
