@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch.distributed._functional_collectives import permute_tensor
 
 from .kernels import triton_sparse_transpose_dense_matmul
+from .utils import decoder_impl
 
 
 class EncoderOutput(NamedTuple):
@@ -38,7 +39,24 @@ class FusedEncoder(torch.autograd.Function):
 
         # Get top-k values and indices for each row
         if activation == "topk":
-            if isinstance(preacts, dtensor.DTensor):
+            if (
+                isinstance(preacts, dtensor.DTensor)
+                and preacts.device_mesh.shape[1] == 1
+            ):
+                mesh = preacts.device_mesh
+                local_acts = preacts.to_local()
+                local_values, local_indices = local_acts.topk(k, dim=1, sorted=False)
+                values = dtensor.DTensor.from_local(
+                    local_values,
+                    mesh,
+                    (dtensor.Shard(0), dtensor.Replicate()),
+                )
+                indices = dtensor.DTensor.from_local(
+                    local_indices,
+                    mesh,
+                    (dtensor.Shard(0), dtensor.Replicate()),
+                )
+            elif isinstance(preacts, dtensor.DTensor):
                 # TODO leo gao's ring topk
                 mesh = preacts.device_mesh
                 local_acts = preacts.to_local()
@@ -117,11 +135,10 @@ class FusedEncoder(torch.autograd.Function):
 
         # --- Grad w.r.t. input ---
         if ctx.needs_input_grad[0]:
-            grad_input = F.embedding_bag(
+            grad_input = decoder_impl(
                 indices,
+                grad_values.type_as(weight),
                 weight,
-                mode="sum",
-                per_sample_weights=grad_values.type_as(weight),
             )
 
         if isinstance(grad_values, dtensor.DTensor):

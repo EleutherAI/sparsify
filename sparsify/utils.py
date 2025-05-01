@@ -108,7 +108,12 @@ def sharded_axis(
     """
     sharded_axes = {}
     for key, tensor in state_dict.items():
-        sharding = tensor.placements
+        try:
+            sharding = tensor.placements
+        except AttributeError:
+            print(f"Warning: key {key} is not a DTensor, skipping sharded axis check.")
+            sharded_axes[key] = None
+            continue
         assert isinstance(sharding[0], Replicate)
         if not isinstance(sharding[1], Shard):
             sharded_axes[key] = None
@@ -179,7 +184,10 @@ def save_sharded(
     if mesh is None:
         state_dict = {k: v.cpu() for k, v in tensor_state_dict.items()}
     else:
-        cpu_state_dict = {k: v.to_local().cpu() for k, v in tensor_state_dict.items()}
+        cpu_state_dict = {
+            k: (v.to_local() if isinstance(v, DTensor) else v).cpu()
+            for k, v in tensor_state_dict.items()
+        }
         state_dict = {}
         shard_dims = sharded_axis(tensor_state_dict)
 

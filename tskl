@@ -1,0 +1,12 @@
+#!/bin/bash
+# WANDB_ENTITY=eleutherai uv run python -m sparsify \
+WANDB_ENTITY=eleutherai uv run torchrun --nproc_per_node gpu -m sparsify \
+roneneldan/TinyStories-33M roneneldan/TinyStories \
+--transcode=True --skip_connection=True \
+--batch_size=8 --expansion_factor=128 --tp=4 \
+--hookpoints h.0.mlp h.1.mlp h.2.mlp h.3.mlp \
+--finetune=checkpoints/clt-ts/ts \
+--optimizer=adam --lr_warmup_steps 50 --lr=4e-5 \
+--loss_fn=kl \
+--cross_layer=4 \
+--run_name clt-ts/$1 ${@:2}

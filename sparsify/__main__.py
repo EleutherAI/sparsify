@@ -7,7 +7,6 @@ from multiprocessing import cpu_count
 import torch
 import torch.distributed as dist
 from datasets import Dataset, load_dataset
-from safetensors.torch import load_model
 from simple_parsing import field, parse
 from torch.distributed.tensor import distribute_module, init_device_mesh
 from transformers import (
@@ -20,7 +19,7 @@ from transformers import (
 
 from .data import MemmapDataset, chunk_and_tokenize
 from .trainer import TrainConfig, Trainer
-from .utils import DISTRIBUTE_MODEL
+from .utils import DISTRIBUTE_MODEL, barrier
 
 
 @dataclass
@@ -212,11 +211,11 @@ def run():
             trainer.load_state(f"checkpoints/{args.run_name}" or "checkpoints/unnamed")
         elif args.finetune:
             for name, sae in trainer.saes.items():
-                load_model(
-                    sae,
-                    f"{args.finetune}/{name}/sae.safetensors",
-                    device=str(model.device),
+                barrier()
+                sae.load_state(
+                    f"{args.finetune}/{name}",
                 )
+                barrier()
 
         trainer.fit()
 

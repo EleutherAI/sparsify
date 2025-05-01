@@ -397,11 +397,13 @@ class SparseCoder(nn.Module):
                 strict=strict,
             )
         else:
+            torch.distributed.barrier()
             state_dict = load_sharded(
                 filename,
                 self.state_dict(),
                 self.mesh,
             )
+            torch.distributed.barrier()
             self.load_state_dict(state_dict, strict=strict)
             torch.distributed.barrier()
 

@@ -78,6 +78,9 @@ class TrainConfig(Serializable):
     """Number of steps over which to warm up the learning rate. Only used if
     `optimizer` is `adam`."""
 
+    force_lr_warmup: bool = False
+    """Force the learning rate warmup even if `optimizer` is not `adam`."""
+
     k_decay_steps: int = 0
     """Number of steps over which to decay the number of active latents. Starts at
     input width * 10 and decays to k. Experimental feature."""
@@ -132,12 +135,6 @@ class TrainConfig(Serializable):
         """Validate the configuration."""
         if self.layers and self.layer_stride != 1:
             raise ValueError("Cannot specify both `layers` and `layer_stride`.")
-
-        if self.distribute_modules and self.loss_fn in ("ce", "kl"):
-            raise ValueError(
-                "Distributing modules across ranks is not compatible with the "
-                "cross-entropy or KL divergence losses."
-            )
 
         if not self.init_seeds:
             raise ValueError("Must specify at least one random seed.")

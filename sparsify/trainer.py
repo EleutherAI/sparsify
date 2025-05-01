@@ -122,6 +122,8 @@ class Trainer:
         assert isinstance(dataset, Sized)
         num_batches = len(dataset) // cfg.batch_size
 
+        barrier()
+
         match cfg.optimizer:
             case "adam":
                 try:
@@ -166,7 +168,7 @@ class Trainer:
                         # Muon distributes the work of the Newton-Schulz iterations
                         # across all ranks for DDP but this doesn't make sense when
                         # we're distributing modules across ranks
-                        ddp=not cfg.distribute_modules,
+                        ddp=False,
                     ),
                     torch.optim.Adam(params - muon_params, lr=cfg.lr or 2e-3),
                 ]
@@ -186,14 +188,20 @@ class Trainer:
                 ]
                 lrs = [f"{lr:.2e}" for lr in sorted(set(pg["lr"] for pg in pgs))]
 
-                # if self.mesh is not None:
-                #     opt = ScheduleFreeWrapperReference(SignSGD(pgs), momentum=0.95)
-                # else:
-                opt = ScheduleFreeWrapper(SignSGD(pgs), momentum=0.95)
-                opt.train()
+                opt = SignSGD(pgs)
+                if not cfg.force_lr_warmup:
+                    opt = ScheduleFreeWrapper(opt, momentum=0.95)
+                    opt.train()
 
                 self.optimizers = [opt]
-                self.lr_schedulers = []
+                if cfg.force_lr_warmup:
+                    self.lr_schedulers = [
+                        get_linear_schedule_with_warmup(
+                            opt, cfg.lr_warmup_steps, num_batches
+                        )
+                    ]
+                else:
+                    self.lr_schedulers = []
             case other:
                 raise ValueError(f"Unknown optimizer '{other}'")
 
@@ -213,6 +221,8 @@ class Trainer:
             if self.cfg.loss_fn == "fvu"
             else float("inf")
         )
+
+        barrier()
 
     def load_state(self, path: str):
         """Load the trainer state from disk."""
@@ -284,6 +294,8 @@ class Trainer:
         # Make sure the model is frozen
         self.model.requires_grad_(False)
 
+        barrier()
+
         rank_zero = not dist.is_initialized() or dist.get_rank() == 0
 
         wandb = None
@@ -301,6 +313,8 @@ class Trainer:
                 print("Weights & Biases not available, skipping logging.")
                 print("Run `pip install -U wandb` if you want to use it.")
                 self.cfg.log_to_wandb = False
+
+        barrier()
 
         num_sae_params = sum(
             p.numel() for s in self.saes.values() for p in s.parameters()
@@ -466,7 +480,8 @@ class Trainer:
             out, hookpoint = None, None
             to_restore = []
             for hookpoint, layer_mid in layer_mids.items():
-                layer_mid.detach()
+                if self.cfg.loss_fn == "fvu":
+                    layer_mid.detach()
                 out = layer_mid(
                     outputs,
                     addition=(
@@ -476,7 +491,8 @@ class Trainer:
                     ),
                     no_extras=hookpoint != name,
                 )
-                to_restore.append((layer_mid, out.is_last))
+                if self.cfg.loss_fn == "fvu":
+                    to_restore.append((layer_mid, out.is_last))
                 if hookpoint == name:
                     output = out.sae_out
                 else:
@@ -503,13 +519,14 @@ class Trainer:
 
             if self.cfg.loss_fn in ("ce", "kl"):
                 # reshard outputs
-                output = output.redistribute(self.mesh, [Shard(0), Shard(0)]).to_local()
+                if self.mesh is not None:
+                    output = output.redistribute(
+                        self.mesh, [Shard(0), Shard(0)]
+                    ).to_local()
+                output = output.reshape(out_shape).type_as(outputs)
+
                 # Replace the normal output with the SAE output
-                return (
-                    (output.reshape(out_shape).type_as(outputs), *aux_out)
-                    if aux_out is not None
-                    else output
-                )
+                return (output, *aux_out) if aux_out is not None else output
             else:
                 assert self.cfg.loss_fn == "fvu"
 
@@ -551,10 +568,11 @@ class Trainer:
 
             # Compute clean logits if using KL loss
             with implicit_replication():
+                clean_logits = (
+                    self.model(x).logits if self.cfg.loss_fn == "kl" else None
+                )
                 clean_probs = (
-                    self.model(x).logits.softmax(dim=-1)
-                    if self.cfg.loss_fn == "kl"
-                    else None
+                    clean_logits.softmax(dim=-1) if self.cfg.loss_fn == "kl" else None
                 )
 
             # Forward pass on the model to get the next batch of activations
@@ -574,7 +592,11 @@ class Trainer:
                             avg_losses = avg_ce
                         case "kl":
                             dirty_lps = self.model(x).logits.log_softmax(dim=-1)
-                            kl = -torch.sum(clean_probs * dirty_lps, dim=-1).mean()
+                            kl = torch.sum(
+                                clean_probs
+                                * (clean_logits.log_softmax(dim=-1) - dirty_lps),
+                                dim=-1,
+                            ).mean()
                             kl.div(acc_steps).backward()
 
                             avg_kl += float(kl / denom)

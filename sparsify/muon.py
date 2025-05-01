@@ -147,7 +147,9 @@ class Muon(torch.optim.Optimizer):
                     state = self.state[p]
 
                     g = p.grad
-                    assert g is not None
+                    assert (
+                        g is not None
+                    ), f"Parameter {i + self.rank} (shape: {p.shape}) has no gradient."
 
                     # Apply momentum
                     if beta > 0.0:
