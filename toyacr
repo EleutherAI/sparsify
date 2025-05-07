@@ -1,0 +1,8 @@
+#!/bin/sh
+WANDB_ENTITY=eleutherai uv run torchrun --nproc_per_node gpu --master_port 9348 -m sparsify \
+nev/acronym-toy-3M nev/acronym-toy-dataset --ctx_len 32 \
+--transcode=True --skip_connection=True \
+--batch_size=8 --expansion_factor=32 --tp=4 \
+--hookpoints h.0.mlp h.1.mlp h.2.mlp h.3.mlp \
+--run_name acr-clt/$1 ${@:2} \
+--cross_layer=4
