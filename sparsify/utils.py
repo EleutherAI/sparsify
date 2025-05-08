@@ -165,7 +165,7 @@ def save_sharded(
     save_st: bool = True,
 ):
     if mesh is not None and mesh.get_local_rank(0) != 0:
-        torch.distributed.barrier()
+        barrier()
         return False
 
     if not save_st:
@@ -218,7 +218,7 @@ def save_sharded(
         save_file(state_dict, filename)
     else:
         torch.save(state_dict, filename)
-    torch.distributed.barrier()
+    barrier()
     return True
 
 

@@ -39,9 +39,6 @@ def chunk_and_tokenize(
         num_proc: The number of processes to use for tokenization.
         text_key: The key in the dataset to use as the text to tokenize.
         max_seq_len: The maximum length of a batch of input ids.
-        return_overflowed_tokens: Whether to add the overflowing tokens to the
-            dataset. This will result in a dataset with more than `max_seq_len`
-            tokens, but the last batch will be smaller than `max_seq_len`.
         return_final_batch: Whether to return the final batch, which may be smaller
             than the others.
         load_from_cache_file: Whether to load from the cache file.
@@ -63,31 +60,25 @@ def chunk_and_tokenize(
             truncation=True,
         )
 
-        if return_overflowed_tokens and (
-            overflow := output.pop("overflowing_tokens", None)
-        ):
+        if overflow := output.pop("overflowing_tokens", None):
             # Slow Tokenizers return unnested lists of ints
             assert isinstance(output.input_ids[0], int)
 
             # Chunk the overflow into batches of size `chunk_size`
             chunks = [output["input_ids"]] + [
                 overflow[i * chunk_size : (i + 1) * chunk_size]
-                for i in range(math.ceil(len(overflow) / chunk_size))
+                for i in range(
+                    math.ceil(len(overflow) / chunk_size)
+                    if return_overflowed_tokens
+                    else 0
+                )
             ]
             output = {"input_ids": chunks}
 
-            if not return_final_batch:
-                # We know that the last sample will almost always be less than the max
-                # number of tokens, and we don't want to pad, so we just drop it.
-                output = {k: v[:-1] for k, v in output.items()}
-        else:
-            output = {
-                "input_ids": (
-                    [output["input_ids"][:chunk_size]]
-                    if len(output["input_ids"]) >= chunk_size
-                    else []
-                )
-            }
+        if not return_final_batch:
+            # We know that the last sample will almost always be less than the max
+            # number of tokens, and we don't want to pad, so we just drop it.
+            output = {k: v[:-1] for k, v in output.items()}
 
         output_batch_size = len(output["input_ids"])
 

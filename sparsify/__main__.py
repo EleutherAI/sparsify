@@ -42,6 +42,9 @@ class RunConfig(TrainConfig):
     ctx_len: int = 2048
     """Context length to use for training."""
 
+    return_overflowed_tokens: bool = True
+    """Whether to return overflowed tokens from the dataset."""
+
     # Use a dummy encoding function to prevent the token from being saved
     # to disk in plain text
     hf_token: str | None = field(default=None, encoding_fn=lambda _: None)
@@ -127,6 +130,7 @@ def load_artifacts(
                 max_seq_len=args.ctx_len,
                 num_proc=args.data_preprocessing_num_proc,
                 text_key=args.text_column,
+                return_overflowed_tokens=args.return_overflowed_tokens,
             )
         else:
             print("Dataset already tokenized; skipping tokenization.")

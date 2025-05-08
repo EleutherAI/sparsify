@@ -1,8 +1,9 @@
-#!/bin/sh
-WANDB_ENTITY=eleutherai uv run torchrun --nproc_per_node gpu --master_port 9348 -m sparsify \
-nev/acronym-toy-3M nev/acronym-toy-dataset --ctx_len 32 \
+#!/bin/bash
+# WANDB_ENTITY=eleutherai uv run torchrun --nproc_per_node gpu --master_port 9348 -m sparsify \
+WANDB_ENTITY=eleutherai uv run python -m sparsify \
+nev/acronym-toy-3M nev/acronyms-toy-dataset --ctx_len 32 --return_overflowed_tokens=False \
 --transcode=True --skip_connection=True \
---batch_size=8 --expansion_factor=32 --tp=4 \
---hookpoints h.0.mlp h.1.mlp h.2.mlp h.3.mlp \
+--batch_size=8 --expansion_factor=128 \
+--hookpoints h.0.mlp h.1.mlp h.2.mlp h.3.mlp h.4.mlp h.5.mlp h.6.mlp h.7.mlp \
 --run_name acr-clt/$1 ${@:2} \
---cross_layer=4
+--cross_layer=8

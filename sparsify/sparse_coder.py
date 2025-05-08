@@ -15,7 +15,7 @@ from torch.distributed.tensor.device_mesh import DeviceMesh
 
 from .config import SparseCoderConfig
 from .fused_encoder import EncoderOutput, fused_encoder
-from .utils import decoder_impl, load_sharded, save_sharded
+from .utils import barrier, decoder_impl, load_sharded, save_sharded
 
 
 class ForwardOutput(NamedTuple):
@@ -405,18 +405,17 @@ class SparseCoder(nn.Module):
                 strict=strict,
             )
         else:
-            torch.distributed.barrier()
+            barrier()
             state_dict = load_sharded(
                 filename,
                 self.state_dict(),
                 self.mesh,
             )
-            torch.distributed.barrier()
             self.load_state_dict(state_dict, strict=strict)
-            torch.distributed.barrier()
+            barrier()
 
     def save_to_disk(self, path: Path | str):
-        torch.distributed.barrier()
+        barrier()
         path = Path(path)
         if (
             not torch.distributed.is_initialized()
@@ -433,7 +432,7 @@ class SparseCoder(nn.Module):
                     },
                     f,
                 )
-        torch.distributed.barrier()
+        barrier()
 
     @property
     def device(self):
