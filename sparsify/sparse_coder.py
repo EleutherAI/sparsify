@@ -361,6 +361,7 @@ class SparseCoder(nn.Module):
     def dtype(self):
         return self.encoder.weight.dtype
 
+    @torch.autocast("cuda")
     def encode(self, x: Tensor) -> EncoderOutput:
         """Encode the input and select the top-k latents."""
         if not self.cfg.transcode:
