@@ -1,0 +1,8 @@
+#!/bin/bash
+WANDB_ENTITY=eleutherai uv run python -m sparsify \
+"HuggingFaceTB/SmolLM2-135M" EleutherAI/SmolLM2-135M-10B \
+--batch_size 16 --grad_acc_steps 2 \
+--transcode=True --skip_connection=True --expansion_factor=64 \
+--activation=gumbel_binary --lr=3e-2 \
+--hookpoints layers.0.mlp layers.9.mlp layers.18.mlp layers.27.mlp \
+--run_name "SmolLM2-135M-gumbel-$1" ${@:2}

@@ -1,0 +1,7 @@
+#!/bin/bash
+# --loss_fn=kl --batch_size=16 --grad_acc_steps=2 \
+WANDB_ENTITY=eleutherai uv run python -m sparsify \
+"HuggingFaceTB/SmolLM2-135M" --transcode=True --skip_connection=True \
+--hookpoints layers.10.mlp layers.15.mlp layers.20.mlp \
+--wandb_project=optimized-encoder \
+--run_name sae-pkm/$1 ${@:2}

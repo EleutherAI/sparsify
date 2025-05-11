@@ -1,0 +1,7 @@
+#!/bin/bash
+# --loss_fn=kl --batch_size=16 --grad_acc_steps=2 \
+WANDB_ENTITY=eleutherai uv run python -m sparsify \
+"HuggingFaceTB/SmolLM2-135M" --transcode=True --skip_connection=True \
+--batch_size=16 --grad_acc_steps=2 \
+--hookpoints layers.10.mlp layers.15.mlp layers.20.mlp \
+--run_name binaries/$1 ${@:2}

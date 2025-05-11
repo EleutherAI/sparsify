@@ -1,7 +1,8 @@
 import json
+import os
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import NamedTuple, Optional
+from typing import Literal, NamedTuple, Optional
 
 import einops
 import torch
@@ -13,7 +14,6 @@ from torch import Tensor, nn
 
 from .config import SparseCoderConfig
 from .fused_encoder import EncoderOutput, binary_fused_encoder, fused_encoder
-from .reinmax import reinmax
 from .utils import decoder_impl, eager_decode
 
 # Thresholded
@@ -120,7 +120,7 @@ def custom_gumbel_softmax(
     ).scatter_(dim, index, 1.0)
     if k is not None:
         soft_values, soft_indices = y_soft.topk(k, dim=dim)
-        if 0:
+        if GUMBEL_TYPE == "sparse_x4_accurate":
             threshold = soft_values[..., -1, None]
             # soft_values = torch.where(mask, soft_values, soft_values.detach())
             gumbels_ = torch.where(y_soft >= threshold, gumbels, gumbels.detach())
@@ -131,16 +131,21 @@ def custom_gumbel_softmax(
     return y_hard - y_soft.detach() + y_soft
 
 
+GUMBEL_TYPE: Literal[
+    "full", "sparse_grad", "sparse_x4", "sparse_x4_accurate", "topk"
+] = os.environ.get("GUMBEL_TYPE", "full")
+
+
 @torch.compile(mode="max-autotune-no-cudagraphs")
 def gumbel_encoder(x: Tensor, W_enc: Tensor, b_enc: Tensor, k: int) -> EncoderOutput:
     preacts = torch.einsum("...i,oi->...o", x, W_enc) + b_enc
 
-    if 0:
+    if GUMBEL_TYPE == "topk":
         gumbel = torch.empty_like(preacts).exponential_().log().neg()
         gumbeled = preacts + gumbel
         softmaxed = torch.nn.functional.softmax(
-            preacts,
-            # gumbeled,
+            # preacts,
+            gumbeled,
             dim=-1,
         )
         softmaxed = 1 - (1 - softmaxed).pow(k)
@@ -149,13 +154,11 @@ def gumbel_encoder(x: Tensor, W_enc: Tensor, b_enc: Tensor, k: int) -> EncoderOu
         values = torch.ones_like(values).float() + (values - values.detach())
         return EncoderOutput(values, indices, preacts)
 
-    if 1:
-        grouped = einops.rearrange(preacts, "... (k h) -> ... k h", k=k)
-        # values = torch.nn.functional.gumbel_softmax(
-        #     grouped, tau=0.5, hard=True, dim=-1
-        # )
+    grouped = einops.rearrange(preacts, "... (k h) -> ... k h", k=k)
+    if GUMBEL_TYPE == "sparse_x4":
+        values = torch.nn.functional.gumbel_softmax(grouped, tau=0.5, hard=True, dim=-1)
         threshold = grouped.topk(4, dim=-1).values[..., -1, None]
-        values, _ = reinmax(grouped, tau=1.1)
+        # values, _ = reinmax(grouped, tau=1.1)
         values = torch.where(values >= threshold, values, values.detach())
         values = values.flatten(-2, -1)
         indices = (
@@ -164,7 +167,19 @@ def gumbel_encoder(x: Tensor, W_enc: Tensor, b_enc: Tensor, k: int) -> EncoderOu
             .expand_as(values)
         )
         return EncoderOutput(values, indices, preacts)
-    values, indices = custom_gumbel_softmax(grouped, tau=0.5, dim=-1, k=4)
+    values = custom_gumbel_softmax(
+        grouped, tau=0.5, dim=-1, k=None if GUMBEL_TYPE == "full" else 4
+    )
+    if GUMBEL_TYPE == "full":
+        indices = torch.arange(values.shape[-1], device=values.device) + (
+            torch.arange(values.shape[-2], device=values.device)[:, None]
+            * values.shape[-1]
+        )
+        indices = indices.unsqueeze(0).expand_as(values)
+        values = values.flatten(-2, -1)
+        indices = indices.flatten(-2, -1)
+        return EncoderOutput(values, indices, preacts)
+    values, indices = values
     values = values.flatten(-2, -1)
     indices = indices + torch.arange(
         indices.shape[-2], device=indices.device

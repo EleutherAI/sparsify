@@ -1,0 +1,8 @@
+#!/bin/bash
+WANDB_ENTITY=eleutherai uv run python -m sparsify \
+"HuggingFaceTB/SmolLM2-135M" --transcode=True --skip_connection=True \
+--run_name binaries/$1 ${@:2} \
+--batch_size=16 --grad_acc_steps=2 \
+--hookpoints layers.9.mlp layers.18.mlp layers.27.mlp
+# --batch_size=32 \
+# --hookpoints layers.18.mlp

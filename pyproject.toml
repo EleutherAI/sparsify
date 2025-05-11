@@ -16,10 +16,11 @@ dependencies = [
     "einops",
     "huggingface-hub",
     "natsort", # For sorting module names
+    "rtopk-torch",
     "safetensors",
     "schedulefree",
     "simple-parsing",
-    "torch",
+    "torch==2.6.0",
     "transformers",
 ]
 version = "0.1.0"
@@ -38,7 +39,11 @@ reportPrivateImportUsage = false
 [tool.setuptools.packages.find]
 include = ["sparsify*"]
 
+[tool.black]
+force_exclude = "sparse_gumbel"
+
 [tool.ruff]
+exclude = ["sparse_gumbel.py"]
 # Enable pycodestyle (`E`), Pyflakes (`F`), and isort (`I`) codes
 # See https://beta.ruff.rs/docs/rules/ for more possible rules
 select = ["E", "F", "I"]
@@ -51,3 +56,4 @@ ignore-init-module-imports = true
 
 [tool.uv.sources]
 eindex-callum = { git = "https://github.com/callummcdougall/eindex.git" }
+rtopk-torch = { git = "https://github.com/EleutherAI/rtopk" }

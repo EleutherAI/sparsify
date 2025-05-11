@@ -1,0 +1,57 @@
+#!/bin/bash
+set -e
+DEV=$1
+if [ -z "$DEV" ]; then
+    echo "Usage: $0 <CUDA DEVICE ID>"
+    exit 1
+fi
+export CUDA_VISIBLE_DEVICES=$DEV
+if [[ $DEV == "0" ]]; then
+    # ./trae baseline
+    # ./trae baseline-x64 --expansion_factor=64
+    # ./trae kron-u1 --optimized_encoder_config=Kronecker -u=1
+
+    # ./trae kron-baseline-long --optimized_encoder_config=Kronecker --stop_steps=150_000
+
+    # ./trae baseline-k64 --k=64
+    ./trae kron-k64 --k=64 --optimized_encoder_config=Kronecker
+fi
+if [[ $DEV == "1" ]]; then
+    # ./trae kron-baseline --optimized_encoder_config=Kronecker
+    # ./trae kron-x64-k64 --optimized_encoder_config=Kronecker --expansion_factor=64 --k=64
+    # ./trae pkm-h8 --optimized_encoder_config=PKM --heads=8
+
+    # ./trae kron-x64-k64-long --optimized_encoder_config=Kronecker --expansion_factor=64 --k=64 --stop_steps=150_000
+
+    ./trae kron-ig4-u4 --optimized_encoder_config=Kronecker --in_group=4 -u=4
+fi
+if [[ $DEV == "2" ]]; then
+    # ./trae pkm-baseline --optimized_encoder_config=PKM
+    # ./trae pkm-x64 --optimized_encoder_config=PKM --expansion_factor=64
+    # ./trae pkm-h32 --optimized_encoder_config=PKM --heads=32
+
+    # ./trae kron-x64-long --optimized_encoder_config=Kronecker --expansion_factor=64 --stop_steps=150_000
+    ./trae kron-og8 --optimized_encoder_config=Kronecker --out_group=8
+fi
+if [[ $DEV == "3" ]]; then
+    # ./trae pkm-h16 --optimized_encoder_config=PKM --heads=16
+    # ./trae baseline-k64 --k=64
+    # ./trae kron-u8 --optimized_encoder_config=Kronecker -u=8
+
+    # ./trae kron-u2-long --optimized_encoder_config=Kronecker -u=2 --stop_steps=150_000
+    ./trae kron-ig8 --optimized_encoder_config=Kronecker --in_group=8
+fi
+if [[ $DEV == "4" ]]; then
+    # ./trae pkm-x64-h16 --optimized_encoder_config=PKM --heads=16 --expansion_factor=64
+    # ./trae baseline-x64-k64 --expansion_factor=64 --k=64
+    # ./trae kron-ig4 --optimized_encoder_config=Kronecker --in_group=4
+
+    # ./trae kron-ig4-long --optimized_encoder_config=Kronecker --in_group=4 --stop_steps=150_000
+    ./trae pkm-h16-k64 --optimized_encoder_config=PKM --heads=16 --k=64
+fi
+if [[ $DEV == "5" ]]; then
+    # ./trae kron-x64 --optimized_encoder_config=Kronecker --expansion_factor=64
+    # ./trae kron-u2 --optimized_encoder_config=Kronecker -u=2
+
+    ./trae pkm-x64-h16-k64 --optimized_encoder_config=PKM --heads=16 --expansion_factor=64 --k=64
+fi

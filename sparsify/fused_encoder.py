@@ -114,9 +114,6 @@ class BinaryFusedEncoder(torch.autograd.Function):
         return grad_input, grad_weight, grad_bias, None, grad_threshold
 
 
-K_MUL = 4
-
-
 class FusedEncoder(torch.autograd.Function):
     @staticmethod
     def forward(
