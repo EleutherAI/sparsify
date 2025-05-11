@@ -22,6 +22,7 @@ def assert_type(typ: Type[T], obj: Any) -> T:
 
 def barrier():
     """Synchronize all processes."""
+    return
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 

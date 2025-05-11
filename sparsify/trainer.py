@@ -299,6 +299,7 @@ class Trainer:
 
         # Make sure the model is frozen
         self.model.requires_grad_(False)
+        self.model.eval()
 
         barrier()
 
