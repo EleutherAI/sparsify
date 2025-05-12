@@ -107,11 +107,11 @@ class Trainer:
                     cfg.sae,
                     n_targets=(
                         min(
-                            cfg.cross_layer_step,
+                            cfg.cross_layer,
                             len(self.cfg.hookpoints) - position - 1,
                         )
                         + 1
-                        if cfg.cross_layer_step > 0
+                        if cfg.cross_layer > 0
                         else 0
                     ),
                 )
@@ -366,7 +366,7 @@ class Trainer:
         denom = acc_steps * self.cfg.wandb_log_frequency
         num_tokens_in_step = 0
 
-        cross_layer = self.cfg.cross_layer_step > 0
+        cross_layer = self.cfg.cross_layer > 0
 
         # For logging purposes
         avg_auxk_loss = defaultdict(float)

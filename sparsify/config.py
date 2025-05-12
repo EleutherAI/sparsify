@@ -104,7 +104,7 @@ class TrainConfig(Serializable):
     layer_stride: int = 1
     """Stride between layers to train sparse coders on."""
 
-    cross_layer_step: int = 0
+    cross_layer: int = 0
     """How many layers ahead to train the sparse coder on.
     If 0, train only on the same layer."""
 
