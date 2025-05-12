@@ -492,13 +492,11 @@ class Trainer:
             for hookpoint, layer_mid in layer_mids.items():
                 if self.cfg.loss_fn == "fvu":
                     layer_mid.detach()
+                # divide_by = max(1, len(layer_mids) - 1)
+                divide_by = 1
                 out = layer_mid(
                     outputs,
-                    addition=(
-                        0
-                        if hookpoint != name
-                        else (output / max(1, len(layer_mids) - 1))
-                    ),
+                    addition=(0 if hookpoint != name else (output / divide_by)),
                     no_extras=hookpoint != name,
                 )
                 if self.cfg.loss_fn == "fvu":
