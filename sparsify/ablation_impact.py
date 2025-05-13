@@ -2,6 +2,7 @@ import os
 import re
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -9,12 +10,13 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 from datasets import DownloadConfig, load_dataset
+from torch import Tensor
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from sparsify import SparseCoder
 from sparsify.data import chunk_and_tokenize
-from sparsify.sparsify_hooks import collect_activations, edit_with_mse
+from sparsify.sparsify_hooks import ablate_with_mse, collect_activations, edit_with_mse
 
 mp.set_start_method("spawn", force=True)
 
@@ -190,6 +192,7 @@ def process_hookpoint_losses(args):
         sparse_path,
         variance,
         dataset,
+        interpretability_df,
     ) = args
 
     torch.cuda.set_device(gpu_id)
@@ -202,7 +205,6 @@ def process_hookpoint_losses(args):
         max_seq_len=1024,
     ).select(range(4096))
     del tokenizer
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
     model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
 
@@ -216,9 +218,14 @@ def process_hookpoint_losses(args):
         )
     sparse_model.eval()
 
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
     sparse_losses = []
     sparse_accuracies = []
+    ablation_losses = []
+    ablation_accuracies = []
     fvus = []
+
     for batch in dataloader:
         tokens = batch["input_ids"].to(device)
 
@@ -229,26 +236,50 @@ def process_hookpoint_losses(args):
         ) as mses:
             output = model(tokens.long())
 
-        sparse_losses.append(
-            F.cross_entropy(
-                output.logits[:, :-1].flatten(0, 1), tokens[:, 1:].flatten()
-            ).item()
+        loss = F.cross_entropy(
+            output.logits[:, :-1].flatten(0, 1), tokens[:, 1:].flatten()
         )
+        sparse_losses.append(loss.item())
 
-        sparse_accuracies.append(
-            (output.logits[:, :-1].argmax(dim=-1) == tokens[:, 1:])
-            .float()
-            .mean()
-            .item()
+        accuracy = (
+            (output.logits[:, :-1].argmax(dim=-1) == tokens[:, 1:]).float().mean()
         )
+        sparse_accuracies.append(accuracy.item())
 
         fvus.append((mses[f"model.{hookpoint}"] / variance).cpu())
 
+        if not interpretability_df.empty:
+            for i in range(len(interpretability_df)):
+                with ablate_with_mse(
+                    model,
+                    hookpoints=[f"model.{hookpoint}"],
+                    sparse_models={f"model.{hookpoint}": sparse_model},
+                    ablate_features={
+                        f"model.{hookpoint}": interpretability_df[
+                            "latent_idx"
+                        ].tolist()[i : i + 1]
+                    },
+                ) as mses:
+                    output = model(tokens.long())
+
+                    loss = F.cross_entropy(
+                        output.logits[:, :-1].flatten(0, 1), tokens[:, 1:].flatten()
+                    )
+                    ablation_losses.append(loss.item())
+
+                    accuracy = (
+                        (output.logits[:, :-1].argmax(dim=-1) == tokens[:, 1:])
+                        .float()
+                        .mean()
+                    )
+                    ablation_accuracies.append(accuracy.item())
+
     data = {
         "hookpoint": hookpoint,
-        "sparse_loss": np.mean(sparse_losses),
-        "sparse_fvu": np.mean(fvus),
-        "sparse_acc": np.mean(sparse_accuracies),
+        "feature_idx": interpretability_df["latent_idx"].tolist(),
+        "autointerp_score": interpretability_df["accuracy"].tolist(),
+        "ablation_loss": np.mean(ablation_losses),
+        "ablation_acc": np.mean(ablation_accuracies),
     }
     return data
 
@@ -293,25 +324,17 @@ def process_baseline_losses(args):
 
 
 @torch.inference_mode()
-def populate_performance_metrics(
+def populate_ablation_metrics(
     model_name: str,
     sparse_path: str,
-    variance_df: pd.DataFrame,
+    loss_df: pd.DataFrame,
     dataset: str,
     batch_size: int,
+    ablate_scores_path: str,
 ):
     results = {}
-    hookpoints = variance_df["hookpoint"].tolist()
+    hookpoints = loss_df["hookpoint"].tolist()
     num_gpus = torch.cuda.device_count()
-
-    baseline_loss, baseline_acc = process_baseline_losses(
-        (0, batch_size, model_name, dataset)
-    )
-    for hookpoint in hookpoints:
-        results[hookpoint] = {
-            "baseline_loss": baseline_loss,
-            "baseline_acc": baseline_acc,
-        }
 
     ctx = mp.get_context("spawn")
     args_list = [
@@ -321,86 +344,154 @@ def populate_performance_metrics(
             batch_size,
             model_name,
             sparse_path,
-            variance_df[variance_df["hookpoint"] == hookpoint][
-                "output_variance"
-            ].values[0],
+            loss_df[loss_df["hookpoint"] == hookpoint]["output_variance"].values[0],
             dataset,
+            (
+                get_ablation_indices(Path(ablate_scores_path), [hookpoint], 1000)
+                if ablate_scores_path is not None
+                else pd.DataFrame([])
+            ),
         )
         for i, hookpoint in enumerate(hookpoints)
     ]
 
     with ProcessPoolExecutor(max_workers=num_gpus, mp_context=ctx) as executor:
         for data in executor.map(process_hookpoint_losses, args_list):
+            # data contains auto-interpretability scores and ablation effects
+            # for n features
+            # we need to plot the scatter plot of the auto-interpretability scores
+            # vs the ablation effects
+            # and save the raw data to a csv file
             results[data["hookpoint"]].update(data)
 
-    return pd.DataFrame(
-        {
-            "hookpoint": hookpoints,
-            "baseline_loss": [results[hp]["baseline_loss"] for hp in hookpoints],
-            "sparse_loss_increase": [
-                results[hp]["sparse_loss"] - results[hp]["baseline_loss"]
-                for hp in hookpoints
-            ],
-            "baseline_acc": [results[hp]["baseline_acc"] for hp in hookpoints],
-            "sparse_acc_decrease": [
-                results[hp]["baseline_acc"] - results[hp]["sparse_acc"]
-                for hp in hookpoints
-            ],
-            "sparse_fvu": [results[hp]["sparse_fvu"] for hp in hookpoints],
-            "model": [model_name] * len(hookpoints),
-            "sparse_model_name": [sparse_path] * len(hookpoints),
-            "skip": ["skip" in sparse_path] * len(hookpoints),
-            "k": [extract_k(sparse_path.split("/")[-1])] * len(hookpoints),
-            # "loss_increase_pct": [
-            #     (results[hp]["loss"] - baseline_loss) / baseline_loss * 100
-            #     for hp in hookpoints
-            # ],
-        }
+    # save the raw data to a csv file
+    pd.DataFrame(results).to_csv(
+        f"{loss_df.iloc[0]['sparse_model_name']}_ablation_raw_data.csv", index=False
     )
+
+    # plot the scatter plot of the auto-interpretability scores vs the ablation effects
+    # using go.Scatter
+
+    import plotly.graph_objects as go
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=results["autointerp_scores"], y=results["ablation_loss"], mode="markers"
+        )
+    )
+    fig.write_image(
+        f"{loss_df.iloc[0]['sparse_model_name']}_ablation_scatter.pdf", format="pdf"
+    )
+    exit()
+
+    loss_df["ablation_loss"] = [results[hp]["ablation_loss"] for hp in hookpoints]
+    loss_df["random_ablation_loss"] = [
+        results[hp]["random_ablation_loss"] for hp in hookpoints
+    ]
+    loss_df["ablation_acc"] = [results[hp]["ablation_acc"] for hp in hookpoints]
+
+    loss_df["ablation_loss_increase"] = (
+        loss_df["ablation_loss"] - loss_df["baseline_loss"]
+    )
+    loss_df["ablation_acc_decrease"] = loss_df["baseline_acc"] - loss_df["ablation_acc"]
+
+    return loss_df
+
+    # return pd.DataFrame(
+    #     {
+    #         "uninterpretable_ablation_loss_increase": [
+    #             results[hp]["uninterpretable_ablation_loss"]
+    #             - results[hp]["baseline_loss"]
+    #             for hp in hookpoints
+    #         ],
+    #         "random_ablation_loss_increase": [
+    #             results[hp]["random_ablation_loss"] - results[hp]["baseline_loss"]
+    #             for hp in hookpoints
+    #         ],
+    #         "uninterpretable_ablation_acc_decrease": [
+    #             results[hp]["baseline_acc"]
+    #             - results[hp]["uninterpretable_ablation_acc"]
+    #             for hp in hookpoints
+    #         ],
+    #         "random_ablation_acc_decrease": [
+    #             results[hp]["baseline_acc"] - results[hp]["random_ablation_acc"]
+    #             for hp in hookpoints
+    #         ],
+    #     }
+    # )
+
+
+def get_ablation_indices(
+    scores_path: Path, target_modules: list[str], num_samples: int
+) -> pd.DataFrame:
+    from delphi.log.result_analysis import build_scores_df
+
+    log_path = scores_path.parent / "log" / "hookpoint_firing_counts.pt"
+    hookpoint_firing_counts: dict[str, Tensor] = torch.load(log_path, weights_only=True)
+    df = build_scores_df(scores_path, target_modules, hookpoint_firing_counts)
+
+    # width = len(hookpoint_firing_counts[target_modules[0]])
+
+    # Sample num_samples random features with their autointerp scores
+    print(len(df), "rows")
+    return df.sample(num_samples)
+
+    # df.to_csv(f"images/uninterpretable_indices_{scores_path.stem}.csv", index=False)
+
+    # Get the features with an interpretability accuracy below the threshold
+    # features = df.query(f"accuracy < {threshold}")
+    # perfect_indices = df.query("accuracy == 1")["latent_idx"].unique()
+
+    # print(f"Number of features: {len(df)}")
+
+    # uninterpretable_indices = features["latent_idx"].unique()
+    # random_indices = torch.randint(0, width, (len(uninterpretable_indices),)).tolist()
+
+    # return uninterpretable_indices, random_indices
 
 
 @torch.inference_mode()
-def evaluate(
+def evaluate_ablation(
     model_name: str,
     sparse_path: str,
     hookpoints: list[str],
     batch_size: int,
     dataset: str,
+    ablate_scores_path: str,
+    threshold: float = 0.7,
 ):
     torch.manual_seed(42)
 
     cache_dir = f"images/ce_loss_increases/{model_name.replace('/', '-')}"
-    os.makedirs(cache_dir, exist_ok=True)
-
-    # Get variance
-    if os.path.exists(f"{cache_dir}/variance.csv"):
-        df = pd.read_csv(f"{cache_dir}/variance.csv")
-    else:
-        print(f"Populating variance for {model_name}...")
-        df = populate_variances(model_name, cache_dir, hookpoints, dataset, batch_size)
-        df.to_csv(f"{cache_dir}/variance.csv", index=False)
-
     sparse_name = sparse_path.split("/")[-1]
+
     loss_fvu_path = f"{cache_dir}/{sparse_name}_loss_fvu.csv"
-    # if os.path.exists(loss_fvu_path):
-    # df = pd.read_csv(loss_fvu_path)
-    # else:
-    print(f"Populating loss increase for {sparse_path}...")
-    df = df[df["hookpoint"].isin(hookpoints)]
-    df = populate_performance_metrics(
+    if not os.path.exists(loss_fvu_path):
+        print(
+            f"Baseline evaluation missing..."
+            f" populating loss increase for {sparse_path}..."
+        )
+        from sparsify.evaluate import evaluate
+
+        evaluate(model_name, sparse_path, hookpoints, batch_size, dataset)
+
+    loss_df = pd.read_csv(loss_fvu_path)
+
+    loss_df = loss_df[loss_df["hookpoint"].isin(hookpoints)]
+    df = populate_ablation_metrics(
         model_name,
         sparse_path,
-        df,
+        loss_df,
         dataset,
         batch_size,
+        ablate_scores_path,
     )
-    df.to_csv(loss_fvu_path, index=False)
+    df.to_csv(f"{loss_fvu_path}_ablation.csv", index=False)
 
     print("Done! Results:")
     print(df.head())
-    print(f"Saved to {loss_fvu_path}")
-
-    return df
+    print(f"Saved to {loss_fvu_path}_ablation.csv")
 
 
 def main():
@@ -411,15 +502,17 @@ def main():
     parser.add_argument("--hookpoints", nargs="+", required=True)
     parser.add_argument("--base_model", type=str, default="HuggingFaceTB/SmolLM2-135M")
     parser.add_argument("--dataset", type=str, default="EleutherAI/SmolLM2-135M-10B")
+    parser.add_argument("--ablate_scores_path", type=str, default=None)
     parser.add_argument("--batch_size", type=int, default=16)
     args = parser.parse_args()
 
-    evaluate(
+    evaluate_ablation(
         args.base_model,
         args.sparse_model,
         args.hookpoints,
         args.batch_size,
         args.dataset,
+        args.ablate_scores_path,
     )
 
 
