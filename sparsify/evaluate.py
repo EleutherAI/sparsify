@@ -17,6 +17,8 @@ from sparsify.data import chunk_and_tokenize
 from sparsify.sparsify_hooks import collect_activations, edit_with_mse
 
 mp.set_start_method("spawn", force=True)
+# N_EVALUATE = 4096
+N_EVALUATE = 32
 
 
 def extract_k(run_name):
@@ -95,11 +97,14 @@ def chunked_torch_variance(data_loader, device):
 def get_acts(batch, model, hookpoint, device, input_acts=True):
     # input_acts is a boolean that indicates whether the activations are input or output
 
-    with collect_activations(
-        model,
-        hookpoints=[hookpoint],
-        input_acts=input_acts,
-    ) as activations:
+    with (
+        torch.no_grad(),
+        collect_activations(
+            model,
+            hookpoints=[hookpoint],
+            input_acts=input_acts,
+        ) as activations,
+    ):
         model(batch["input_ids"].to(device))
 
     return {
@@ -122,7 +127,7 @@ def process_hookpoint_variance(args):
         ),  # type: ignore
         tokenizer,
         max_seq_len=1024,
-    ).select(range(4096))
+    ).select(range(N_EVALUATE))
 
     model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
 
@@ -158,7 +163,7 @@ def populate_variances(
     num_gpus = min(len(hookpoints), torch.cuda.device_count())
 
     args_list = [
-        (hookpoint, i, batch_size, model_name, dataset, False)
+        (hookpoint, i % num_gpus, batch_size, model_name, dataset, False)
         for i, hookpoint in enumerate(hookpoints)
     ]
 
@@ -200,21 +205,25 @@ def process_hookpoint_losses(args):
         load_dataset(dataset, split="train"),  # type: ignore
         tokenizer,
         max_seq_len=1024,
-    ).select(range(4096))
+    ).select(range(N_EVALUATE))
     del tokenizer
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
     model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
 
-    try:
-        sparse_model = SparseCoder.load_from_hub(
-            sparse_path, hookpoint=hookpoint, device=device
-        )
-    except Exception:
-        sparse_model = SparseCoder.load_from_disk(
-            f"{sparse_path}/{hookpoint}", device=device
-        )
-    sparse_model.eval()
+    all_hookpoints = [hookpoint] if isinstance(hookpoint, str) else hookpoint
+    model_hookpoints = [f"model.{hookpoint}" for hookpoint in all_hookpoints]
+    sparse_models = {}
+    for hp in all_hookpoints:
+        try:
+            sparse_models[f"model.{hp}"] = SparseCoder.load_from_hub(
+                sparse_path, hookpoint=hp, device=device
+            )
+        except Exception:
+            sparse_models[f"model.{hp}"] = SparseCoder.load_from_disk(
+                f"{sparse_path}/{hp}", device=device
+            )
+        sparse_models[f"model.{hp}"].eval()
 
     sparse_losses = []
     sparse_accuracies = []
@@ -224,8 +233,8 @@ def process_hookpoint_losses(args):
 
         with edit_with_mse(
             model,
-            hookpoints=[f"model.{hookpoint}"],
-            sparse_models={f"model.{hookpoint}": sparse_model},
+            hookpoints=model_hookpoints,
+            sparse_models=sparse_models,
         ) as mses:
             output = model(tokens.long())
 
@@ -242,12 +251,17 @@ def process_hookpoint_losses(args):
             .item()
         )
 
-        fvus.append((mses[f"model.{hookpoint}"] / variance).cpu())
+        fvus.append(
+            [
+                (mses[f"model.{hookpoint}"] / variance).cpu()
+                for hookpoint, variance in zip(all_hookpoints, variance)
+            ]
+        )
 
     data = {
         "hookpoint": hookpoint,
         "sparse_loss": np.mean(sparse_losses),
-        "sparse_fvu": np.mean(fvus),
+        "sparse_fvu": np.mean(fvus, axis=1),
         "sparse_acc": np.mean(sparse_accuracies),
     }
     return data
@@ -265,7 +279,7 @@ def process_baseline_losses(args):
         load_dataset(dataset, split="train"),  # type: ignore
         tokenizer,
         max_seq_len=1024,
-    ).select(range(4096))
+    ).select(range(N_EVALUATE))
     del tokenizer
 
     model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
@@ -312,45 +326,72 @@ def populate_performance_metrics(
             "baseline_loss": baseline_loss,
             "baseline_acc": baseline_acc,
         }
+    results["all"] = {
+        "baseline_loss": baseline_loss,
+        "baseline_acc": baseline_acc,
+    }
 
     ctx = mp.get_context("spawn")
-    args_list = [
-        (
-            hookpoint,
-            i,
+
+    def get_var(hookpoint):
+        return variance_df[variance_df["hookpoint"] == hookpoint][
+            "output_variance"
+        ].values[0]
+
+    def args(hookpoint):
+        return (
             batch_size,
             model_name,
             sparse_path,
-            variance_df[variance_df["hookpoint"] == hookpoint][
-                "output_variance"
-            ].values[0],
+            (
+                [get_var(hookpoint)]
+                if isinstance(hookpoint, str)
+                else [get_var(hp) for hp in hookpoint]
+            ),
             dataset,
         )
+
+    args_list = [
+        (
+            hookpoint,
+            i % num_gpus,
+            *args(hookpoint),
+        )
         for i, hookpoint in enumerate(hookpoints)
+    ] + [
+        (
+            hookpoints,
+            0,
+            *args(hookpoints),
+        )
     ]
 
     with ProcessPoolExecutor(max_workers=num_gpus, mp_context=ctx) as executor:
         for data in executor.map(process_hookpoint_losses, args_list):
-            results[data["hookpoint"]].update(data)
+            if isinstance(data["hookpoint"], list):
+                results["all"].update(data)
+            else:
+                results[data["hookpoint"]].update(data)
 
+    save_hookpoints = hookpoints + ["all"]
     return pd.DataFrame(
         {
-            "hookpoint": hookpoints,
-            "baseline_loss": [results[hp]["baseline_loss"] for hp in hookpoints],
+            "hookpoint": save_hookpoints,
+            "baseline_loss": [results[hp]["baseline_loss"] for hp in save_hookpoints],
             "sparse_loss_increase": [
                 results[hp]["sparse_loss"] - results[hp]["baseline_loss"]
-                for hp in hookpoints
+                for hp in save_hookpoints
             ],
-            "baseline_acc": [results[hp]["baseline_acc"] for hp in hookpoints],
+            "baseline_acc": [results[hp]["baseline_acc"] for hp in save_hookpoints],
             "sparse_acc_decrease": [
                 results[hp]["baseline_acc"] - results[hp]["sparse_acc"]
-                for hp in hookpoints
+                for hp in save_hookpoints
             ],
-            "sparse_fvu": [results[hp]["sparse_fvu"] for hp in hookpoints],
-            "model": [model_name] * len(hookpoints),
-            "sparse_model_name": [sparse_path] * len(hookpoints),
-            "skip": ["skip" in sparse_path] * len(hookpoints),
-            "k": [extract_k(sparse_path.split("/")[-1])] * len(hookpoints),
+            "sparse_fvu": [results[hp]["sparse_fvu"] for hp in save_hookpoints],
+            "model": [model_name] * len(save_hookpoints),
+            "sparse_model_name": [sparse_path] * len(save_hookpoints),
+            "skip": ["skip" in sparse_path] * len(save_hookpoints),
+            "k": [extract_k(sparse_path.split("/")[-1])] * len(save_hookpoints),
             # "loss_increase_pct": [
             #     (results[hp]["loss"] - baseline_loss) / baseline_loss * 100
             #     for hp in hookpoints
