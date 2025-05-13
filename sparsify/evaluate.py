@@ -17,8 +17,7 @@ from sparsify.data import chunk_and_tokenize
 from sparsify.sparsify_hooks import collect_activations, edit_with_mse
 
 mp.set_start_method("spawn", force=True)
-# N_EVALUATE = 4096
-N_EVALUATE = 32
+N_EVALUATE = 4096
 
 
 def extract_k(run_name):
@@ -261,7 +260,7 @@ def process_hookpoint_losses(args):
     data = {
         "hookpoint": hookpoint,
         "sparse_loss": np.mean(sparse_losses),
-        "sparse_fvu": np.mean(fvus, axis=1),
+        "sparse_fvu": np.mean(fvus, axis=0),
         "sparse_acc": np.mean(sparse_accuracies),
     }
     return data
