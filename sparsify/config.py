@@ -38,7 +38,7 @@ class SparseCoderConfig(Serializable):
     ste: Literal["sigmoid", "rectangle", "identity", "re"] = "sigmoid"
     """Straight-through estimator to use."""
 
-    ste_temperature: float = 1.0
+    ste_temperature: float = 2.0
     """Temperature for the STE."""
 
     tied_decoder: bool = False

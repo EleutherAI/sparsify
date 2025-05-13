@@ -30,7 +30,7 @@ class RunConfig(TrainConfig):
     """Name of the model to train."""
 
     dataset: str = field(
-        default="EleutherAI/fineweb-edu-dedup-10b",
+        default="EleutherAI/SmolLM2-135M-10B",
         positional=True,
     )
     """Path to the dataset to use for training."""
@@ -165,7 +165,16 @@ def run():
             dist.barrier()
             if rank != 0:
                 model, dataset = load_artifacts(args, rank)
+
+            # Drop examples that are indivisible across processes to prevent deadlock
+            remainder_examples = len(dataset) % dist.get_world_size()
+            dataset = dataset.select(range(len(dataset) - remainder_examples))
+
             dataset = dataset.shard(dist.get_world_size(), rank)
+
+            # Drop examples that are indivisible across processes to prevent deadlock
+            remainder_examples = len(dataset) % dist.get_world_size()
+            dataset = dataset.select(range(len(dataset) - remainder_examples))
 
         print(f"Training on '{args.dataset}' (split '{args.split}')")
         print(f"Storing model weights in {model.dtype}")

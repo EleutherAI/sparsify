@@ -268,7 +268,7 @@ class FusedEncoder(torch.autograd.Function):
 
         # Get top-k values and indices for each row
         if activation == "topk":
-            values, indices = torch.topk(preacts, k, dim=1, sorted=False)
+            values, indices = torch.topk(preacts, k, dim=-1, sorted=False)
         elif activation == "groupmax":
             values, indices = preacts.unflatten(-1, (k, -1)).max(dim=-1)
 
