@@ -449,10 +449,9 @@ class Trainer:
             num_tokens_in_step += N
 
             # Compute clean logits if using KL loss
+            clean_logits = self.model(x).logits if self.cfg.loss_fn == "kl" else None
             clean_probs = (
-                self.model(x).logits.softmax(dim=-1)
-                if self.cfg.loss_fn == "kl"
-                else None
+                clean_logits.softmax(dim=-1) if self.cfg.loss_fn == "kl" else None
             )
 
             # Forward pass on the model to get the next batch of activations
@@ -470,7 +469,11 @@ class Trainer:
                         avg_losses = avg_ce
                     case "kl":
                         dirty_lps = self.model(x).logits.log_softmax(dim=-1)
-                        kl = -torch.sum(clean_probs * dirty_lps, dim=-1).mean()
+                        kl = torch.sum(
+                            clean_probs
+                            * (clean_logits.log_softmax(dim=-1) - dirty_lps),
+                            dim=-1,
+                        ).mean()
                         kl.div(acc_steps).backward()
 
                         avg_kl += float(self.maybe_all_reduce(kl) / denom)
