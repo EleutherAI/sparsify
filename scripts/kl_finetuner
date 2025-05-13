@@ -14,15 +14,22 @@
 # layers.0.mlp layers.9.mlp layers.18.mlp layers.27.mlp \
 # layers.6.mlp layers.9.mlp layers.12.mlp layers.15.mlp \
 
+
+
+# --finetune /mnt/ssd-1/lucia/sparsify/checkpoints/SmolLM2-135M-topk-binary-s=2 \
+# --run_name SmolLM2-135M-topk-binary-s=2-all-ft \
+# --activation topk_binary \
+
+
 uv run python -m sparsify \
 HuggingFaceTB/SmolLM2-135M EleutherAI/SmolLM2-135M-20B \
 --batch_size 16 --grad_acc_steps 2 \
---activation topk_binary --hookpoints \
+--hookpoints \
 layers.0.mlp layers.9.mlp layers.18.mlp layers.27.mlp \
 --optimizer adam --transcode --lr 1e-3 --lr_warmup_steps 50 \
 --skip_connection --expansion_factor 64 \
---finetune /mnt/ssd-1/lucia/sparsify/checkpoints/SmolLM2-135M-topk-binary-s=2 \
---run_name SmolLM2-135M-topk-binary-s=2-all-ft \
+--finetune /mnt/ssd-1/lucia/sparsify/checkpoints/SmolLM2-135M-topk-s=2 \
+--run_name SmolLM2-135M-topk-s=2-all-ft \
 --init_seeds 2 \
 --log_to_wandb True \
 --loss_fn kl \
