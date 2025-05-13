@@ -64,13 +64,6 @@ class DenseBinaryEncode(torch.autograd.Function):
         # Gradient of the loss wrt the threshold
         grad_log_threshold = -grad_thresholded_preacts.sum(0)
 
-        # print("encode backwards")
-        # print("input grad", grad_input)
-        # print("W_enc grad", grad_W_enc)
-        # print("b_enc grad", grad_b_enc)
-        # print("thresholds", threshold)
-        # print("log threshold grad", grad_log_threshold)
-
         return grad_input, grad_W_enc, grad_b_enc, grad_log_threshold
 
 
@@ -290,11 +283,6 @@ class SparseCoder(nn.Module):
                 self.cfg.activation,
             )
 
-    def binary_decode(self, top_indices: Tensor, top_acts: Tensor) -> Tensor:
-        y = eager_decode(top_indices, top_acts, self.W_dec.mT)
-        # y = BinaryDecode.apply(top_indices, top_acts, self.W_dec.mT)
-        return y + self.b_dec
-
     def decode(self, top_acts: Tensor, top_indices: Tensor) -> Tensor:
         y = decoder_impl(top_indices, top_acts.to(self.dtype), self.W_dec.mT)
         return y + self.b_dec
@@ -308,25 +296,21 @@ class SparseCoder(nn.Module):
     def forward(
         self, x: Tensor, y: Tensor | None = None, *, dead_mask: Tensor | None = None
     ) -> ForwardOutput:
-        # if self.cfg.activation == "binary":
-        #     top_acts = dense_binary_encode(
-        #         x, self.encoder.weight, self.encoder.bias, self.log_threshold
-        #     )
-        #     top_indices, pre_acts = None, None
-        #     sae_out = top_acts @ self.W_dec + self.b_dec
-        # else:
-        top_acts, top_indices, pre_acts = self.encode(x)
+        if self.cfg.activation == "binary":
+            top_acts = dense_binary_encode(
+                x, self.encoder.weight, self.encoder.bias, self.log_threshold
+            )
+            top_indices, pre_acts = None, None
+        else:
+            top_acts, top_indices, pre_acts = self.encode(x)
 
         # If we aren't given a distinct target, we're autoencoding
         if y is None:
             y = x
 
         # Decode
-        if self.cfg.activation == "topk_binary":
-            sae_out = self.binary_decode(top_indices, top_acts)
-        elif self.cfg.activation == "binary":
-            pass
-            # sae_out = top_acts @ self.W_dec + self.b_dec
+        if self.cfg.activation == "binary":
+            sae_out = top_acts @ self.W_dec + self.b_dec
         else:
             sae_out = self.decode(top_acts, top_indices)
         if self.W_skip is not None:
@@ -340,6 +324,10 @@ class SparseCoder(nn.Module):
 
         # Second decoder pass for AuxK loss
         if dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
+            assert (
+                not self.cfg.activation == "binary"
+            ), "AuxK loss is not supported for binary activation."
+
             # Heuristic from Appendix B.1 in the paper
             k_aux = y.shape[-1] // 2
 
@@ -361,32 +349,32 @@ class SparseCoder(nn.Module):
         else:
             auxk_loss = sae_out.new_tensor(0.0)
 
-        if self.cfg.matryoshka:
-            total_l2_loss = (self.b_dec - y.float()).pow(2).sum()
-            l2_losses = []
+        # if self.cfg.matryoshka:
+        #     total_l2_loss = (self.b_dec - y.float()).pow(2).sum()
+        #     l2_losses = []
 
-            cumulative_sae_out = self.b_dec
+        #     cumulative_sae_out = self.b_dec
 
-            for start_idx, end_idx in zip(
-                self.group_indices[:-1], self.group_indices[1:]
-            ):
-                group_mask = (top_indices >= start_idx) & (top_indices < end_idx)
-                filtered_acts = torch.where(
-                    group_mask, top_acts, torch.zeros_like(top_acts)
-                )
-                group_out = decoder_impl(
-                    top_indices, filtered_acts.to(self.dtype), self.W_dec.mT
-                )
-                cumulative_sae_out = cumulative_sae_out + group_out
+        #     for start_idx, end_idx in zip(
+        #         self.group_indices[:-1], self.group_indices[1:]
+        #     ):
+        #         group_mask = (top_indices >= start_idx) & (top_indices < end_idx)
+        #         filtered_acts = torch.where(
+        #             group_mask, top_acts, torch.zeros_like(top_acts)
+        #         )
+        #         group_out = decoder_impl(
+        #             top_indices, filtered_acts.to(self.dtype), self.W_dec.mT
+        #         )
+        #         cumulative_sae_out = cumulative_sae_out + group_out
 
-                current_e = (cumulative_sae_out.float() - y.float()).pow(2).sum()
+        #         current_e = (cumulative_sae_out.float() - y.float()).pow(2).sum()
 
-                l2_losses.append(current_e)
-                total_l2_loss += current_e
+        #         l2_losses.append(current_e)
+        #         total_l2_loss += current_e
 
-            l2_loss = torch.stack(l2_losses).sum() / self.cfg.matryoshka_groups
-        else:
-            l2_loss = e.pow(2).sum()
+        #     l2_loss = torch.stack(l2_losses).sum() / self.cfg.matryoshka_groups
+        # else:
+        l2_loss = e.pow(2).sum()
 
         fvu = l2_loss / total_variance
         dummy_loss = sum(p.sum() * 0.0 for p in self.parameters())
@@ -394,7 +382,7 @@ class SparseCoder(nn.Module):
 
         if self.cfg.multi_topk:
             assert (
-                not self.cfg.activation == "topk_binary"
+                not self.cfg.activation == "binary"
             ), "Multi-TopK is not supported for binary activation."
             top_acts, top_indices = pre_acts.topk(4 * self.cfg.k, sorted=False)
             sae_out = self.decode(top_acts, top_indices)

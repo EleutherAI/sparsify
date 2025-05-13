@@ -102,13 +102,23 @@ class Trainer:
                     )
                     print("Run `pip install bitsandbytes` for less memory usage.")
 
-                pgs = [
-                    dict(
-                        params=sae.parameters(),
-                        lr=cfg.lr or 2e-4 / (sae.num_latents / (2**14)) ** 0.5,
-                    )
-                    for sae in self.saes.values()
-                ]
+                if list(self.saes.values())[0].cfg.activation == "topk_binary":
+                    print("binary", list(self.saes.values())[0].num_latents)
+                    pgs = [
+                        dict(
+                            params=sae.parameters(),
+                            lr=cfg.lr or 3e-3 / (sae.num_latents / (2**15)) ** 0.5,
+                        )
+                        for sae in self.saes.values()
+                    ]
+                else:
+                    pgs = [
+                        dict(
+                            params=sae.parameters(),
+                            lr=cfg.lr or 2e-4 / (sae.num_latents / (2**14)) ** 0.5,
+                        )
+                        for sae in self.saes.values()
+                    ]
                 # For logging purposes
                 lrs = [f"{lr:.2e}" for lr in sorted(set(pg["lr"] for pg in pgs))]
 
@@ -170,6 +180,9 @@ class Trainer:
         }
 
         num_latents = list(self.saes.values())[0].num_latents
+
+        # self.initial_k = self.cfg.sae.k#128
+        # self.final_k = self.cfg.sae.k#576 * 16 # 256
         self.initial_k = min(num_latents, round(list(input_widths.values())[0] * 10))
         self.final_k = self.cfg.sae.k
 
