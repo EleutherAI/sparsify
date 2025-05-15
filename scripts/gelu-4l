@@ -3,8 +3,10 @@ WANDB_ENTITY=eleutherai uv run python -m sparsify \
 nev/GELU_4L512W_C4_Code \
 --ctx_len 1024 \
 --transcode=True \
---batch_size=8 --expansion_factor=64 \
+--batch_size=32 --expansion_factor=128 \
+--lr=3e-4 \
 --k=64 \
 --hookpoints h.0.mlp h.1.mlp h.2.mlp h.3.mlp \
 --run_name gelu-4l-clt/$1 ${@:2} \
---skip_connection=True
+--skip_connection=True \
+--cross_layer 4
