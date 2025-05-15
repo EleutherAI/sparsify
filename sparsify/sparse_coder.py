@@ -119,6 +119,8 @@ class MidDecoder:
             sae_out += self.x.to(self.sparse_coder.dtype) @ W_skip.mT
         sae_out += addition
 
+        sae_out = self.sparse_coder.denormalize_output(sae_out)
+
         if no_extras:
             return ForwardOutput(
                 sae_out,
@@ -207,7 +209,6 @@ class SparseCoder(nn.Module):
         self.num_latents = cfg.num_latents or d_in * cfg.expansion_factor
         self.multi_target = cfg.n_targets > 0 and cfg.transcode
         self.mesh = mesh
-
         self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
         self.encoder.bias.data.zero_()
         if mesh is None:
@@ -316,6 +317,34 @@ class SparseCoder(nn.Module):
         else:
             self.b_dec = create_bias()
             self.W_skip = create_W_skip()
+
+        if cfg.normalize_io:
+            if mesh is not None:
+                self.register_buffer(
+                    "in_norm",
+                    dtensor.ones(
+                        1,
+                        dtype=dtype,
+                        device_mesh=mesh,
+                        placements=[dtensor.Replicate(), dtensor.Replicate()],
+                    ),
+                )
+                self.register_buffer(
+                    "out_norm",
+                    dtensor.ones(
+                        1,
+                        dtype=dtype,
+                        device_mesh=mesh,
+                        placements=[dtensor.Replicate(), dtensor.Replicate()],
+                    ),
+                )
+            else:
+                self.register_buffer(
+                    "in_norm", torch.ones(1, device=device, dtype=dtype)
+                )
+                self.register_buffer(
+                    "out_norm", torch.ones(1, device=device, dtype=dtype)
+                )
 
     @staticmethod
     def load_many(
@@ -442,8 +471,20 @@ class SparseCoder(nn.Module):
     def dtype(self):
         return self.encoder.weight.dtype
 
+    def normalize_input(self, x: Tensor) -> Tensor:
+        if self.cfg.normalize_io:
+            return x * (x.shape[-1] ** 0.5 / self.in_norm)
+        return x
+
+    def denormalize_output(self, x: Tensor) -> Tensor:
+        if self.cfg.normalize_io:
+            return x * (self.out_norm / (x.shape[-1] ** 0.5))
+        return x
+
     def encode(self, x: Tensor) -> EncoderOutput:
         """Encode the input and select the top-k latents."""
+        x = self.normalize_input(x)
+
         if not self.cfg.transcode:
             x = x - self.b_dec
 
@@ -481,6 +522,8 @@ class SparseCoder(nn.Module):
         top_acts, top_indices, pre_acts = self.encode(x)
         if self.multi_target:
             pre_acts = None
+
+        x = self.normalize_input(x)
 
         mid_decoder = MidDecoder(self, x, top_acts, top_indices, dead_mask, pre_acts)
         if self.multi_target or return_mid_decoder:

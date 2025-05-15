@@ -38,6 +38,9 @@ class SparseCoderConfig(Serializable):
     n_targets: int = 0
     """Number of targets to predict. Only used if `transcode` is True."""
 
+    normalize_io: bool = False
+    """Normalize the input and output of the sparse coder."""
+
 
 # Support different naming conventions for the same configuration
 SaeConfig = SparseCoderConfig

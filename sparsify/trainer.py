@@ -469,6 +469,19 @@ class Trainer:
                     # not the contributing previous layers
                     raw.b_decs[0].data[:] = mean.to(raw.dtype)
 
+                if raw.cfg.normalize_io:
+                    in_norm = inputs.norm(dim=-1).mean()
+                    out_norm = outputs.norm(dim=-1).mean()
+
+                    raw.in_norm.data[:] = in_norm
+                    raw.out_norm.data[:] = out_norm
+                    raw.b_dec.data[:] = raw.b_dec.data * (
+                        (raw.b_dec.shape[-1] ** 0.5) / out_norm
+                    )
+                    raw.encoder.bias.data[:] = raw.encoder.bias.data * (
+                        (raw.encoder.weight.shape[-1] ** 0.5) / in_norm
+                    )
+
             # Make sure the W_dec is still unit-norm if we're autoencoding
             if raw.cfg.normalize_decoder and not self.cfg.sae.transcode:
                 raw.set_decoder_norm_to_unit_norm()
