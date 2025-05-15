@@ -20,7 +20,7 @@ dependencies = [
     "safetensors",
     "schedulefree",
     "simple-parsing",
-    "torch==2.6.0",
+    "torch>=2.7.0",
     "transformers",
 ]
 version = "1.1.3"
