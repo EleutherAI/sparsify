@@ -475,9 +475,10 @@ class Trainer:
 
                     raw.in_norm.data[:] = in_norm
                     raw.out_norm.data[:] = out_norm
-                    raw.b_dec.data[:] = raw.b_dec.data * (
-                        (raw.b_dec.shape[-1] ** 0.5) / out_norm
-                    )
+                    for b_dec in raw.b_decs if raw.multi_target else [raw.b_dec]:
+                        b_dec.data[:] = b_dec.data * (
+                            (b_dec.shape[-1] ** 0.5) / out_norm
+                        )
                     raw.encoder.bias.data[:] = raw.encoder.bias.data * (
                         (raw.encoder.weight.shape[-1] ** 0.5) / in_norm
                     )
@@ -511,6 +512,7 @@ class Trainer:
                     outputs,
                     addition=(0 if hookpoint != name else (output / divide_by)),
                     no_extras=hookpoint != name,
+                    denormalize=hookpoint == name,
                 )
                 if self.cfg.loss_fn == "fvu":
                     to_restore.append((layer_mid, out.is_last))

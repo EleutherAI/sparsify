@@ -93,6 +93,7 @@ class MidDecoder:
         index: Optional[int] = None,
         addition: float | Tensor = 0,
         no_extras: bool = False,
+        denormalize: bool = True,
     ) -> ForwardOutput:
         # If we aren't given a distinct target, we're autoencoding
         if y is None:
@@ -119,7 +120,8 @@ class MidDecoder:
             sae_out += self.x.to(self.sparse_coder.dtype) @ W_skip.mT
         sae_out += addition
 
-        sae_out = self.sparse_coder.denormalize_output(sae_out)
+        if denormalize:
+            sae_out = self.sparse_coder.denormalize_output(sae_out)
 
         if no_extras:
             return ForwardOutput(
