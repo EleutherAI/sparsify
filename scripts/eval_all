@@ -1,0 +1,6 @@
+#!/bin/bash
+export CUDA_VISIBLE_DEVICES=0,6,7
+scripts/eval /mnt/ssd-1/lucia/sparsify/checkpoints/SmolLM2-135M-topk-s=2
+scripts/eval /mnt/ssd-1/lucia/sparsify/checkpoints/SmolLM2-135M-topk-binary-s=2
+scripts/eval checkpoints/SmolLM2-135M-topk-s=2-all-ft
+scripts/eval checkpoints/SmolLM2-135M-topk-binary-s=2-all-ft

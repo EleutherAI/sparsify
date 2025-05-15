@@ -1,0 +1,9 @@
+#!/bin/bash
+# SP=checkpoints/SmolLM2-135M-topk-binary-s=2-all-ft
+# /mnt/ssd-1/lucia/sparsify/checkpoints/SmolLM2-135M-topk-binary-s=2
+SP=$1
+uv run python -m sparsify.evaluate \
+--base_model HuggingFaceTB/SmolLM2-135M --dataset=EleutherAI/SmolLM2-135M-20B \
+--sparse_model $SP \
+--batch_size=4 \
+--hookpoints layers.0.mlp layers.9.mlp layers.18.mlp layers.27.mlp \

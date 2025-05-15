@@ -14,10 +14,7 @@ from torch import Tensor, nn
 
 from .config import SparseCoderConfig
 from .fused_encoder import EncoderOutput, binary_fused_encoder, fused_encoder
-from .utils import decoder_impl, eager_decode
-
-# Thresholded
-# STE
+from .utils import eager_decode
 
 
 class DenseBinaryEncode(torch.autograd.Function):
@@ -68,13 +65,6 @@ class DenseBinaryEncode(torch.autograd.Function):
 
         # Gradient of the loss wrt the threshold
         grad_log_threshold = -grad_thresholded_preacts.sum(0)
-
-        # print("encode backwards")
-        # print("input grad", grad_input)
-        # print("W_enc grad", grad_W_enc)
-        # print("b_enc grad", grad_b_enc)
-        # print("thresholds", threshold)
-        # print("log threshold grad", grad_log_threshold)
 
         return grad_input, grad_W_enc, grad_b_enc, grad_log_threshold
 
@@ -214,8 +204,6 @@ class SparseCoder(nn.Module):
         cfg: SparseCoderConfig,
         device: str | torch.device = "cpu",
         dtype: torch.dtype | None = None,
-        *,
-        decoder: bool = True,
     ):
         super().__init__()
         self.cfg = cfg
@@ -230,20 +218,24 @@ class SparseCoder(nn.Module):
 
         self.encoder.bias.data.zero_()
 
-        if decoder:
-            # Transcoder initialization: use zeros
-            if cfg.transcode:
-                self.W_dec = nn.Parameter(torch.zeros_like(self.encoder.weight.data))
+        if self.cfg.tied_decoder:
+            assert (
+                not self.cfg.transcode
+            ), "Tied decoder and transcode cannot both be true."
+            self.W_dec = self.encoder.weight
 
-            # Sparse autoencoder initialization: use the transpose of encoder weights
-            else:
-                self.W_dec = nn.Parameter(self.encoder.weight.data.clone())
-                if self.cfg.normalize_decoder:
-                    self.set_decoder_norm_to_unit_norm()
+        # Transcoder initialization: use zeros
+        elif cfg.transcode:
+            self.W_dec = nn.Parameter(torch.zeros_like(self.encoder.weight.data))
+
+        # Sparse autoencoder initialization: use the transpose of encoder weights
         else:
-            self.W_dec = None
+            self.W_dec = nn.Parameter(self.encoder.weight.data.clone())
+            if self.cfg.normalize_decoder:
+                self.set_decoder_norm_to_unit_norm()
 
         self.b_dec = nn.Parameter(torch.zeros(d_in, dtype=dtype, device=device))
+
         self.W_skip = (
             nn.Parameter(torch.zeros(d_in, d_in, device=device, dtype=dtype))
             if cfg.skip_connection
@@ -257,14 +249,18 @@ class SparseCoder(nn.Module):
                 ).log()
             )
 
+        group_sizes = [
+            self.num_latents // self.cfg.matryoshka_groups
+        ] * self.cfg.matryoshka_groups
+        group_sizes[-1] = self.num_latents - sum(group_sizes[:-1])
+        self.group_indices = [0] + list(torch.cumsum(torch.tensor(group_sizes), dim=0))
+
     @staticmethod
     def load_many(
         name: str,
         local: bool = False,
         layers: list[str] | None = None,
         device: str | torch.device = "cpu",
-        *,
-        decoder: bool = True,
         pattern: str | None = None,
     ) -> dict[str, "SparseCoder"]:
         """Load sparse coders for multiple hookpoints on a single model and dataset."""
@@ -276,9 +272,7 @@ class SparseCoder(nn.Module):
 
         if layers is not None:
             return {
-                layer: SparseCoder.load_from_disk(
-                    repo_path / layer, device=device, decoder=decoder
-                )
+                layer: SparseCoder.load_from_disk(repo_path / layer, device=device)
                 for layer in natsorted(layers)
             }
         files = [
@@ -287,7 +281,7 @@ class SparseCoder(nn.Module):
             if f.is_dir() and (pattern is None or fnmatch(f.name, pattern))
         ]
         return {
-            f.name: SparseCoder.load_from_disk(f, device=device, decoder=decoder)
+            f.name: SparseCoder.load_from_disk(f, device=device)
             for f in natsorted(files, key=lambda f: f.name)
         }
 
@@ -296,8 +290,6 @@ class SparseCoder(nn.Module):
         name: str,
         hookpoint: str | None = None,
         device: str | torch.device = "cpu",
-        *,
-        decoder: bool = True,
     ) -> "SparseCoder":
         # Download from the HuggingFace Hub
         repo_path = Path(
@@ -313,14 +305,11 @@ class SparseCoder(nn.Module):
         elif not repo_path.joinpath("cfg.json").exists():
             raise FileNotFoundError("No config file found; try specifying a layer.")
 
-        return SparseCoder.load_from_disk(repo_path, device=device, decoder=decoder)
+        return SparseCoder.load_from_disk(repo_path, device=device)
 
     @staticmethod
     def load_from_disk(
-        path: Path | str,
-        device: str | torch.device = "cpu",
-        *,
-        decoder: bool = True,
+        path: Path | str, device: str | torch.device = "cpu"
     ) -> "SparseCoder":
         path = Path(path)
 
@@ -329,13 +318,13 @@ class SparseCoder(nn.Module):
             d_in = cfg_dict.pop("d_in")
             cfg = SparseCoderConfig.from_dict(cfg_dict, drop_extra_fields=True)
 
-        sae = SparseCoder(d_in, cfg, device=device, decoder=decoder)
+        sae = SparseCoder(d_in, cfg, device=device)
         load_model(
             model=sae,
             filename=str(path / "sae.safetensors"),
             device=str(device),
             # TODO: Maybe be more fine-grained about this in the future?
-            strict=decoder,
+            strict=True,
         )
         return sae
 
@@ -380,6 +369,8 @@ class SparseCoder(nn.Module):
                 self.encoder.bias,
                 self.cfg.k,
                 self.log_threshold.exp(),
+                self.cfg.ste,
+                self.cfg.ste_temperature,
             )
         elif self.cfg.activation == "gumbel_binary":
             return gumbel_encoder(x, self.encoder.weight, self.encoder.bias, self.cfg.k)
@@ -417,8 +408,6 @@ class SparseCoder(nn.Module):
             ).all()
         ):
             return top_acts @ self.W_dec + self.b_dec
-        y = decoder_impl(top_indices, top_acts.to(self.dtype), self.W_dec.mT)
-        return y + self.b_dec
 
     # Wrapping the forward in bf16 autocast improves performance by almost 2x
     @torch.autocast(
@@ -439,15 +428,6 @@ class SparseCoder(nn.Module):
             )
         else:
             if self.cfg.activation == "binary":
-                # sae_out = binary_topk_encode_decode(
-                #   x, self.encoder.weight, self.encoder.bias,
-                #   self.W_dec.mT, self.b_dec, self.cfg.k)
-                # top_acts, top_indices, pre_acts = None, None, None
-                # top_acts = dense_binary_encode(
-                # x, self.encoder.weight, self.encoder.bias)
-                # top_indices = None
-                # pre_acts = None
-
                 top_acts = dense_binary_encode(
                     x, self.encoder.weight, self.encoder.bias, self.log_threshold
                 )
@@ -468,6 +448,7 @@ class SparseCoder(nn.Module):
                 # sae_out = top_acts @ self.W_dec + self.b_dec
             else:
                 sae_out = self.decode(top_acts, top_indices)
+
         if self.W_skip is not None:
             sae_out += x.to(self.dtype) @ self.W_skip.mT
 
@@ -476,6 +457,10 @@ class SparseCoder(nn.Module):
 
         # Second decoder pass for AuxK loss
         if dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
+            assert (
+                not self.cfg.activation == "binary"
+            ), "AuxK loss is not supported for binary activation."
+
             # Heuristic from Appendix B.1 in the paper
             k_aux = y.shape[-1] // 2
 
@@ -497,12 +482,41 @@ class SparseCoder(nn.Module):
         else:
             auxk_loss = sae_out.new_tensor(0.0)
 
+        # if self.cfg.matryoshka:
+        #     total_l2_loss = (self.b_dec - y.float()).pow(2).sum()
+        #     l2_losses = []
+
+        #     cumulative_sae_out = self.b_dec
+
+        #     for start_idx, end_idx in zip(
+        #         self.group_indices[:-1], self.group_indices[1:]
+        #     ):
+        #         group_mask = (top_indices >= start_idx) & (top_indices < end_idx)
+        #         filtered_acts = torch.where(
+        #             group_mask, top_acts, torch.zeros_like(top_acts)
+        #         )
+        #         group_out = decoder_impl(
+        #             top_indices, filtered_acts.to(self.dtype), self.W_dec.mT
+        #         )
+        #         cumulative_sae_out = cumulative_sae_out + group_out
+
+        #         current_e = (cumulative_sae_out.float() - y.float()).pow(2).sum()
+
+        #         l2_losses.append(current_e)
+        #         total_l2_loss += current_e
+
+        #     l2_loss = torch.stack(l2_losses).sum() / self.cfg.matryoshka_groups
+        # else:
         l2_loss = e.pow(2).sum()
+
         fvu = l2_loss / total_variance
+        dummy_loss = sum(p.sum() * 0.0 for p in self.parameters())
+        fvu = fvu + dummy_loss
 
         if self.cfg.multi_topk:
             assert (
                 not self.cfg.activation == "topk_binary"
+                and not self.cfg.activation == "binary"
             ), "Multi-TopK is not supported for binary activation."
             top_acts, top_indices = pre_acts.topk(4 * self.cfg.k, sorted=False)
             sae_out = self.decode(top_acts, top_indices)
@@ -522,15 +536,12 @@ class SparseCoder(nn.Module):
 
     @torch.no_grad()
     def set_decoder_norm_to_unit_norm(self):
-        assert self.W_dec is not None, "Decoder weight was not initialized."
-
         eps = torch.finfo(self.W_dec.dtype).eps
         norm = torch.norm(self.W_dec.data, dim=1, keepdim=True)
         self.W_dec.data /= norm + eps
 
     @torch.no_grad()
     def remove_gradient_parallel_to_decoder_directions(self):
-        assert self.W_dec is not None, "Decoder weight was not initialized."
         assert self.W_dec.grad is not None  # keep pyright happy
 
         parallel_component = einops.einsum(

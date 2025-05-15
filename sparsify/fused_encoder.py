@@ -33,6 +33,7 @@ class BinaryFusedEncoder(torch.autograd.Function):
         k: int,
         threshold: Tensor,
         ste_activation: Literal["sigmoid", "rectangle"] = "sigmoid",
+        ste_temperature: float = 1.0,
     ):
         """
         input:  (N, D)
@@ -40,7 +41,7 @@ class BinaryFusedEncoder(torch.autograd.Function):
         bias:   (M,)
         k:      int (number of top elements to select along dim=1)
         """
-        preacts = F.relu(F.linear(input, weight, bias))
+        preacts = F.linear(input, weight, bias)  #  F.relu(
         # Get top-k values and indices for each row
 
         topk_values, indices = torch.topk(preacts - threshold, k, dim=1, sorted=False)
@@ -52,6 +53,7 @@ class BinaryFusedEncoder(torch.autograd.Function):
         )
         ctx.k = k
         ctx.ste_activation = ste_activation
+        ctx.ste_temperature = ste_temperature
         return values, indices, preacts
 
     @staticmethod
@@ -60,26 +62,42 @@ class BinaryFusedEncoder(torch.autograd.Function):
     )
     def backward(ctx, grad_values, grad_indices, grad_preacts):  # bandwidth: float = 2.
         input, weight, bias, values, indices, threshold, topk_values = ctx.saved_tensors
+        ste_temperature = ctx.ste_temperature
         grad_input = grad_weight = grad_bias = None
 
+        grad_threshold = torch.zeros_like(threshold)
         if ctx.ste_activation == "sigmoid":
-            ste_vals = torch.sigmoid(topk_values)
-            sigmoid_grad_wrt_vals = ste_vals * (1 - ste_vals)
+            ste_grad_wrt_vals = torch.sigmoid(topk_values / ste_temperature)
+            sigmoid_grad_wrt_vals = ste_grad_wrt_vals * (1 - ste_grad_wrt_vals)
 
             # dL/dvals = dL/dsigmoid * dsigmoid/dvals
             grad_values = grad_values * sigmoid_grad_wrt_vals
 
             # dL/dthreshold = dL/dvals * dvals/dthreshold
-            grad_threshold = torch.zeros_like(threshold)
             grad_threshold.index_add_(0, indices.flatten(), -grad_values.flatten())
         elif ctx.ste_activation == "rectangle":
-            ste_vals = rectangle(topk_values)
-            rect_grad_wrt_vals = ste_vals
-            grad_values = grad_values * rect_grad_wrt_vals
+            # This is essentially always true for the first condition in rectangle
+            ste_grad_wrt_vals = rectangle(topk_values / ste_temperature)
+            grad_values = grad_values * ste_grad_wrt_vals
 
-            grad_threshold = (
-                -(threshold / 2.0) * rectangle((topk_values) / 2.0) * grad_values
+            grad_threshold_vals = (
+                -(threshold[indices].flatten() / ste_temperature)
+                * grad_values.flatten()
             )
+            grad_threshold.index_add_(0, indices.flatten(), grad_threshold_vals)
+        elif ctx.ste_activation == "re":
+            o = ste_temperature
+            ste_grad_wrt_vals = 1 / o * torch.abs(topk_values).pow((1 - o) / o)
+            grad_values = grad_values * ste_grad_wrt_vals
+            grad_threshold_vals = (
+                -(threshold[indices].flatten() / o) * grad_values.flatten()
+            )
+            grad_threshold.index_add_(0, indices.flatten(), grad_threshold_vals)
+        elif ctx.ste_activation == "identity":
+            grad_threshold_vals = (
+                -grad_values * threshold[indices]
+            ).flatten() / ste_temperature
+            grad_threshold.index_add_(0, indices.flatten(), grad_threshold_vals)
 
         # --- Grad w.r.t. input ---
         if ctx.needs_input_grad[0]:
@@ -111,18 +129,134 @@ class BinaryFusedEncoder(torch.autograd.Function):
             )
 
         # The k parameter is an int, so return None for its gradient.
-        return grad_input, grad_weight, grad_bias, None, grad_threshold
+        return grad_input, grad_weight, grad_bias, None, grad_threshold, None, None
 
 
-class FusedEncoder(torch.autograd.Function):
+class BinaryGroupMaxFusedEncoder(torch.autograd.Function):
     @staticmethod
+    @torch.autocast(
+        "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_bf16_supported()
+    )
     def forward(
         ctx,
         input,
         weight,
         bias,
         k: int,
-        activation: Literal["groupmax", "topk", "topk_binary", "gumbel_binary"],
+        threshold: Tensor,
+        ste_activation: Literal["sigmoid", "rectangle"] = "sigmoid",
+        ste_temperature: float = 1.0,
+    ):
+        """
+        input:  (N, D)
+        weight: (M, D)
+        bias:   (M,)
+        k:      int (number of top elements to select along dim=1)
+        """
+        preacts = F.linear(input, weight, bias)  #  F.relu(
+        # Get top-k values and indices for each row
+
+        # Group max
+        topk_values, indices = (preacts - threshold).unflatten(-1, (k, -1)).max(dim=-1)
+        num_latents = preacts.shape[1]
+        offsets = torch.arange(0, num_latents, num_latents // k, device=preacts.device)
+        indices = offsets + indices
+
+        values = (topk_values > 0).float()
+
+        # Save tensors needed for the backward pass
+        ctx.save_for_backward(
+            input, weight, bias, values, indices, threshold, topk_values
+        )
+        ctx.k = k
+        ctx.ste_activation = ste_activation
+        ctx.ste_temperature = ste_temperature
+        return values, indices, preacts
+
+    @staticmethod
+    @torch.autocast(
+        "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_bf16_supported()
+    )
+    def backward(ctx, grad_values, grad_indices, grad_preacts):  # bandwidth: float = 2.
+        input, weight, bias, values, indices, threshold, topk_values = ctx.saved_tensors
+        ste_temperature = ctx.ste_temperature
+        grad_input = grad_weight = grad_bias = None
+
+        grad_threshold = torch.zeros_like(threshold)
+        if ctx.ste_activation == "sigmoid":
+            ste_grad_wrt_vals = torch.sigmoid(topk_values / ste_temperature)
+            sigmoid_grad_wrt_vals = ste_grad_wrt_vals * (1 - ste_grad_wrt_vals)
+
+            # dL/dvals = dL/dsigmoid * dsigmoid/dvals
+            grad_values = grad_values * sigmoid_grad_wrt_vals
+
+            # dL/dthreshold = dL/dvals * dvals/dthreshold
+            grad_threshold.index_add_(0, indices.flatten(), -grad_values.flatten())
+        elif ctx.ste_activation == "rectangle":
+            # This is essentially always true for the first condition in rectangle
+            ste_grad_wrt_vals = rectangle(topk_values / ste_temperature)
+            grad_values = grad_values * ste_grad_wrt_vals
+
+            grad_threshold_vals = (
+                -(threshold[indices].flatten() / ste_temperature)
+                * grad_values.flatten()
+            )
+            grad_threshold.index_add_(0, indices.flatten(), grad_threshold_vals)
+
+        elif ctx.ste_activation == "re":
+            o = ste_temperature
+            ste_grad_wrt_vals = 1 / o * torch.abs(topk_values).pow((1 - o) / o)
+            grad_values = grad_values * ste_grad_wrt_vals
+            grad_threshold_vals = (
+                -(threshold[indices].flatten() / o) * grad_values.flatten()
+            )
+            grad_threshold.index_add_(0, indices.flatten(), grad_threshold_vals)
+
+        # --- Grad w.r.t. input ---
+        if ctx.needs_input_grad[0]:
+            grad_input = F.embedding_bag(
+                indices,
+                weight,
+                mode="sum",
+                per_sample_weights=grad_values.type_as(weight),
+            )
+
+        # --- Grad w.r.t. weight ---
+        if ctx.needs_input_grad[1]:
+            grad_weight = torch.zeros_like(weight)
+            # Compute contributions from each top-k element:
+            # computed as grad_values * input for each top-k location.
+            contributions = grad_values.unsqueeze(2) * input.unsqueeze(1)
+            _, _, D = contributions.shape
+            # Flatten contributions to shape (N*k, D)
+            contributions = contributions.reshape(-1, D)
+
+            # Accumulate contributions into the correct rows of grad_weight.
+            grad_weight.index_add_(0, indices.flatten(), contributions.type_as(weight))
+
+        # --- Grad w.r.t. bias ---
+        if bias is not None and ctx.needs_input_grad[2]:
+            grad_bias = torch.zeros_like(bias)
+            grad_bias.index_add_(
+                0, indices.flatten(), grad_values.flatten().type_as(bias)
+            )
+
+        # The k parameter is an int, so return None for its gradient.
+        return grad_input, grad_weight, grad_bias, None, grad_threshold, None, None
+
+
+class FusedEncoder(torch.autograd.Function):
+    @staticmethod
+    @torch.autocast(
+        "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_bf16_supported()
+    )
+    def forward(
+        ctx,
+        input,
+        weight,
+        bias,
+        k: int,
+        activation: Literal["groupmax", "topk", "topk_binary"],
     ):
         """
         input:  (N, D)
@@ -134,8 +268,7 @@ class FusedEncoder(torch.autograd.Function):
 
         # Get top-k values and indices for each row
         if activation == "topk":
-            values, indices = torch.topk(preacts, k, dim=1, sorted=False)
-            extra_ctx = ()
+            values, indices = torch.topk(preacts, k, dim=-1, sorted=False)
         elif activation == "groupmax":
             values, indices = preacts.unflatten(-1, (k, -1)).max(dim=-1)
 
@@ -146,20 +279,23 @@ class FusedEncoder(torch.autograd.Function):
                 0, num_latents, num_latents // k, device=preacts.device
             )
             indices = offsets + indices
-            extra_ctx = ()
+            # extra_ctx = ()
         elif activation == "gumbel_binary":
-            generator = torch.Generator(preacts.device)
-
-            extra_ctx = (generator,)
+            # generator = torch.Generator(preacts.device)
+            pass
+            # extra_ctx = (generator,)
         else:
             raise ValueError(f"Unknown activation: {activation}")
 
         # Save tensors needed for the backward pass
-        ctx.save_for_backward(input, weight, bias, values, indices, *extra_ctx)
+        ctx.save_for_backward(input, weight, bias, values, indices)
         ctx.k = k
         ctx.activation = activation
         return values, indices, preacts
 
+    @torch.autocast(
+        "cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_bf16_supported()
+    )
     @staticmethod
     def backward(ctx, grad_values, grad_indices, grad_preacts):
         input, weight, bias, values, indices = ctx.saved_tensors
@@ -216,7 +352,11 @@ def binary_fused_encoder(
     bias,
     k: int,
     threshold: Tensor,
+    ste_activation: Literal["sigmoid", "rectangle"] = "sigmoid",
+    ste_temperature: float = 1.0,
 ) -> EncoderOutput:
     return EncoderOutput(
-        *BinaryFusedEncoder.apply(input, weight, bias, k, threshold)  # type: ignore
+        *BinaryFusedEncoder.apply(
+            input, weight, bias, k, threshold, ste_activation, ste_temperature
+        )  # type: ignore
     )

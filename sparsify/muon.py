@@ -2,6 +2,7 @@
 Adapted from https://github.com/KellerJordan/Muon/blob/master/muon.py
 Modifications by Nora Belrose
 """
+
 import torch
 import torch.distributed as dist
 from torch import Tensor

@@ -102,13 +102,23 @@ class Trainer:
                     )
                     print("Run `pip install bitsandbytes` for less memory usage.")
 
-                pgs = [
-                    dict(
-                        params=sae.parameters(),
-                        lr=cfg.lr or 2e-4 / (sae.num_latents / (2**14)) ** 0.5,
-                    )
-                    for sae in self.saes.values()
-                ]
+                if list(self.saes.values())[0].cfg.activation == "topk_binary":
+                    print("binary", list(self.saes.values())[0].num_latents)
+                    pgs = [
+                        dict(
+                            params=sae.parameters(),
+                            lr=cfg.lr or 3e-3 / (sae.num_latents / (2**15)) ** 0.5,
+                        )
+                        for sae in self.saes.values()
+                    ]
+                else:
+                    pgs = [
+                        dict(
+                            params=sae.parameters(),
+                            lr=cfg.lr or 2e-4 / (sae.num_latents / (2**14)) ** 0.5,
+                        )
+                        for sae in self.saes.values()
+                    ]
                 # For logging purposes
                 lrs = [f"{lr:.2e}" for lr in sorted(set(pg["lr"] for pg in pgs))]
 
@@ -170,17 +180,17 @@ class Trainer:
         }
 
         num_latents = list(self.saes.values())[0].num_latents
+
+        # self.initial_k = self.cfg.sae.k#128
+        # self.final_k = self.cfg.sae.k#576 * 16 # 256
         self.initial_k = min(num_latents, round(list(input_widths.values())[0] * 10))
         self.final_k = self.cfg.sae.k
 
-        if self.cfg.save_best:
-            self.best_loss = (
-                {name: float("inf") for name in self.local_hookpoints()}
-                if self.cfg.loss_fn == "fvu"
-                else float("inf")
-            )
-        else:
-            self.best_loss = None
+        self.best_loss = (
+            {name: float("inf") for name in self.local_hookpoints()}
+            if self.cfg.loss_fn == "fvu"
+            else float("inf")
+        )
 
     def load_state(self, path: str):
         """Load the trainer state from disk."""
@@ -190,18 +200,21 @@ class Trainer:
         train_state = torch.load(
             f"{path}/state.pt", map_location=device, weights_only=True
         )
-        train_state["num_tokens_since_fired"] = {}
+        self.global_step = train_state["global_step"]
 
         for file in glob(f"{path}/rank_*_state.pt"):
-            rank_train_state = torch.load(file, map_location=device, weights_only=True)
-            train_state["num_tokens_since_fired"].update(
-                rank_train_state["num_tokens_since_fired"]
-            )
+            rank_state = torch.load(file, map_location=device, weights_only=True)
 
-        self.global_step = train_state["global_step"]
-        self.num_tokens_since_fired = {
-            k: train_state["num_tokens_since_fired"][k] for k in self.local_hookpoints()
-        }
+            for k in self.local_hookpoints():
+                if k in rank_state["num_tokens_since_fired"]:
+                    self.num_tokens_since_fired[k] = rank_state[
+                        "num_tokens_since_fired"
+                    ][k]
+
+                if not isinstance(rank_state["best_loss"], dict):
+                    self.best_loss = rank_state["best_loss"]
+                elif k in rank_state["best_loss"]:
+                    self.best_loss[k] = rank_state["best_loss"][k]  # type: ignore
 
         print(
             f"\033[92mResuming training at step {self.global_step} from '{path}'\033[0m"
@@ -371,7 +384,7 @@ class Trainer:
 
             # On the first iteration, initialize the encoder and decoder biases
             raw = self.saes[name]
-            if self.global_step == 0:
+            if self.global_step == 0 and not self.cfg.finetune:
                 # Ensure the preactivations are centered at initialization
                 # This is mathematically equivalent to Anthropic's proposal of
                 # subtracting the decoder bias
@@ -454,10 +467,9 @@ class Trainer:
             num_tokens_in_step += N
 
             # Compute clean logits if using KL loss
+            clean_logits = self.model(x).logits if self.cfg.loss_fn == "kl" else None
             clean_probs = (
-                self.model(x).logits.softmax(dim=-1)
-                if self.cfg.loss_fn == "kl"
-                else None
+                clean_logits.softmax(dim=-1) if self.cfg.loss_fn == "kl" else None
             )
 
             # Forward pass on the model to get the next batch of activations
@@ -475,14 +487,18 @@ class Trainer:
                         avg_losses = avg_ce
                     case "kl":
                         dirty_lps = self.model(x).logits.log_softmax(dim=-1)
-                        kl = -torch.sum(clean_probs * dirty_lps, dim=-1).mean()
+                        kl = torch.sum(
+                            clean_probs
+                            * (clean_logits.log_softmax(dim=-1) - dirty_lps),
+                            dim=-1,
+                        ).mean()
                         kl.div(acc_steps).backward()
 
                         avg_kl += float(self.maybe_all_reduce(kl) / denom)
                         avg_losses = avg_kl
                     case "fvu":
                         self.model(x)
-                        avg_losses = avg_fvu
+                        avg_losses = dict(avg_fvu)
                     case other:
                         raise ValueError(f"Unknown loss function '{other}'")
             finally:
@@ -519,6 +535,12 @@ class Trainer:
                     for mask in did_fire.values():
                         mask.zero_()
 
+                if (step + 1) % self.cfg.save_every == 0:
+                    self.save()
+
+                    if self.cfg.save_best:
+                        self.save_best(avg_losses)
+
                 if (
                     self.cfg.log_to_wandb
                     and (step + 1) % self.cfg.wandb_log_frequency == 0
@@ -545,12 +567,6 @@ class Trainer:
                         if self.cfg.sae.multi_topk:
                             info[f"multi_topk_fvu/{name}"] = avg_multi_topk_fvu[name]
 
-                    avg_auxk_loss.clear()
-                    avg_fvu.clear()
-                    avg_multi_topk_fvu.clear()
-                    avg_ce = 0.0
-                    avg_kl = 0.0
-
                     if self.cfg.distribute_modules:
                         outputs = [{} for _ in range(dist.get_world_size())]
                         dist.gather_object(info, outputs if rank_zero else None)
@@ -562,11 +578,11 @@ class Trainer:
                         if wandb is not None:
                             wandb.log(info, step=step)
 
-                if (step + 1) % self.cfg.save_every == 0:
-                    self.save()
-
-                    if self.cfg.save_best:
-                        self.save_best(avg_losses)
+                avg_auxk_loss.clear()
+                avg_fvu.clear()
+                avg_multi_topk_fvu.clear()
+                avg_ce = 0.0
+                avg_kl = 0.0
 
             self.global_step += 1
             pbar.update()
@@ -627,54 +643,18 @@ class Trainer:
         for rank, modules in enumerate(self.module_plan):
             print(f"Rank {rank} modules: {modules}")
 
-    def save_best(self, avg_loss: float | dict[str, float]):
-        """Save individual sparse coders to disk if they have the lowest loss."""
-        base_path = f'{self.cfg.save_dir}/{self.cfg.run_name or "unnamed"}/best'
-        if type(avg_loss) == float:
-            if avg_loss < self.best_loss:  # type: ignore
-                self.best_loss = avg_loss  # type: ignore
-                self.save(base_path)
-        else:
-            for name in self.saes:
-                if avg_loss[name] < self.best_loss[name]:  # type: ignore
-                    self.best_loss[name] = avg_loss[name]  # type: ignore
-                    path = f"{base_path}/{name}"
-                    self.save(path, {name: self.saes[name]})
-
-    def save(self, path: str | None = None, saes: dict[str, SparseCoder] | None = None):
-        """Save the SAEs to disk."""
-        if path is None:
-            path = f'{self.cfg.save_dir}/{self.cfg.run_name or "unnamed"}'
-        if saes is None:
-            saes = self.saes
-
-        rank_zero = not dist.is_initialized() or dist.get_rank() == 0
+    def _checkpoint(self, saes: dict[str, SparseCoder], path: str, rank_zero: bool):
+        """Save SAEs and training state to disk."""
+        print("Saving checkpoint")
 
         for optimizer in self.optimizers:
-            if hasattr(optimizer, "eval"):
-                optimizer.eval()  # type: ignore
+            if isinstance(optimizer, ScheduleFreeWrapper):
+                optimizer.eval()
 
-        if rank_zero or self.cfg.distribute_modules:
-            print("Saving checkpoint")
+        for name, sae in saes.items():
+            assert isinstance(sae, SparseCoder)
 
-            for optimizer in self.optimizers:
-                if isinstance(optimizer, ScheduleFreeWrapper):
-                    optimizer.eval()
-
-            for name, sae in saes.items():
-                assert isinstance(sae, SparseCoder)
-
-                sae.save_to_disk(f"{path}/{name}")
-
-            for optimizer in self.optimizers:
-                if isinstance(optimizer, ScheduleFreeWrapper):
-                    optimizer.train()
-
-            rank = 0 if rank_zero else dist.get_rank()
-            torch.save(
-                {"num_tokens_since_fired": self.num_tokens_since_fired},
-                f"{path}/rank_{rank}_state.pt",
-            )
+            sae.save_to_disk(f"{path}/{name}")
 
         if rank_zero:
             for i, scheduler in enumerate(self.lr_schedulers):
@@ -683,13 +663,59 @@ class Trainer:
             for i, optimizer in enumerate(self.optimizers):
                 torch.save(optimizer.state_dict(), f"{path}/optimizer_{i}.pt")
 
-            torch.save({"global_step": self.global_step}, f"{path}/state.pt")
+            torch.save(
+                {"global_step": self.global_step},
+                f"{path}/state.pt",
+            )
 
             self.cfg.save_json(f"{path}/config.json")
 
         for optimizer in self.optimizers:
-            if hasattr(optimizer, "train"):
-                optimizer.train()  # type: ignore
+            if isinstance(optimizer, ScheduleFreeWrapper):
+                optimizer.train()
+
+        rank = 0 if rank_zero else dist.get_rank()
+        torch.save(
+            {
+                "num_tokens_since_fired": self.num_tokens_since_fired,
+                "best_loss": self.best_loss,
+            },
+            f"{path}/rank_{rank}_state.pt",
+        )
+
+    def save(self):
+        """Save the SAEs and training state to disk."""
+        path = f'{self.cfg.save_dir}/{self.cfg.run_name or "unnamed"}'
+
+        rank_zero = not dist.is_initialized() or dist.get_rank() == 0
+
+        if rank_zero or self.cfg.distribute_modules:
+            self._checkpoint(self.saes, path, rank_zero)
+
+        # Barrier to ensure all ranks have saved before continuing
+        if dist.is_initialized():
+            dist.barrier()
+
+    def save_best(self, avg_loss: float | dict[str, float]):
+        """Save individual sparse coders to disk if they have the lowest loss."""
+        base_path = f'{self.cfg.save_dir}/{self.cfg.run_name or "unnamed"}/best'
+        rank_zero = not dist.is_initialized() or dist.get_rank() == 0
+
+        if isinstance(avg_loss, dict):
+            for name in self.saes:
+                if avg_loss[name] < self.best_loss[name]:  # type: ignore
+                    self.best_loss[name] = avg_loss[name]  # type: ignore
+
+                    if rank_zero or self.cfg.distribute_modules:
+                        self._checkpoint(
+                            {name: self.saes[name]}, f"{base_path}/{name}", rank_zero
+                        )
+        else:
+            if avg_loss < self.best_loss:  # type: ignore
+                self.best_loss = avg_loss  # type: ignore
+
+                if rank_zero or self.cfg.distribute_modules:
+                    self._checkpoint(self.saes, base_path, rank_zero)
 
         # Barrier to ensure all ranks have saved before continuing
         if dist.is_initialized():

@@ -37,6 +37,21 @@ class SparseCoderConfig(Serializable):
     transcode: bool = False
     """Whether we want to predict the output of a module given its input."""
 
+    ste: Literal["sigmoid", "rectangle", "identity", "re"] = "sigmoid"
+    """Straight-through estimator to use."""
+
+    ste_temperature: float = 2.0
+    """Temperature for the STE."""
+
+    tied_decoder: bool = False
+    """Tie the decoder weights to the encoder weights."""
+
+    matryoshka: bool = False
+    """Use Matryoshka sparse coders."""
+
+    matryoshka_groups: int = 5
+    """Number of activation groups to use for the Matryoshka loss."""
+
 
 # Support different naming conventions for the same configuration
 SaeConfig = SparseCoderConfig
@@ -108,6 +123,9 @@ class TrainConfig(Serializable):
 
     save_best: bool = False
     """Save the best checkpoint found for each hookpoint."""
+
+    finetune: str | None = None
+    """Finetune the sparse coders from a pretrained checkpoint."""
 
     log_to_wandb: bool = True
     run_name: str | None = None
