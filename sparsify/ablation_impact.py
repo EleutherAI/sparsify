@@ -1,199 +1,60 @@
 import os
-import re
 from concurrent.futures import ProcessPoolExecutor
-from functools import partial
 from pathlib import Path
 
+import plotly.graph_objects as go
+import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 import torch
 import torch.multiprocessing as mp
-import torch.nn.functional as F
-from datasets import DownloadConfig, load_dataset
+from datasets import load_dataset
 from torch import Tensor
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from tqdm import tqdm
 
 from sparsify import SparseCoder
 from sparsify.data import chunk_and_tokenize
-from sparsify.sparsify_hooks import ablate_with_mse, collect_activations, edit_with_mse
+from sparsify.sparsify_hooks import ablate_with_mse
 
 mp.set_start_method("spawn", force=True)
 
-
-def extract_k(run_name):
-    """Extract the k from the run name."""
-    k_str = [item for item in run_name.split("-") if "k=" in item]
-    if len(k_str) == 0:
-        return 32
-
-    return int(k_str[0].split("=")[1])
-
-
-def extract_optimizer(run_name):
-    """Extract the optimizer type from the run name."""
-    if "adam" in run_name.lower():
-        return "adam"
-    elif "signum" in run_name.lower():
-        return "signum"
-    else:
-        return "unknown"
-
-
-def extract_learning_rate(run_name):
-    """Extract the learning rate from the run name."""
-    lr_patterns = ["1e-3", "1e-4", "5e-3", "5e-4"]
-
-    # Check for specific pattern like "adam-5e-4" or "signum-1e-3"
-    for pattern in ["adam-", "signum-"]:
-        for lr in lr_patterns:
-            if f"{pattern}{lr}" in run_name:
-                return lr
-
-    # Check for patterns like "(adam 5e-4)" or "(1e-3)"
-    parenthesis_match = re.search(r"\((.*?)\)", run_name)
-    if parenthesis_match:
-        content = parenthesis_match.group(1)
-        for lr in lr_patterns:
-            if lr in content:
-                return lr
-
-    # Just check for the lr pattern anywhere in the name
-    for lr in lr_patterns:
-        if lr in run_name:
-            return lr
-
-    return "unknown"
-
-
-def chunked_torch_variance(data_loader, device):
-    # Initialize running values
-    n_total = 0
-    mean_total = 0
-    M2_total = 0
-
-    # Process data in batches
-    for batch in data_loader:
-        acts = batch["activations"].to(device).flatten(0, 1)
-
-        n_acts = acts.shape[0]
-        mean_acts = torch.mean(acts, dim=0)
-        var_acts = torch.var(acts, dim=0, unbiased=True)
-
-        # Update combined statistics using Welford's online algorithm
-        delta = mean_acts - mean_total
-        mean_total = (n_total * mean_total + n_acts * mean_acts) / (n_total + n_acts)
-        M2_total = (
-            M2_total
-            + n_acts * var_acts
-            + (delta**2) * n_total * n_acts / (n_total + n_acts)
+def import_plotly():
+    try:
+        import plotly.express as px
+        import plotly.io as pio
+    except ImportError:
+        raise ImportError(
+            "Plotly is not installed.\n"
+            "Please install it using `pip install plotly`, "
+            "or install the `[visualize]` extra."
         )
-        n_total += n_acts
+    pio.kaleido.scope.mathjax = None  # https://github.com/plotly/plotly.py/issues/3469
+    return px
 
-    variance = M2_total / (n_total - 1)
-    return variance.cpu()
+def make_equal_fire_bins(df, n_bins=100):
+    df = df.sort_values('f1_score', ascending=False).reset_index(drop=True)
+    edges = np.linspace(0, df.firing_count.sum(), n_bins + 1)
+    df['bin'] = np.searchsorted(edges, df.firing_count.cumsum(), side='right') - 1
 
-
-def get_acts(batch, model, hookpoint, device, input_acts=True):
-    # input_acts is a boolean that indicates whether the activations are input or output
-
-    with collect_activations(
-        model,
-        hookpoints=[hookpoint],
-        input_acts=input_acts,
-    ) as activations:
-        model(batch["input_ids"].to(device))
-
-    return {
-        "input_ids": batch["input_ids"].cpu(),
-        "activations": activations[hookpoint].cpu(),
-    }
+    return df
 
 
 @torch.inference_mode()
-def process_hookpoint_variance(args):
-    hookpoint, gpu_id, batch_size, model_name, dataset, input = args
-    device = f"cuda:{gpu_id}"
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    dataset = chunk_and_tokenize(
-        load_dataset(
-            dataset,
-            split="train",
-            download_config=DownloadConfig(disable_tqdm=True),
-        ),  # type: ignore
-        tokenizer,
-        max_seq_len=1024,
-    ).select(range(4096))
-
-    model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
-
-    return hookpoint, chunked_torch_variance(
-        DataLoader(
-            dataset.map(
-                partial(
-                    get_acts,
-                    input_acts=input,
-                    model=model,
-                    hookpoint=f"model.{hookpoint}",
-                    device=device,
-                ),
-                batched=True,
-                batch_size=batch_size,
-            ),
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=24,
-        ),
-        device=device,
-    )
-
-
-@torch.inference_mode()
-def populate_variances(
-    model_name: str,
-    cache_dir: str,
-    hookpoints: list[str],
-    dataset: str,
-    batch_size: int,
-):
-    num_gpus = min(len(hookpoints), torch.cuda.device_count())
-
-    args_list = [
-        (hookpoint, i, batch_size, model_name, dataset, False)
-        for i, hookpoint in enumerate(hookpoints)
-    ]
-
-    ctx = mp.get_context("spawn")
-    output_variances = {}
-
-    with ProcessPoolExecutor(max_workers=num_gpus, mp_context=ctx) as executor:
-        for hookpoint, variance in executor.map(process_hookpoint_variance, args_list):
-            output_variances[hookpoint] = variance
-    # Save variance to cache
-    return pd.DataFrame(
-        {
-            "output_variance": [
-                output_variances[hookpoint].mean().item() for hookpoint in hookpoints
-            ],
-            "model": [model_name] * len(hookpoints),
-            "hookpoint": hookpoints,
-        }
-    )
-
-
-@torch.inference_mode()
-def process_hookpoint_losses(args):
+def get_ablation_metrics(args):
     (
         hookpoint,
         gpu_id,
         batch_size,
         model_name,
         sparse_path,
-        variance,
         dataset,
         interpretability_df,
+        n_seqs,
+        num_bins
     ) = args
+
 
     torch.cuda.set_device(gpu_id)
     device = f"cuda:{gpu_id}"
@@ -203,7 +64,7 @@ def process_hookpoint_losses(args):
         load_dataset(dataset, split="train"),  # type: ignore
         tokenizer,
         max_seq_len=1024,
-    ).select(range(4096))
+    ).select(range(n_seqs))
     del tokenizer
 
     model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
@@ -219,121 +80,187 @@ def process_hookpoint_losses(args):
     sparse_model.eval()
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    
+    # bins = True
+    bin_data = []
+    # if bins:
+    
 
-    sparse_losses = []
-    sparse_accuracies = []
-    ablation_losses = []
-    ablation_accuracies = []
-    fvus = []
+    interp_df = make_equal_fire_bins(interpretability_df, num_bins)
 
-    for batch in dataloader:
-        tokens = batch["input_ids"].to(device)
+    print("bin with highest f1 score", interp_df[interp_df.bin == 0].f1_score.mean())
+    print("bin with lowest f1 score", interp_df[interp_df.bin == 19].f1_score.mean())
 
-        with edit_with_mse(
-            model,
-            hookpoints=[f"model.{hookpoint}"],
-            sparse_models={f"model.{hookpoint}": sparse_model},
-        ) as mses:
-            output = model(tokens.long())
+    # original_outlier_bins = [0, 1]
+    # interp_df["is_outlier"] = interp_df["bin"].isin(original_outlier_bins)
+    # outlier = interp_df.loc[interp_df.is_outlier]
+    # rest    = interp_df.loc[~interp_df.is_outlier]
 
-        loss = F.cross_entropy(
-            output.logits[:, :-1].flatten(0, 1), tokens[:, 1:].flatten()
-        )
-        sparse_losses.append(loss.item())
+    
+    # n_new_outlier_bins = 15
+    # outlier = make_equal_fire_bins(outlier.drop(columns="bin"), n_new_outlier_bins)          # ensure no collision
+    # outlier["is_outlier"] = True                  
+    # rest["bin"] += (n_new_outlier_bins - len(original_outlier_bins))
 
-        accuracy = (
-            (output.logits[:, :-1].argmax(dim=-1) == tokens[:, 1:]).float().mean()
-        )
-        sparse_accuracies.append(accuracy.item())
+    # interp_df = pd.concat([outlier, rest]).reset_index(drop=True)
 
-        fvus.append((mses[f"model.{hookpoint}"] / variance).cpu())
+    print("bins: ", interp_df.bin.unique())
 
-        if not interpretability_df.empty:
-            for i in range(len(interpretability_df)):
-                with ablate_with_mse(
-                    model,
-                    hookpoints=[f"model.{hookpoint}"],
-                    sparse_models={f"model.{hookpoint}": sparse_model},
-                    ablate_features={
-                        f"model.{hookpoint}": interpretability_df[
-                            "latent_idx"
-                        ].tolist()[i : i + 1]
-                    },
-                ) as mses:
-                    output = model(tokens.long())
+    binned_idxs = []
+    bin_mean_autointerp_scores = []
+    for bin in interp_df.bin.unique():
+        binned_idxs.append(interp_df[interp_df.bin == bin].index.tolist())
+        bin_mean_autointerp_scores.append(np.average(interp_df[interp_df.bin == bin].f1_score, weights=interp_df[interp_df.bin == bin].firing_count))
+    
+    # binned_idxs = [list(idxs) for _, idxs in interp_df.groupby("bin").groups.items()]
+    # bin_mean_autointerp_scores = (
+    #     interp_df.groupby("bin")
+    #             .apply(lambda g: np.average(g.f1_score, weights=g.firing_count))
+    #             .tolist()
+    # )
+    # print(len(binned_idxs), "bins")
 
-                    loss = F.cross_entropy(
-                        output.logits[:, :-1].flatten(0, 1), tokens[:, 1:].flatten()
-                    )
-                    ablation_losses.append(loss.item())
+    # for i in range(len(binned_idxs)):
+    #     bin_data.append({
+    #         "bin_idx": i,
+    #         "autointerp_score": np.average(interp_df.iloc[binned_idxs[i]]["f1_score"], weights=interp_df.iloc[binned_idxs[i]]["firing_count"]),
+    #         "bin_idxs": binned_idxs[i]
+    #     })
 
-                    accuracy = (
-                        (output.logits[:, :-1].argmax(dim=-1) == tokens[:, 1:])
-                        .float()
-                        .mean()
-                    )
-                    ablation_accuracies.append(accuracy.item())
+    # else:
+    #     interp_idxs = interpretability_df[interpretability_df["f1_score"] > 0.75].index.tolist()
+    #     uninterp_idxs = interpretability_df[interpretability_df["f1_score"] <= 0.75].index.tolist()
+    #     binned_idxs = [interp_idxs, uninterp_idxs]
+    #     # Select relevant rows
+    #     bin_mean_autointerp_scores = [interpretability_df.iloc[interp_idxs]["f1_score"].mean(), interpretability_df.iloc[uninterp_idxs]["f1_score"].mean()]
 
-    data = {
-        "hookpoint": hookpoint,
-        "feature_idx": interpretability_df["latent_idx"].tolist(),
-        "autointerp_score": interpretability_df["accuracy"].tolist(),
-        "ablation_loss": np.mean(ablation_losses),
-        "ablation_acc": np.mean(ablation_accuracies),
+
+    print(len(binned_idxs))
+    print(len(binned_idxs[0]))
+    print(len(binned_idxs[5]))
+    print(len(binned_idxs[10]))
+    print(len(binned_idxs[15]))
+    # print(len(binned_idxs[20]))
+    # print(len(binned_idxs[21]))
+    # print(len(binned_idxs[22]))
+    # print(len(binned_idxs[23]))
+
+
+    feature_data = {
+        i: {
+            "loss": [],
+            "acc": [],
+            "fvu": [],
+            "original_loss": [],
+            "original_acc": [],
+        }
+        for i in range(len(binned_idxs))
     }
-    return data
 
+     # Scale by outlier bin
+    # per_bin = (interp_df.groupby("bin")
+    #     .agg(total_fire=("firing_count", "sum"),
+    #         is_outlier=("is_outlier", "any"))
+    #     .reset_index())
 
-@torch.inference_mode()
-def process_baseline_losses(args):
-    gpu_id, batch_size, model_name, dataset = args
+    # mean_fire_non_out = per_bin.loc[~per_bin.is_outlier, "total_fire"].mean()
+    # per_bin["scale"]  = np.where(per_bin.is_outlier,
+    #     n_new_outlier_bins / len(original_outlier_bins),
+    #     1.0
+    # )
 
-    torch.cuda.set_device(gpu_id)
-    device = f"cuda:{gpu_id}"
+    # scale_map      = per_bin.set_index("bin")["scale"].to_dict()
+    # outlier_map    = per_bin.set_index("bin")["is_outlier"].to_dict()
+    # bin_fire_total = per_bin.set_index("bin")["total_fire"].to_dict()
+    # print(list(scale_map.keys()))
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    dataset = chunk_and_tokenize(
-        load_dataset(dataset, split="train"),  # type: ignore
-        tokenizer,
-        max_seq_len=1024,
-    ).select(range(4096))
-    del tokenizer
-
-    model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
-
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-
-    losses = []
-    accuracies = []
-
-    for batch in dataloader:
+    for batch in tqdm(dataloader):
         tokens = batch["input_ids"].to(device)
-        output = model(tokens.long())
 
-        loss = F.cross_entropy(
-            output.logits[:, :-1].flatten(0, 1), tokens[:, 1:].flatten()
+        original_loss = F.cross_entropy(
+            model(tokens.long()).logits[:, :-1].flatten(0, 1), tokens[:, 1:].flatten()
         )
-        losses.append(loss.item())
-
-        accuracy = (
-            (output.logits[:, :-1].argmax(dim=-1) == tokens[:, 1:]).float().mean()
+        original_acc = (
+            (model(tokens.long()).logits[:, :-1].argmax(dim=-1) == tokens[:, 1:])
+            .float()
+            .mean()
         )
-        accuracies.append(accuracy.item())
+        for i in range(len(binned_idxs)):
+            feature_data[i]["original_loss"].append(original_loss.item())
+            feature_data[i]["original_acc"].append(original_acc.item())
 
-    return np.mean(losses), np.mean(accuracies)
+        for i in range(len(binned_idxs)):
+            with ablate_with_mse(
+                model,
+                hookpoints=[f"model.{hookpoint}"],
+                sparse_models={f"model.{hookpoint}": sparse_model},
+                ablate_features={
+                    f"model.{hookpoint}": binned_idxs[i]
+                },
+            ) as mses:
+                
+                output = model(tokens.long())
+
+                loss = F.cross_entropy(
+                    output.logits[:, :-1].flatten(0, 1), tokens[:, 1:].flatten()
+                )
+                feature_data[i]["loss"].append(loss.item())
+
+                accuracy = (
+                    (output.logits[:, :-1].argmax(dim=-1) == tokens[:, 1:])
+                    .float()
+                    .mean()
+                )
+                feature_data[i]["acc"].append(accuracy.item())
+
+                feature_data[i]["fvu"].append(mses[f"model.{hookpoint}"])
+
+   
+
+    data = []
+    for bin_idx, autointerp_score in zip(range(len(binned_idxs)), bin_mean_autointerp_scores):
+        # raw_inc = np.mean(feature_data[bin_idx]["loss"]) - np.mean(feature_data[bin_idx]["original_loss"])
+        # scaled  = raw_inc * scale_map[bin_idx]
+
+        # orig = np.mean(feature_data[bin_idx]["original_loss"])
+        # raw_inc  = np.mean(feature_data[bin_idx]["loss"]) - orig
+        # raw_rat  = raw_inc / orig                       # loss increase / original loss
+        # scaled   = raw_inc * scale_map[bin_idx]
+        # scaled_r = raw_rat * scale_map[bin_idx]
+
+        data.append({
+            "hookpoint": hookpoint,
+            "bin_idx": bin_idx,
+            # "feature_idx": feature_idx,
+            "autointerp_score": autointerp_score,
+            "ablation_loss": np.mean(feature_data[bin_idx]["loss"]),
+            "ablation_acc": np.mean(feature_data[bin_idx]["acc"]),
+            "ablation_fvu": np.mean(feature_data[bin_idx]["fvu"]),
+            "original_loss": np.mean(feature_data[bin_idx]["original_loss"]),
+            "original_acc": np.mean(feature_data[bin_idx]["original_acc"]),
+            "loss_increase": np.mean(feature_data[bin_idx]["loss"]) - np.mean(feature_data[bin_idx]["original_loss"]),
+            "acc_increase": np.mean(feature_data[bin_idx]["acc"]) - np.mean(feature_data[bin_idx]["original_acc"]),
+            # "scaled_loss_increase": scaled,
+            # "scaled_loss_increase_ratio": scaled_r,
+            # "bin_fire_total": bin_fire_total[bin_idx],
+        })
+
+
+    return pd.DataFrame(data)
 
 
 @torch.inference_mode()
-def populate_ablation_metrics(
+def get_ablation_df(
     model_name: str,
     sparse_path: str,
-    loss_df: pd.DataFrame,
+    hookpoints: list[str],
     dataset: str,
     batch_size: int,
-    ablate_scores_path: str,
+    interpretability_dfs: dict[str, pd.DataFrame],
+    n_seqs: int,
+    num_bins: int
 ):
-    results = {}
-    hookpoints = loss_df["hookpoint"].tolist()
+    results = []
     num_gpus = torch.cuda.device_count()
 
     ctx = mp.get_context("spawn")
@@ -344,111 +271,39 @@ def populate_ablation_metrics(
             batch_size,
             model_name,
             sparse_path,
-            loss_df[loss_df["hookpoint"] == hookpoint]["output_variance"].values[0],
             dataset,
-            (
-                get_ablation_indices(Path(ablate_scores_path), [hookpoint], 1000)
-                if ablate_scores_path is not None
-                else pd.DataFrame([])
-            ),
+            interpretability_dfs[hookpoint],
+            n_seqs,
+            num_bins
         )
         for i, hookpoint in enumerate(hookpoints)
     ]
 
     with ProcessPoolExecutor(max_workers=num_gpus, mp_context=ctx) as executor:
-        for data in executor.map(process_hookpoint_losses, args_list):
-            # data contains auto-interpretability scores and ablation effects
-            # for n features
-            # we need to plot the scatter plot of the auto-interpretability scores
-            # vs the ablation effects
-            # and save the raw data to a csv file
-            results[data["hookpoint"]].update(data)
+        for df in executor.map(get_ablation_metrics, args_list):
+            results.append(df)
 
-    # save the raw data to a csv file
-    pd.DataFrame(results).to_csv(
-        f"{loss_df.iloc[0]['sparse_model_name']}_ablation_raw_data.csv", index=False
-    )
-
-    # plot the scatter plot of the auto-interpretability scores vs the ablation effects
-    # using go.Scatter
-
-    import plotly.graph_objects as go
-
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=results["autointerp_scores"], y=results["ablation_loss"], mode="markers"
-        )
-    )
-    fig.write_image(
-        f"{loss_df.iloc[0]['sparse_model_name']}_ablation_scatter.pdf", format="pdf"
-    )
-    exit()
-
-    loss_df["ablation_loss"] = [results[hp]["ablation_loss"] for hp in hookpoints]
-    loss_df["random_ablation_loss"] = [
-        results[hp]["random_ablation_loss"] for hp in hookpoints
-    ]
-    loss_df["ablation_acc"] = [results[hp]["ablation_acc"] for hp in hookpoints]
-
-    loss_df["ablation_loss_increase"] = (
-        loss_df["ablation_loss"] - loss_df["baseline_loss"]
-    )
-    loss_df["ablation_acc_decrease"] = loss_df["baseline_acc"] - loss_df["ablation_acc"]
-
-    return loss_df
-
-    # return pd.DataFrame(
-    #     {
-    #         "uninterpretable_ablation_loss_increase": [
-    #             results[hp]["uninterpretable_ablation_loss"]
-    #             - results[hp]["baseline_loss"]
-    #             for hp in hookpoints
-    #         ],
-    #         "random_ablation_loss_increase": [
-    #             results[hp]["random_ablation_loss"] - results[hp]["baseline_loss"]
-    #             for hp in hookpoints
-    #         ],
-    #         "uninterpretable_ablation_acc_decrease": [
-    #             results[hp]["baseline_acc"]
-    #             - results[hp]["uninterpretable_ablation_acc"]
-    #             for hp in hookpoints
-    #         ],
-    #         "random_ablation_acc_decrease": [
-    #             results[hp]["baseline_acc"] - results[hp]["random_ablation_acc"]
-    #             for hp in hookpoints
-    #         ],
-    #     }
-    # )
+    return pd.concat(results)
 
 
-def get_ablation_indices(
-    scores_path: Path, target_modules: list[str], num_samples: int
+
+def get_autointerp_df(
+    scores_path: Path, target_modules: list[str]
 ) -> pd.DataFrame:
-    from delphi.log.result_analysis import build_scores_df
+    df_path = f"images/uninterpretable_indices_{str(scores_path).replace('/', '-')}.csv"
 
     log_path = scores_path.parent / "log" / "hookpoint_firing_counts.pt"
     hookpoint_firing_counts: dict[str, Tensor] = torch.load(log_path, weights_only=True)
-    df = build_scores_df(scores_path, target_modules, hookpoint_firing_counts)
 
-    # width = len(hookpoint_firing_counts[target_modules[0]])
-
-    # Sample num_samples random features with their autointerp scores
-    print(len(df), "rows")
-    return df.sample(num_samples)
-
-    # df.to_csv(f"images/uninterpretable_indices_{scores_path.stem}.csv", index=False)
-
-    # Get the features with an interpretability accuracy below the threshold
-    # features = df.query(f"accuracy < {threshold}")
-    # perfect_indices = df.query("accuracy == 1")["latent_idx"].unique()
-
-    # print(f"Number of features: {len(df)}")
-
-    # uninterpretable_indices = features["latent_idx"].unique()
-    # random_indices = torch.randint(0, width, (len(uninterpretable_indices),)).tolist()
-
-    # return uninterpretable_indices, random_indices
+    if os.path.exists(df_path):
+        df = pd.read_csv(df_path)
+    else:
+        from delphi.log.result_analysis import build_scores_df
+        df = build_scores_df(scores_path, target_modules, hookpoint_firing_counts)
+        df.to_csv(df_path, index=False)
+    
+    
+    return df, hookpoint_firing_counts
 
 
 @torch.inference_mode()
@@ -459,40 +314,143 @@ def evaluate_ablation(
     batch_size: int,
     dataset: str,
     ablate_scores_path: str,
-    threshold: float = 0.7,
+    score_type="fuzz",
+    n_seqs = 1024,
+    num_bins = 200
 ):
+    """
+    This method uses caching logic that assumes
+    score_type will remain consistent for the same model.
+    """
+
+    px = import_plotly() # plotly bug workaround
     torch.manual_seed(42)
 
     cache_dir = f"images/ce_loss_increases/{model_name.replace('/', '-')}"
     sparse_name = sparse_path.split("/")[-1]
+    
+    ablation_df_path = f"{cache_dir}/{sparse_name}_grouped_ablation_n={n_seqs}.csv"
 
-    loss_fvu_path = f"{cache_dir}/{sparse_name}_loss_fvu.csv"
-    if not os.path.exists(loss_fvu_path):
-        print(
-            f"Baseline evaluation missing..."
-            f" populating loss increase for {sparse_path}..."
+    interpretability_dfs = {}
+    for hookpoint in hookpoints:
+        interp_df, hookpoint_firing_counts = get_autointerp_df(
+            Path(ablate_scores_path), 
+            [hookpoint], 
         )
-        from sparsify.evaluate import evaluate
+        interp_df = interp_df[interp_df["score_type"] == score_type]
+        interp_df = interp_df[interp_df["module"] == hookpoint]
 
-        evaluate(model_name, sparse_path, hookpoints, batch_size, dataset)
+        aligned_firing_counts = []
+        firing_counts = hookpoint_firing_counts[hookpoint]
+        for idx, row in interp_df.iterrows():
+            latent_idx = row["latent_idx"]
+            aligned_firing_counts.append(firing_counts[latent_idx].item())
 
-    loss_df = pd.read_csv(loss_fvu_path)
+        interp_df["firing_count"] = aligned_firing_counts
 
-    loss_df = loss_df[loss_df["hookpoint"].isin(hookpoints)]
-    df = populate_ablation_metrics(
+        # TODO remove this
+        # top_indices = interp_df["firing_count"].nlargest(500).index
+        # interp_df = interp_df.drop(top_100_indices)
+        
+        # # 533
+        # max_firing_row = interp_df["firing_count"].idxmax()
+        # interp_df.loc[max_firing_row]
+        # # f1 of 1.
+        # breakpoint()
+
+        # Filter dead neurons
+        # interp_df = interp_df[interp_df["firing_count"] > 0]
+
+        # Calculate normalized weights that sum to n_features
+        interp_df["normalized_weight"] = interp_df["firing_count"] / interp_df["firing_count"].mean()
+        weight_sum = interp_df["normalized_weight"].sum()
+        print(f"Sum of weights: {weight_sum:.2f}, Number of features: {len(interp_df)}")
+
+        interp_df["normalized_f1"] = interp_df["f1_score"] * interp_df["normalized_weight"]
+        interp_df["f1_score_weighted"] = interp_df["f1_score"] * interp_df["normalized_weight"]
+
+        # interp_df["garbage_score"] = (1 - interp_df["f1_score"]) * (
+        #     interp_df["normalized_f1"] / interp_df["normalized_f1"].sum() * (1 - interp_df["f1_score"]).sum()
+        # )
+
+        # firing_count_sum = float(interp_df["firing_count"].sum())
+        # interp_df["firing_frequency"] = interp_df["firing_count"] / firing_count_sum
+
+        # Get firing count-weighted f1 score
+        # interp_df["f1_score_weighted"] = interp_df["f1_score"] * interp_df["firing_frequency"]
+        print("weighted f1", interp_df["f1_score_weighted"].mean())
+        print("unweighted f1", interp_df["f1_score"].mean())
+
+        # Re-calculate with high-frequency features excluded
+        # subset_interp_df = interp_df[interp_df["firing_count"] < 100_000]
+        # subset_interp_df["normalized_weight"] = subset_interp_df["firing_count"] / subset_interp_df["firing_count"].mean()
+        # subset_interp_df["f1_score_weighted"] = subset_interp_df["f1_score"] * subset_interp_df["normalized_weight"]
+        # print("subset weighted f1", subset_interp_df["f1_score_weighted"].mean())
+        # print("subset unweighted f1", subset_interp_df["f1_score"].mean())
+
+        # Plot firing count vs. interp f1
+        num_tokens = 10_000_000
+        interp_df["firing_rate"] = interp_df["firing_count"] / num_tokens
+        fig = px.scatter(interp_df, x="firing_rate", y="f1_score", log_x=True)
+        fig.update_layout(
+            xaxis_title="Firing rate",
+            yaxis_title="F1 score",
+            title="",
+            xaxis_range=[-5.4, 0]
+        )
+        fig.write_image(f"images/{sparse_name}_{hookpoint}_firing_rates.pdf", format="pdf")
+
+        # filter to rows for latent idxs in feature_idx_range
+        # interp_df = interp_df[interp_df["latent_idx"].isin(
+        #     range(latent_idx_range[0], latent_idx_range[1])
+        # )]
+
+        interpretability_dfs[hookpoint] = interp_df
+
+    # ablation_df = pd.read_csv(ablation_df_path)
+    ablation_df = get_ablation_df(
         model_name,
         sparse_path,
-        loss_df,
+        hookpoints,
         dataset,
         batch_size,
-        ablate_scores_path,
+        interpretability_dfs,
+        n_seqs,
+        num_bins
     )
-    df.to_csv(f"{loss_fvu_path}_ablation.csv", index=False)
-
+     
     print("Done! Results:")
-    print(df.head())
-    print(f"Saved to {loss_fvu_path}_ablation.csv")
+    print(ablation_df.head())
+    print(f"Saved to {ablation_df_path}")
+    ablation_df.to_csv(ablation_df_path, index=False)
 
+    ablation_df["loss_increase"] = ablation_df["ablation_loss"] - ablation_df["original_loss"]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=ablation_df["autointerp_score"], 
+            y=(
+                ablation_df["loss_increase"] / ablation_df["original_loss"]
+            ), 
+            mode="markers",
+        )
+    )
+
+    name = f"images/{sparse_name}_binned_ablations_n={n_seqs}_bins={num_bins}.pdf"
+
+    if "bins" in name:
+        fig.update_layout(
+            yaxis_range=[0.0, 0.02]
+        )
+    fig.update_layout(
+        yaxis_title="Relative loss increase",
+        xaxis_title="F1 score",
+    )
+    fig.write_image(
+        name, format="pdf"
+    )
+    print(f"Saved to {name}")
 
 def main():
     from argparse import ArgumentParser

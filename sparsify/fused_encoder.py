@@ -41,7 +41,7 @@ class BinaryFusedEncoder(torch.autograd.Function):
         bias:   (M,)
         k:      int (number of top elements to select along dim=1)
         """
-        preacts = F.linear(input, weight, bias)  #  F.relu(
+        preacts = F.linear(input, weight, bias)
         # Get top-k values and indices for each row
 
         topk_values, indices = torch.topk(preacts - threshold, k, dim=1, sorted=False)

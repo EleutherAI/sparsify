@@ -23,7 +23,7 @@ def sparsify_forward(sparse_model: SparseCoder, input: Tensor, device: str) -> T
 
 
 def ablate_forward(
-    sparse_model: SparseCoder, input: Tensor, device: str, ablate_features: list[int]
+    sparse_model: SparseCoder, input: Tensor, device: str, ablate_features: Tensor
 ) -> Tensor:
     """Helper method to process an input through a sparse model.
     Handles flattening and unflattening."""
@@ -38,13 +38,15 @@ def ablate_forward(
     # TODO mean ablate or zero ablate?
     # Mean value will be slightly above zero
     mask = torch.isin(
-        latent_indices, torch.tensor(ablate_features, device=latent_indices.device)
+        latent_indices, ablate_features
     )
     latent_acts[mask] = 0.0
 
     sae_out = sparse_model.decode(latent_acts, latent_indices)
+    if sparse_model.W_skip is not None:
+        sae_out += input.flatten(0, 1).to(sparse_model.dtype) @ sparse_model.W_skip.mT
 
-    return sae_out.unflatten(dim=0, sizes=unflattened).to(device)
+    return sae_out.unflatten(dim=0, sizes=unflattened).to(device), forward_output.sae_out.unflatten(dim=0, sizes=unflattened).to(device)
 
 
 @contextmanager
@@ -196,6 +198,8 @@ def ablate_with_mse(
     mses = {}
 
     def create_edit_hook(hookpoint: str):
+        hookpoint_features = torch.tensor(ablate_features[hookpoint], device=sparse_models[hookpoint].device)
+
         def hook_fn(
             module: nn.Module, input: Any, output: Tensor
         ) -> Tensor | tuple[Tensor, ...]:
@@ -207,26 +211,34 @@ def ablate_with_mse(
                     if sparse_models[hookpoint].cfg.transcode
                     else output[0]
                 )
-                encoding = ablate_forward(
+                encoding, unablated_sae_out = ablate_forward(
                     sparse_models[hookpoint],
                     sparse_forward_input,
                     device,
-                    ablate_features[hookpoint],
+                    hookpoint_features,
                 )
-                mses[hookpoint] = F.mse_loss(output[0], encoding)
+                total_variance = (output[0] - output[0].mean(0)).pow(2).sum().item()
+                mse = (output[0] - encoding).pow(2).sum().item()
+                original_mse = (output[0] - unablated_sae_out).pow(2).sum().item()
+
+                mses[hookpoint] = (mse / total_variance) - (original_mse / total_variance)
                 return (encoding, *output[1:])
             else:
                 sparse_forward_input = (
                     tensor_input if sparse_models[hookpoint].cfg.transcode else output
                 )
-                encoding = ablate_forward(
+                encoding, unablated_sae_out = ablate_forward(
                     sparse_models[hookpoint],
                     sparse_forward_input,
                     device,
-                    ablate_features[hookpoint],
+                    hookpoint_features,
                 )
 
-                mses[hookpoint] = F.mse_loss(output, encoding)
+                total_variance = (output - output.mean(0)).pow(2).sum().item()
+                mse = (output - encoding).pow(2).sum().item()
+                original_mse = (output - unablated_sae_out).pow(2).sum().item()
+
+                mses[hookpoint] = (mse / total_variance) - (original_mse / total_variance)
                 return encoding
 
         return hook_fn

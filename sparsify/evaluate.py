@@ -382,19 +382,19 @@ def evaluate(
 
     sparse_name = sparse_path.split("/")[-1]
     loss_fvu_path = f"{cache_dir}/{sparse_name}_loss_fvu.csv"
-    # if os.path.exists(loss_fvu_path):
-    # df = pd.read_csv(loss_fvu_path)
-    # else:
-    print(f"Populating loss increase for {sparse_path}...")
-    df = df[df["hookpoint"].isin(hookpoints)]
-    df = populate_performance_metrics(
-        model_name,
-        sparse_path,
-        df,
-        dataset,
-        batch_size,
-    )
-    df.to_csv(loss_fvu_path, index=False)
+    if os.path.exists(loss_fvu_path):
+        df = pd.read_csv(loss_fvu_path)
+    else:
+        print(f"Populating loss increase for {sparse_path}...")
+        df = df[df["hookpoint"].isin(hookpoints)]
+        df = populate_performance_metrics(
+            model_name,
+            sparse_path,
+            df,
+            dataset,
+            batch_size,
+        )
+        df.to_csv(loss_fvu_path, index=False)
 
     print("Done! Results:")
     print(df.head())
@@ -410,7 +410,7 @@ def main():
     parser.add_argument("--sparse_model", type=str, required=True)
     parser.add_argument("--hookpoints", nargs="+", required=True)
     parser.add_argument("--base_model", type=str, default="HuggingFaceTB/SmolLM2-135M")
-    parser.add_argument("--dataset", type=str, default="EleutherAI/SmolLM2-135M-10B")
+    parser.add_argument("--dataset", type=str, default="EleutherAI/SmolLM2-135M-20B")
     parser.add_argument("--batch_size", type=int, default=16)
     args = parser.parse_args()
 
