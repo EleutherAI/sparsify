@@ -2,23 +2,24 @@ import os
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
-import plotly.graph_objects as go
-import torch.nn.functional as F
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import torch
 import torch.multiprocessing as mp
+import torch.nn.functional as F
 from datasets import load_dataset
 from torch import Tensor
 from torch.utils.data import DataLoader
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from sparsify import SparseCoder
 from sparsify.data import chunk_and_tokenize
 from sparsify.sparsify_hooks import ablate_with_mse
 
 mp.set_start_method("spawn", force=True)
+
 
 def import_plotly():
     try:
@@ -33,10 +34,11 @@ def import_plotly():
     pio.kaleido.scope.mathjax = None  # https://github.com/plotly/plotly.py/issues/3469
     return px
 
+
 def make_equal_fire_bins(df, n_bins=100):
-    df = df.sort_values('f1_score', ascending=False).reset_index(drop=True)
+    df = df.sort_values("f1_score", ascending=False).reset_index(drop=True)
     edges = np.linspace(0, df.firing_count.sum(), n_bins + 1)
-    df['bin'] = np.searchsorted(edges, df.firing_count.cumsum(), side='right') - 1
+    df["bin"] = np.searchsorted(edges, df.firing_count.cumsum(), side="right") - 1
 
     return df
 
@@ -52,9 +54,8 @@ def get_ablation_metrics(args):
         dataset,
         interpretability_df,
         n_seqs,
-        num_bins
+        num_bins,
     ) = args
-
 
     torch.cuda.set_device(gpu_id)
     device = f"cuda:{gpu_id}"
@@ -80,11 +81,10 @@ def get_ablation_metrics(args):
     sparse_model.eval()
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-    
+
     # bins = True
     bin_data = []
     # if bins:
-    
 
     interp_df = make_equal_fire_bins(interpretability_df, num_bins)
 
@@ -96,10 +96,9 @@ def get_ablation_metrics(args):
     # outlier = interp_df.loc[interp_df.is_outlier]
     # rest    = interp_df.loc[~interp_df.is_outlier]
 
-    
     # n_new_outlier_bins = 15
     # outlier = make_equal_fire_bins(outlier.drop(columns="bin"), n_new_outlier_bins)          # ensure no collision
-    # outlier["is_outlier"] = True                  
+    # outlier["is_outlier"] = True
     # rest["bin"] += (n_new_outlier_bins - len(original_outlier_bins))
 
     # interp_df = pd.concat([outlier, rest]).reset_index(drop=True)
@@ -110,8 +109,13 @@ def get_ablation_metrics(args):
     bin_mean_autointerp_scores = []
     for bin in interp_df.bin.unique():
         binned_idxs.append(interp_df[interp_df.bin == bin].index.tolist())
-        bin_mean_autointerp_scores.append(np.average(interp_df[interp_df.bin == bin].f1_score, weights=interp_df[interp_df.bin == bin].firing_count))
-    
+        bin_mean_autointerp_scores.append(
+            np.average(
+                interp_df[interp_df.bin == bin].f1_score,
+                weights=interp_df[interp_df.bin == bin].firing_count,
+            )
+        )
+
     # binned_idxs = [list(idxs) for _, idxs in interp_df.groupby("bin").groups.items()]
     # bin_mean_autointerp_scores = (
     #     interp_df.groupby("bin")
@@ -134,7 +138,6 @@ def get_ablation_metrics(args):
     #     # Select relevant rows
     #     bin_mean_autointerp_scores = [interpretability_df.iloc[interp_idxs]["f1_score"].mean(), interpretability_df.iloc[uninterp_idxs]["f1_score"].mean()]
 
-
     print(len(binned_idxs))
     print(len(binned_idxs[0]))
     print(len(binned_idxs[5]))
@@ -144,7 +147,6 @@ def get_ablation_metrics(args):
     # print(len(binned_idxs[21]))
     # print(len(binned_idxs[22]))
     # print(len(binned_idxs[23]))
-
 
     feature_data = {
         i: {
@@ -157,7 +159,7 @@ def get_ablation_metrics(args):
         for i in range(len(binned_idxs))
     }
 
-     # Scale by outlier bin
+    # Scale by outlier bin
     # per_bin = (interp_df.groupby("bin")
     #     .agg(total_fire=("firing_count", "sum"),
     #         is_outlier=("is_outlier", "any"))
@@ -194,11 +196,9 @@ def get_ablation_metrics(args):
                 model,
                 hookpoints=[f"model.{hookpoint}"],
                 sparse_models={f"model.{hookpoint}": sparse_model},
-                ablate_features={
-                    f"model.{hookpoint}": binned_idxs[i]
-                },
+                ablate_features={f"model.{hookpoint}": binned_idxs[i]},
             ) as mses:
-                
+
                 output = model(tokens.long())
 
                 loss = F.cross_entropy(
@@ -215,10 +215,10 @@ def get_ablation_metrics(args):
 
                 feature_data[i]["fvu"].append(mses[f"model.{hookpoint}"])
 
-   
-
     data = []
-    for bin_idx, autointerp_score in zip(range(len(binned_idxs)), bin_mean_autointerp_scores):
+    for bin_idx, autointerp_score in zip(
+        range(len(binned_idxs)), bin_mean_autointerp_scores
+    ):
         # raw_inc = np.mean(feature_data[bin_idx]["loss"]) - np.mean(feature_data[bin_idx]["original_loss"])
         # scaled  = raw_inc * scale_map[bin_idx]
 
@@ -228,23 +228,26 @@ def get_ablation_metrics(args):
         # scaled   = raw_inc * scale_map[bin_idx]
         # scaled_r = raw_rat * scale_map[bin_idx]
 
-        data.append({
-            "hookpoint": hookpoint,
-            "bin_idx": bin_idx,
-            # "feature_idx": feature_idx,
-            "autointerp_score": autointerp_score,
-            "ablation_loss": np.mean(feature_data[bin_idx]["loss"]),
-            "ablation_acc": np.mean(feature_data[bin_idx]["acc"]),
-            "ablation_fvu": np.mean(feature_data[bin_idx]["fvu"]),
-            "original_loss": np.mean(feature_data[bin_idx]["original_loss"]),
-            "original_acc": np.mean(feature_data[bin_idx]["original_acc"]),
-            "loss_increase": np.mean(feature_data[bin_idx]["loss"]) - np.mean(feature_data[bin_idx]["original_loss"]),
-            "acc_increase": np.mean(feature_data[bin_idx]["acc"]) - np.mean(feature_data[bin_idx]["original_acc"]),
-            # "scaled_loss_increase": scaled,
-            # "scaled_loss_increase_ratio": scaled_r,
-            # "bin_fire_total": bin_fire_total[bin_idx],
-        })
-
+        data.append(
+            {
+                "hookpoint": hookpoint,
+                "bin_idx": bin_idx,
+                # "feature_idx": feature_idx,
+                "autointerp_score": autointerp_score,
+                "ablation_loss": np.mean(feature_data[bin_idx]["loss"]),
+                "ablation_acc": np.mean(feature_data[bin_idx]["acc"]),
+                "ablation_fvu": np.mean(feature_data[bin_idx]["fvu"]),
+                "original_loss": np.mean(feature_data[bin_idx]["original_loss"]),
+                "original_acc": np.mean(feature_data[bin_idx]["original_acc"]),
+                "loss_increase": np.mean(feature_data[bin_idx]["loss"])
+                - np.mean(feature_data[bin_idx]["original_loss"]),
+                "acc_increase": np.mean(feature_data[bin_idx]["acc"])
+                - np.mean(feature_data[bin_idx]["original_acc"]),
+                # "scaled_loss_increase": scaled,
+                # "scaled_loss_increase_ratio": scaled_r,
+                # "bin_fire_total": bin_fire_total[bin_idx],
+            }
+        )
 
     return pd.DataFrame(data)
 
@@ -258,7 +261,7 @@ def get_ablation_df(
     batch_size: int,
     interpretability_dfs: dict[str, pd.DataFrame],
     n_seqs: int,
-    num_bins: int
+    num_bins: int,
 ):
     results = []
     num_gpus = torch.cuda.device_count()
@@ -274,7 +277,7 @@ def get_ablation_df(
             dataset,
             interpretability_dfs[hookpoint],
             n_seqs,
-            num_bins
+            num_bins,
         )
         for i, hookpoint in enumerate(hookpoints)
     ]
@@ -286,10 +289,7 @@ def get_ablation_df(
     return pd.concat(results)
 
 
-
-def get_autointerp_df(
-    scores_path: Path, target_modules: list[str]
-) -> pd.DataFrame:
+def get_autointerp_df(scores_path: Path, target_modules: list[str]) -> pd.DataFrame:
     df_path = f"images/uninterpretable_indices_{str(scores_path).replace('/', '-')}.csv"
 
     log_path = scores_path.parent / "log" / "hookpoint_firing_counts.pt"
@@ -299,10 +299,10 @@ def get_autointerp_df(
         df = pd.read_csv(df_path)
     else:
         from delphi.log.result_analysis import build_scores_df
+
         df = build_scores_df(scores_path, target_modules, hookpoint_firing_counts)
         df.to_csv(df_path, index=False)
-    
-    
+
     return df, hookpoint_firing_counts
 
 
@@ -315,27 +315,27 @@ def evaluate_ablation(
     dataset: str,
     ablate_scores_path: str,
     score_type="fuzz",
-    n_seqs = 1024,
-    num_bins = 200
+    n_seqs=1024,
+    num_bins=200,
 ):
     """
     This method uses caching logic that assumes
     score_type will remain consistent for the same model.
     """
 
-    px = import_plotly() # plotly bug workaround
+    px = import_plotly()  # plotly bug workaround
     torch.manual_seed(42)
 
     cache_dir = f"images/ce_loss_increases/{model_name.replace('/', '-')}"
     sparse_name = sparse_path.split("/")[-1]
-    
+
     ablation_df_path = f"{cache_dir}/{sparse_name}_grouped_ablation_n={n_seqs}.csv"
 
     interpretability_dfs = {}
     for hookpoint in hookpoints:
         interp_df, hookpoint_firing_counts = get_autointerp_df(
-            Path(ablate_scores_path), 
-            [hookpoint], 
+            Path(ablate_scores_path),
+            [hookpoint],
         )
         interp_df = interp_df[interp_df["score_type"] == score_type]
         interp_df = interp_df[interp_df["module"] == hookpoint]
@@ -351,7 +351,7 @@ def evaluate_ablation(
         # TODO remove this
         # top_indices = interp_df["firing_count"].nlargest(500).index
         # interp_df = interp_df.drop(top_100_indices)
-        
+
         # # 533
         # max_firing_row = interp_df["firing_count"].idxmax()
         # interp_df.loc[max_firing_row]
@@ -362,12 +362,18 @@ def evaluate_ablation(
         # interp_df = interp_df[interp_df["firing_count"] > 0]
 
         # Calculate normalized weights that sum to n_features
-        interp_df["normalized_weight"] = interp_df["firing_count"] / interp_df["firing_count"].mean()
+        interp_df["normalized_weight"] = (
+            interp_df["firing_count"] / interp_df["firing_count"].mean()
+        )
         weight_sum = interp_df["normalized_weight"].sum()
         print(f"Sum of weights: {weight_sum:.2f}, Number of features: {len(interp_df)}")
 
-        interp_df["normalized_f1"] = interp_df["f1_score"] * interp_df["normalized_weight"]
-        interp_df["f1_score_weighted"] = interp_df["f1_score"] * interp_df["normalized_weight"]
+        interp_df["normalized_f1"] = (
+            interp_df["f1_score"] * interp_df["normalized_weight"]
+        )
+        interp_df["f1_score_weighted"] = (
+            interp_df["f1_score"] * interp_df["normalized_weight"]
+        )
 
         # interp_df["garbage_score"] = (1 - interp_df["f1_score"]) * (
         #     interp_df["normalized_f1"] / interp_df["normalized_f1"].sum() * (1 - interp_df["f1_score"]).sum()
@@ -396,9 +402,11 @@ def evaluate_ablation(
             xaxis_title="Firing rate",
             yaxis_title="F1 score",
             title="",
-            xaxis_range=[-5.4, 0]
+            xaxis_range=[-5.4, 0],
         )
-        fig.write_image(f"images/{sparse_name}_{hookpoint}_firing_rates.pdf", format="pdf")
+        fig.write_image(
+            f"images/{sparse_name}_{hookpoint}_firing_rates.pdf", format="pdf"
+        )
 
         # filter to rows for latent idxs in feature_idx_range
         # interp_df = interp_df[interp_df["latent_idx"].isin(
@@ -416,23 +424,23 @@ def evaluate_ablation(
         batch_size,
         interpretability_dfs,
         n_seqs,
-        num_bins
+        num_bins,
     )
-     
+
     print("Done! Results:")
     print(ablation_df.head())
     print(f"Saved to {ablation_df_path}")
     ablation_df.to_csv(ablation_df_path, index=False)
 
-    ablation_df["loss_increase"] = ablation_df["ablation_loss"] - ablation_df["original_loss"]
+    ablation_df["loss_increase"] = (
+        ablation_df["ablation_loss"] - ablation_df["original_loss"]
+    )
 
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
-            x=ablation_df["autointerp_score"], 
-            y=(
-                ablation_df["loss_increase"] / ablation_df["original_loss"]
-            ), 
+            x=ablation_df["autointerp_score"],
+            y=(ablation_df["loss_increase"] / ablation_df["original_loss"]),
             mode="markers",
         )
     )
@@ -440,17 +448,14 @@ def evaluate_ablation(
     name = f"images/{sparse_name}_binned_ablations_n={n_seqs}_bins={num_bins}.pdf"
 
     if "bins" in name:
-        fig.update_layout(
-            yaxis_range=[0.0, 0.02]
-        )
+        fig.update_layout(yaxis_range=[0.0, 0.02])
     fig.update_layout(
         yaxis_title="Relative loss increase",
         xaxis_title="F1 score",
     )
-    fig.write_image(
-        name, format="pdf"
-    )
+    fig.write_image(name, format="pdf")
     print(f"Saved to {name}")
+
 
 def main():
     from argparse import ArgumentParser

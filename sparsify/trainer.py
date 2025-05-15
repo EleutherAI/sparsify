@@ -155,14 +155,25 @@ class Trainer:
             case "signum":
                 from schedulefree import ScheduleFreeWrapper
 
-                pgs = [
-                    dict(
-                        params=sae.parameters(),
-                        lr=cfg.lr or 5e-3 / (sae.num_latents / (2**14)) ** 0.5,
-                    )
-                    for sae in self.saes.values()
-                ]
+                if list(self.saes.values())[0].cfg.activation == "topk_binary":
+                    pgs = [
+                        dict(
+                            params=sae.parameters(),
+                            lr=cfg.lr or 3e-3 / (sae.num_latents / (2**15)) ** 0.5,
+                        )
+                        for sae in self.saes.values()
+                    ]
+
+                else:
+                    pgs = [
+                        dict(
+                            params=sae.parameters(),
+                            lr=cfg.lr or 5e-3 / (sae.num_latents / (2**14)) ** 0.5,
+                        )
+                        for sae in self.saes.values()
+                    ]
                 lrs = [f"{lr:.2e}" for lr in sorted(set(pg["lr"] for pg in pgs))]
+                
 
                 opt = ScheduleFreeWrapper(SignSGD(pgs), momentum=0.95)
                 opt.train()

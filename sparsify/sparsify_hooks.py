@@ -37,16 +37,16 @@ def ablate_forward(
 
     # TODO mean ablate or zero ablate?
     # Mean value will be slightly above zero
-    mask = torch.isin(
-        latent_indices, ablate_features
-    )
+    mask = torch.isin(latent_indices, ablate_features)
     latent_acts[mask] = 0.0
 
     sae_out = sparse_model.decode(latent_acts, latent_indices)
     if sparse_model.W_skip is not None:
         sae_out += input.flatten(0, 1).to(sparse_model.dtype) @ sparse_model.W_skip.mT
 
-    return sae_out.unflatten(dim=0, sizes=unflattened).to(device), forward_output.sae_out.unflatten(dim=0, sizes=unflattened).to(device)
+    return sae_out.unflatten(dim=0, sizes=unflattened).to(
+        device
+    ), forward_output.sae_out.unflatten(dim=0, sizes=unflattened).to(device)
 
 
 @contextmanager
@@ -198,7 +198,9 @@ def ablate_with_mse(
     mses = {}
 
     def create_edit_hook(hookpoint: str):
-        hookpoint_features = torch.tensor(ablate_features[hookpoint], device=sparse_models[hookpoint].device)
+        hookpoint_features = torch.tensor(
+            ablate_features[hookpoint], device=sparse_models[hookpoint].device
+        )
 
         def hook_fn(
             module: nn.Module, input: Any, output: Tensor
@@ -221,7 +223,9 @@ def ablate_with_mse(
                 mse = (output[0] - encoding).pow(2).sum().item()
                 original_mse = (output[0] - unablated_sae_out).pow(2).sum().item()
 
-                mses[hookpoint] = (mse / total_variance) - (original_mse / total_variance)
+                mses[hookpoint] = (mse / total_variance) - (
+                    original_mse / total_variance
+                )
                 return (encoding, *output[1:])
             else:
                 sparse_forward_input = (
@@ -238,7 +242,9 @@ def ablate_with_mse(
                 mse = (output - encoding).pow(2).sum().item()
                 original_mse = (output - unablated_sae_out).pow(2).sum().item()
 
-                mses[hookpoint] = (mse / total_variance) - (original_mse / total_variance)
+                mses[hookpoint] = (mse / total_variance) - (
+                    original_mse / total_variance
+                )
                 return encoding
 
         return hook_fn
