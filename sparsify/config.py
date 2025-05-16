@@ -41,6 +41,9 @@ class SparseCoderConfig(Serializable):
     normalize_io: bool = False
     """Normalize the input and output of the sparse coder."""
 
+    divide_cross_layer: bool = False
+    """Divide the preceding layer skip connections by the number of layers."""
+
 
 # Support different naming conventions for the same configuration
 SaeConfig = SparseCoderConfig

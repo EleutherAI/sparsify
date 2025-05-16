@@ -506,8 +506,10 @@ class Trainer:
             for hookpoint, layer_mid in layer_mids.items():
                 if self.cfg.loss_fn == "fvu":
                     layer_mid.detach()
-                # divide_by = max(1, len(layer_mids) - 1)
-                divide_by = 1
+                if layer_mid.sparse_coder.cfg.divide_cross_layer:
+                    divide_by = max(1, len(layer_mids) - 1)
+                else:
+                    divide_by = 1
                 out = layer_mid(
                     outputs,
                     addition=(0 if hookpoint != name else (output / divide_by)),
