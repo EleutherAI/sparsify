@@ -252,6 +252,16 @@ class SparseCoder(nn.Module):
                     )
                 ),
             )
+        if mesh is not None:
+            post_enc = dtensor.zeros(
+                (self.num_latents,),
+                dtype=dtype,
+                device_mesh=mesh,
+                placements=[dtensor.Replicate(), dtensor.Shard(0)],
+            )
+        else:
+            post_enc = torch.zeros(self.num_latents, device=device, dtype=dtype)
+        self.post_enc = nn.Parameter(post_enc, requires_grad=False)
 
         if decoder:
             # Transcoder initialization: use zeros
@@ -491,7 +501,12 @@ class SparseCoder(nn.Module):
             x = x - self.b_dec
 
         return fused_encoder(
-            x, self.encoder.weight, self.encoder.bias, self.cfg.k, self.cfg.activation
+            x,
+            self.encoder.weight,
+            self.encoder.bias,
+            self.post_enc,
+            self.cfg.k,
+            self.cfg.activation,
         )
 
     def decode(
@@ -531,7 +546,7 @@ class SparseCoder(nn.Module):
         if self.multi_target or return_mid_decoder:
             return mid_decoder
         else:
-            return mid_decoder(0, y)
+            return mid_decoder(y, 0)
 
     @torch.no_grad()
     def set_decoder_norm_to_unit_norm(self):

@@ -53,6 +53,7 @@ reportPrivateImportUsage = false
 include = ["sparsify*"]
 
 [tool.ruff]
+exclude = ["scripts/*"]
 # Enable pycodestyle (`E`), Pyflakes (`F`), and isort (`I`) codes
 # See https://beta.ruff.rs/docs/rules/ for more possible rules
 select = ["E", "F", "I"]

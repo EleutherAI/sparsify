@@ -27,7 +27,13 @@ class FusedEncoder(torch.autograd.Function):
     @staticmethod
     @torch.compile
     def forward(
-        ctx, input, weight, bias, k: int, activation: Literal["groupmax", "topk"]
+        ctx,
+        input,
+        weight,
+        bias,
+        post_enc,
+        k: int,
+        activation: Literal["groupmax", "topk"],
     ):
         """
         input:  (N, D)
@@ -120,6 +126,8 @@ class FusedEncoder(torch.autograd.Function):
             indices = offsets + indices
         else:
             raise ValueError(f"Unknown activation: {activation}")
+
+        values = values + post_enc[indices]
 
         # Save tensors needed for the backward pass
         ctx.save_for_backward(input, weight, bias, indices)
@@ -232,6 +240,7 @@ def fused_encoder(
     input,
     weight,
     bias,
+    post_enc,
     k: int,
     activation: Literal["groupmax", "topk"],
 ) -> EncoderOutput:
@@ -240,5 +249,5 @@ def fused_encoder(
     a backward pass optimized using index_add.
     """
     return EncoderOutput(
-        *FusedEncoder.apply(input, weight, bias, k, activation)  # type: ignore
+        *FusedEncoder.apply(input, weight, bias, post_enc, k, activation)  # type: ignore
     )
