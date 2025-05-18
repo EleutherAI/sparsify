@@ -115,15 +115,46 @@ class FusedEncoder(torch.autograd.Function):
             else:
                 values, indices = torch.topk(preacts, k, dim=-1, sorted=False)
         elif activation == "groupmax":
-            values, indices = preacts.unflatten(-1, (k, -1)).max(dim=-1)
-
-            # torch.max gives us indices into each group, but we want indices into the
-            # flattened tensor. Add the offsets to get the correct indices.
-            num_latents = preacts.shape[1]
-            offsets = torch.arange(
-                0, num_latents, num_latents // k, device=preacts.device
-            )
-            indices = offsets + indices
+            if isinstance(preacts, dtensor.DTensor):
+                mesh = preacts.device_mesh
+                local_acts = preacts.to_local()
+                assert k % mesh.shape[1] == 0
+                local_k = k // mesh.shape[1]
+                local_values, local_indices = local_acts.unflatten(
+                    -1, (local_k, -1)
+                ).max(dim=-1)
+                offsets = torch.arange(
+                    0,
+                    local_acts.shape[1],
+                    local_acts.shape[1] // local_k,
+                    device=preacts.device,
+                )
+                mesh_offset = mesh.get_local_rank(1) * local_k
+                indices = mesh_offset + offsets + local_indices
+                values = local_values
+                values = dtensor.DTensor.from_local(
+                    values,
+                    mesh,
+                    (dtensor.Shard(0), dtensor.Shard(1)),
+                )
+                indices = dtensor.DTensor.from_local(
+                    indices,
+                    mesh,
+                    (dtensor.Shard(0), dtensor.Shard(1)),
+                )
+                values = values.redistribute(
+                    mesh, (dtensor.Shard(0), dtensor.Replicate())
+                )
+                indices = indices.redistribute(
+                    mesh, (dtensor.Shard(0), dtensor.Replicate())
+                )
+            else:
+                num_latents = preacts.shape[1]
+                values, indices = preacts.unflatten(-1, (k, -1)).max(dim=-1)
+                offsets = torch.arange(
+                    0, num_latents, num_latents // k, device=preacts.device
+                )
+                indices = offsets + indices
         else:
             raise ValueError(f"Unknown activation: {activation}")
 
@@ -132,6 +163,7 @@ class FusedEncoder(torch.autograd.Function):
         # Save tensors needed for the backward pass
         ctx.save_for_backward(input, weight, bias, indices)
         ctx.k = k
+        ctx.activation = activation
         return values, indices, preacts
 
     @staticmethod
@@ -140,6 +172,7 @@ class FusedEncoder(torch.autograd.Function):
     def backward(ctx, grad_values, grad_indices, grad_preacts):
         input, weight, bias, indices = ctx.saved_tensors
         grad_input = grad_weight = grad_bias = None
+        activation = ctx.activation
 
         # --- Grad w.r.t. input ---
         if ctx.needs_input_grad[0]:
@@ -211,20 +244,32 @@ class FusedEncoder(torch.autograd.Function):
                 gathered_input = input.redistribute(
                     mesh, (dtensor.Replicate(), dtensor.Replicate())
                 ).to_local()
-                gathered_indices = indices.redistribute(
-                    mesh, (dtensor.Replicate(), dtensor.Replicate())
-                ).to_local()
-                gathered_values = grad_values.redistribute(
-                    mesh, (dtensor.Replicate(), dtensor.Replicate())
-                ).to_local()
+                if activation == "groupmax":
+                    indices = indices.redistribute(
+                        mesh, (dtensor.Replicate(), dtensor.Shard(1))
+                    ).to_local()
+                    values = grad_values.redistribute(
+                        mesh, (dtensor.Replicate(), dtensor.Shard(1))
+                    ).to_local()
+                    local_k = ctx.k // mesh.shape[1]
+                    start_f = mesh.get_local_rank(1) * local_k
+                    indices = indices - start_f
+                else:
+                    gathered_indices = indices.redistribute(
+                        mesh, (dtensor.Replicate(), dtensor.Replicate())
+                    ).to_local()
+                    gathered_values = grad_values.redistribute(
+                        mesh, (dtensor.Replicate(), dtensor.Replicate())
+                    ).to_local()
 
-                indices = gathered_indices.view(-1, ctx.k)
-                values = gathered_values.view(-1, ctx.k)
-                mask = (indices >= start_feature) & (indices < end_feature)
-                values *= mask.type_as(values)
-                indices = (indices - start_feature).clamp(
-                    0, local_grad_weight.shape[0] - 1
-                )
+                    indices = gathered_indices.view(-1, ctx.k)
+                    values = gathered_values.view(-1, ctx.k)
+
+                    mask = (indices >= start_feature) & (indices < end_feature)
+                    values *= mask.type_as(values)
+                    indices = (indices - start_feature).clamp(
+                        0, local_grad_weight.shape[0] - 1
+                    )
                 local_grad_weight += triton_sparse_transpose_dense_matmul(
                     indices,
                     values.float(),
