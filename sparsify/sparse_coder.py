@@ -252,16 +252,6 @@ class SparseCoder(nn.Module):
                     )
                 ),
             )
-        if mesh is not None:
-            post_enc = dtensor.zeros(
-                (self.num_latents,),
-                dtype=dtype,
-                device_mesh=mesh,
-                placements=[dtensor.Replicate(), dtensor.Shard(0)],
-            )
-        else:
-            post_enc = torch.zeros(self.num_latents, device=device, dtype=dtype)
-        self.post_enc = nn.Parameter(post_enc, requires_grad=False)
 
         if decoder:
             # Transcoder initialization: use zeros
@@ -357,6 +347,17 @@ class SparseCoder(nn.Module):
                 self.register_buffer(
                     "out_norm", torch.ones(1, device=device, dtype=dtype)
                 )
+
+        if mesh is not None:
+            post_enc = dtensor.zeros(
+                (self.num_latents,),
+                dtype=dtype,
+                device_mesh=mesh,
+                placements=[dtensor.Replicate(), dtensor.Shard(0)],
+            )
+        else:
+            post_enc = torch.zeros(self.num_latents, device=device, dtype=dtype)
+        self.post_enc = nn.Parameter(post_enc, requires_grad=False)
 
     @staticmethod
     def load_many(

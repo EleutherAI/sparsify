@@ -1,6 +1,6 @@
 from torch import Tensor
 
-from .sparse_coder import SparseCoder
+from .sparse_coder import MidDecoder, SparseCoder
 
 
 class CrossLayerRunner(object):
@@ -8,22 +8,23 @@ class CrossLayerRunner(object):
         self.outputs = {}
         self.to_restore = []
 
-    def __call__(
-        self,
-        x: Tensor,
-        y: Tensor,
-        sparse_coder: SparseCoder,
-        module_name: str,
-        detach_grad: bool = False,
-        **kwargs,
-    ):
+    def encode(self, x: Tensor, sparse_coder: SparseCoder, **kwargs):
         out_mid = sparse_coder(
             x=x,
-            y=y,
+            y=None,
             return_mid_decoder=True,
             **kwargs,
         )
-        self.outputs[module_name] = out_mid
+        return out_mid
+
+    def decode(
+        self,
+        mid_out: MidDecoder,
+        y: Tensor,
+        module_name: str,
+        detach_grad: bool = False,
+    ):
+        self.outputs[module_name] = mid_out
 
         output = 0
         to_delete = set()
@@ -58,6 +59,18 @@ class CrossLayerRunner(object):
         for hookpoint in to_delete:
             del self.outputs[hookpoint]
         return out, output
+
+    def __call__(
+        self,
+        x: Tensor,
+        y: Tensor,
+        sparse_coder: SparseCoder,
+        module_name: str,
+        detach_grad: bool = False,
+        **kwargs,
+    ):
+        mid_out = self.encode(x, sparse_coder, **kwargs)
+        return self.decode(mid_out, y, module_name, detach_grad)
 
     def restore(self):
         for restorable, was_last in self.to_restore:

@@ -11,4 +11,4 @@ nev/GELU_4L512W_C4_Code \
 --hookpoints h.0.mlp h.1.mlp h.2.mlp h.3.mlp \
 --run_name gelu-4l-clt-sweep/k$K-x$EF$3 \
 --skip_connection=True \
---cross_layer 4
+--cross_layer 4 ${@:4}

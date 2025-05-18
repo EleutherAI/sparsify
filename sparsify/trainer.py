@@ -32,6 +32,7 @@ from .utils import (
     resolve_widths,
     save_sharded,
     set_submodule,
+    unflatten_dict,
 )
 
 ScheduleFreeWrapperType = (ScheduleFreeWrapper, ScheduleFreeWrapperReference)
@@ -264,9 +265,26 @@ class Trainer:
                     param.grad = torch.zeros_like(param)
         for i, optimizer in enumerate(self.optimizers):
             if self.mesh is None:
+                for sae in self.saes.values():
+                    for param in sae.parameters():
+                        param.grad = torch.zeros_like(param)
+                optimizer.step()
+                optimizer.zero_grad()
+                for sae in self.saes.values():
+                    for param in sae.parameters():
+                        param.grad = torch.zeros_like(param)
+                optimizer.step()
+                optimizer.zero_grad()
+
                 opt_state = torch.load(
                     f"{path}/optimizer_{i}.pt", map_location=device, weights_only=True
                 )
+                from .utils import flatten_dict
+
+                for k, v in flatten_dict(optimizer.state_dict()).items():
+                    if isinstance(v, torch.Tensor):
+                        print(k, v.shape, opt_state[k].shape)
+                opt_state = unflatten_dict(opt_state)
             else:
                 # we haven't stepped the optimizer yet, so the buffers aren't filled
                 # we need to perform a fake step
