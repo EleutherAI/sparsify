@@ -487,7 +487,7 @@ class Trainer:
             if raw.cfg.normalize_decoder and not self.cfg.sae.transcode:
                 raw.set_decoder_norm_to_unit_norm()
 
-            out, output = runner.run(
+            out, output = runner(
                 inputs,
                 outputs,
                 sparse_coder=wrapped,

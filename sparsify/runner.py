@@ -8,7 +8,7 @@ class CrossLayerRunner(object):
         self.outputs = {}
         self.to_restore = []
 
-    def run(
+    def __call__(
         self,
         x: Tensor,
         y: Tensor,
