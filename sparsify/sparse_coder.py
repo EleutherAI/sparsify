@@ -109,8 +109,15 @@ class MidDecoder:
             self.next()
         is_last = self._index >= self.sparse_coder.cfg.n_targets
 
+        post_enc = (
+            self.sparse_coder.post_encs[index]
+            if self.sparse_coder.multi_target
+            else self.sparse_coder.post_enc
+        )
+        latent_acts = self.latent_acts + post_enc[self.latent_indices]
+
         # Decode
-        sae_out = self.sparse_coder.decode(self.latent_acts, self.latent_indices, index)
+        sae_out = self.sparse_coder.decode(latent_acts, self.latent_indices, index)
         W_skip = (
             self.sparse_coder.W_skips[index]
             if self.sparse_coder.multi_target
@@ -348,16 +355,25 @@ class SparseCoder(nn.Module):
                     "out_norm", torch.ones(1, device=device, dtype=dtype)
                 )
 
-        if mesh is not None:
-            post_enc = dtensor.zeros(
-                (self.num_latents,),
-                dtype=dtype,
-                device_mesh=mesh,
-                placements=[dtensor.Replicate(), dtensor.Shard(0)],
-            )
+        def make_post_enc():
+            if mesh is not None:
+                post_enc = dtensor.zeros(
+                    (self.num_latents,),
+                    dtype=dtype,
+                    device_mesh=mesh,
+                    placements=[dtensor.Replicate(), dtensor.Shard(0)],
+                )
+            else:
+                post_enc = torch.zeros(self.num_latents, device=device, dtype=dtype)
+            post_enc = nn.Parameter(post_enc, requires_grad=cfg.train_post_encoder)
+            return post_enc
+
+        if self.multi_target:
+            self.post_encs = nn.ParameterList()
+            for _ in range(cfg.n_targets):
+                self.post_encs.append(make_post_enc())
         else:
-            post_enc = torch.zeros(self.num_latents, device=device, dtype=dtype)
-        self.post_enc = nn.Parameter(post_enc, requires_grad=False)
+            self.post_enc = make_post_enc()
 
     @staticmethod
     def load_many(
@@ -504,7 +520,6 @@ class SparseCoder(nn.Module):
             x,
             self.encoder.weight,
             self.encoder.bias,
-            self.post_enc,
             self.cfg.k,
             self.cfg.activation,
         )

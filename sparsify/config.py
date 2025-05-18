@@ -44,6 +44,9 @@ class SparseCoderConfig(Serializable):
     divide_cross_layer: bool = False
     """Divide the preceding layer skip connections by the number of layers."""
 
+    train_post_encoder: bool = True
+    """Train the post-encoder bias."""
+
 
 # Support different naming conventions for the same configuration
 SaeConfig = SparseCoderConfig

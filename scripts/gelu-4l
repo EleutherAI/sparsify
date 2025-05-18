@@ -6,7 +6,7 @@ nev/GELU_4L512W_C4_Code \
 --ctx_len 1024 \
 --transcode=True \
 --batch_size=16 --expansion_factor=$EF \
---optimizer=muon --lr=1e-3 \
+--optimizer=muon --lr=5e-4 \
 --k=$K \
 --hookpoints h.0.mlp h.1.mlp h.2.mlp h.3.mlp \
 --run_name gelu-4l-clt-sweep/k$K-x$EF$3 \
