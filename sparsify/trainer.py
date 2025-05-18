@@ -1,5 +1,5 @@
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager
 from dataclasses import asdict, replace
 from fnmatch import fnmatchcase
 from glob import glob
@@ -34,10 +34,6 @@ from .utils import (
 )
 
 ScheduleFreeWrapperType = (ScheduleFreeWrapper, ScheduleFreeWrapperReference)
-if not DISTRIBUTE_MODEL:
-
-    def implicit_replication():
-        return nullcontext()
 
 
 class Trainer:
@@ -79,7 +75,7 @@ class Trainer:
         self.dataset = dataset
 
         device = model.device
-        with implicit_replication():
+        with self.implicit_replication():
             input_widths = resolve_widths(
                 model, cfg.hookpoints, mesh=self.mesh if DISTRIBUTE_MODEL else None
             )
@@ -223,6 +219,7 @@ class Trainer:
         )
 
         self.model.eval()
+        # self.model.compile()
 
         barrier()
 
@@ -384,7 +381,7 @@ class Trainer:
             batch = next(iter(dl))
             x = self.input_ids_to_mesh(batch["input_ids"])
 
-            with implicit_replication():
+            with self.implicit_replication():
                 clean_loss = self.model(x, labels=x).loss
             if rank_zero:
                 print(f"Initial CE loss: {clean_loss.item():.4f}")
@@ -426,10 +423,13 @@ class Trainer:
             outputs = outputs.flatten(0, 1)
             inputs = inputs.flatten(0, 1) if self.cfg.sae.transcode else outputs
 
-            if self.mesh is not None and not DISTRIBUTE_MODEL:
-                inputs = DTensor.from_local(inputs, self.mesh, [Shard(0), Shard(0)])
+            if self.mesh is not None:
+                if not DISTRIBUTE_MODEL:
+                    inputs = DTensor.from_local(inputs, self.mesh, [Shard(0), Shard(0)])
+                    outputs = DTensor.from_local(
+                        outputs, self.mesh, [Shard(0), Shard(0)]
+                    )
                 inputs = inputs.redistribute(self.mesh, [Shard(0), Replicate()])
-                outputs = DTensor.from_local(outputs, self.mesh, [Shard(0), Shard(0)])
                 outputs = outputs.redistribute(self.mesh, [Shard(0), Shard(1)])
 
             # On the first iteration, initialize the encoder and decoder biases
@@ -592,7 +592,7 @@ class Trainer:
             num_tokens_in_step += N
 
             # Compute clean logits if using KL loss
-            with implicit_replication():
+            with self.implicit_replication():
                 clean_logits = (
                     self.model(x).logits if self.cfg.loss_fn == "kl" else None
                 )
@@ -605,7 +605,7 @@ class Trainer:
                 mod.register_forward_hook(hook) for mod in name_to_module.values()
             ]
             try:
-                with implicit_replication():
+                with self.implicit_replication():
                     barrier()
                     match self.cfg.loss_fn:
                         case "ce":
@@ -749,6 +749,15 @@ class Trainer:
             x /= self.mesh.shape[0]
 
         return x
+
+    @contextmanager
+    def implicit_replication(self):
+        if not DISTRIBUTE_MODEL or self.mesh is None:
+            yield
+        else:
+            # with context_parallel(self.mesh), implicit_replication():
+            with implicit_replication():
+                yield
 
     def _checkpoint(self, saes: dict[str, SparseCoder], path: str):
         """Save SAEs and training state to disk."""

@@ -1,0 +1,16 @@
+#!/bin/bash
+# export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:$LD_LIBRARY_PATH
+# export LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+# export PATH=/usr/local/cuda-12.8/bin:$PATH
+
+# WANDB_ENTITY=eleutherai  \
+SPARSIFY_DISTRIBUTE_MODEL=0 uv run torchrun --nproc_per_node=gpu -m sparsify \
+google/gemma-2-2b EleutherAI/fineweb-edu-dedup-10b \
+--ctx_len 128 \
+--transcode=True \
+--batch_size=2 --expansion_factor=32 \
+--k=128 \
+--run_name gemma-2-2b/$1 ${@:2} \
+--skip_connection=True \
+--tp=2 \
+--layers 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15

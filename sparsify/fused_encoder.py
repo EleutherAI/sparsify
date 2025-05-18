@@ -233,7 +233,7 @@ class FusedEncoder(torch.autograd.Function):
                 )
 
         # The k parameter is an int, so return None for its gradient.
-        return grad_input, grad_weight, grad_bias, None, None
+        return grad_input, grad_weight, grad_bias, None, None, None
 
 
 def fused_encoder(

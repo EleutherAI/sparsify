@@ -362,4 +362,33 @@ else:
         decoder_impl = triton_decode
 decoder_impl = parallelize_decoder(decoder_impl)
 
-DISTRIBUTE_MODEL: bool = False
+DISTRIBUTE_MODEL: bool = os.environ.get("SPARSIFY_DISTRIBUTE_MODEL", "0") == "1"
+if DISTRIBUTE_MODEL:
+
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    sdpa_val = ALL_ATTENTION_FUNCTIONS["sdpa"]
+
+    def new_sdpa(
+        module: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        dropout: float = 0.0,
+        scaling: Optional[float] = None,
+        is_causal: Optional[bool] = None,
+        **kwargs,
+    ):
+        return sdpa_val(
+            module,
+            query,
+            key,
+            value,
+            is_causal=True,
+            attention_mask=None,
+            scaling=scaling,
+            **kwargs,
+        )
+
+    ALL_ATTENTION_FUNCTIONS["sdpa"] = new_sdpa

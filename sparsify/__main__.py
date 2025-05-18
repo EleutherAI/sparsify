@@ -100,7 +100,9 @@ def load_artifacts(
     )
     if torch.distributed.is_initialized() and DISTRIBUTE_MODEL:
         # TODO: sdpa doesn't shard correctly
-        model.config._attn_implementation = "eager"
+        # model.config._attn_implementation = "eager"
+        pass
+    model.config.use_cache = False
 
     # For memmap-style datasets
     if args.dataset.endswith(".bin"):
