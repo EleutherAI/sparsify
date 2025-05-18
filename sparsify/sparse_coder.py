@@ -8,7 +8,7 @@ import einops
 import torch
 from huggingface_hub import snapshot_download
 from natsort import natsorted
-from safetensors.torch import load_model
+from safetensors.torch import load_file
 from torch import Tensor, nn
 from torch.distributed import tensor as dtensor
 from torch.distributed.tensor.device_mesh import DeviceMesh
@@ -437,23 +437,22 @@ class SparseCoder(nn.Module):
 
     def load_state(self, path: os.PathLike, strict: bool = True):
         filename = str(Path(path) / "sae.safetensors")
+        barrier()
         if self.mesh is None:
-            load_model(
-                model=self,
-                filename=filename,
+            state_dict = load_file(
+                filename,
                 device=str(self.device),
-                # TODO: Maybe be more fine-grained about this in the future?
-                strict=strict,
             )
         else:
-            barrier()
             state_dict = load_sharded(
                 filename,
                 self.state_dict(),
                 self.mesh,
             )
-            self.load_state_dict(state_dict, strict=strict)
-            barrier()
+        if "post_enc" not in state_dict:
+            state_dict["post_enc"] = self.post_enc.clone()
+        self.load_state_dict(state_dict, strict=strict)
+        barrier()
 
     def save_to_disk(self, path: Path | str):
         barrier()
