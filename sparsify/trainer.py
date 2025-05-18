@@ -21,6 +21,7 @@ from transformers import PreTrainedModel, get_linear_schedule_with_warmup
 from .config import TrainConfig
 from .data import MemmapDataset
 from .muon import Muon
+from .runner import CrossLayerRunner
 from .sign_sgd import SignSGD
 from .sparse_coder import ForwardOutput, SparseCoder
 from .utils import (
@@ -398,8 +399,7 @@ class Trainer:
         }
         module_to_name = {v: k for k, v in name_to_module.items()}
 
-        # maybe_wrapped: dict[str, DDP | SparseCoder | FSDP] = {}
-        layer_mids = {}
+        runner = CrossLayerRunner()
 
         def hook(module: nn.Module, inputs, outputs):
             barrier()
@@ -487,53 +487,24 @@ class Trainer:
             if raw.cfg.normalize_decoder and not self.cfg.sae.transcode:
                 raw.set_decoder_norm_to_unit_norm()
 
-            out_mid = wrapped(
-                x=inputs,
-                y=outputs,
+            out, output = runner.run(
+                inputs,
+                outputs,
+                sparse_coder=wrapped,
+                module_name=name,
+                detach_grad=self.cfg.loss_fn == "fvu",
                 dead_mask=(
                     self.num_tokens_since_fired[name] > self.cfg.dead_feature_threshold
                     if self.cfg.auxk_alpha > 0
                     else None
                 ),
-                return_mid_decoder=True,
-            )  # type: ignore
-            layer_mids[name] = out_mid
+            )
 
-            output = 0
-            to_delete = set()
-            out, hookpoint = None, None
-            to_restore = []
-            for hookpoint, layer_mid in layer_mids.items():
-                if self.cfg.loss_fn == "fvu":
-                    layer_mid.detach()
-                if layer_mid.sparse_coder.cfg.divide_cross_layer:
-                    divide_by = max(1, len(layer_mids) - 1)
-                else:
-                    divide_by = 1
-                out = layer_mid(
-                    outputs,
-                    addition=(0 if hookpoint != name else (output / divide_by)),
-                    no_extras=hookpoint != name,
-                    denormalize=hookpoint == name,
-                )
-                if self.cfg.loss_fn == "fvu":
-                    to_restore.append((layer_mid, out.is_last))
-                if hookpoint == name:
-                    output = out.sae_out
-                else:
-                    output += out.sae_out
-                if out.is_last:
-                    to_delete.add(hookpoint)
             if self.cfg.loss_fn == "fvu":
                 del output
             else:
                 assert isinstance(output, Tensor)
-            # last output guaranteed to be the current layer
-            assert hookpoint == name
             assert isinstance(out, ForwardOutput)
-
-            for hookpoint in to_delete:
-                del layer_mids[hookpoint]
 
             # Update the did_fire mask
             latent_indices = out.latent_indices.flatten()
@@ -573,18 +544,13 @@ class Trainer:
                 loss.div(acc_steps).backward()
             del loss
 
-            barrier()
-            for restorable, was_last in to_restore:
-                if was_last:
-                    restorable.restore(True)
-            barrier()
+            runner.restore()
 
         k = self.get_current_k()
         for name, sae in self.saes.items():
             sae.cfg.k = k
 
         for batch in dl:
-            barrier()
             x = self.input_ids_to_mesh(batch["input_ids"])
 
             # Bookkeeping for dead feature detection
@@ -635,7 +601,7 @@ class Trainer:
                 barrier()
                 for handle in handles:
                     handle.remove()
-                layer_mids.clear()
+                runner.reset()
 
             # Check if we need to actually do a training step
             step, substep = divmod(self.global_step + 1, self.cfg.grad_acc_steps)
