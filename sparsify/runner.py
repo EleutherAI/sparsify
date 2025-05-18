@@ -58,7 +58,7 @@ class CrossLayerRunner(object):
 
         for hookpoint in to_delete:
             del self.outputs[hookpoint]
-        return out, output
+        return out
 
     def __call__(
         self,
