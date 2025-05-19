@@ -38,6 +38,10 @@ class SparseCoderConfig(Serializable):
     n_targets: int = 0
     """Number of targets to predict. Only used if `transcode` is True."""
 
+    n_sources: int = 0
+    """Number of cross-layer sources writing to this layer. Only used if
+    `transcode` is True and `cross_layer` is not 0."""
+
     normalize_io: bool = False
     """Normalize the input and output of the sparse coder."""
 

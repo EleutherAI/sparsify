@@ -1,8 +1,9 @@
 import json
 import os
+from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import NamedTuple, Optional
+from typing import Optional
 
 import einops
 import torch
@@ -18,7 +19,8 @@ from .fused_encoder import EncoderOutput, fused_encoder
 from .utils import barrier, decoder_impl, load_sharded, save_sharded
 
 
-class ForwardOutput(NamedTuple):
+@dataclass
+class ForwardOutput:
     sae_out: Tensor
 
     latent_acts: Tensor
@@ -165,7 +167,10 @@ class MidDecoder:
         is_last = self.index >= self.sparse_coder.cfg.n_targets
 
         # Decode
-        sae_out = self.sparse_coder.decode(latent_acts, self.latent_indices, index)
+        if latent_acts is None and self.latent_indices is None:
+            sae_out = torch.zeros_like(self.x)
+        else:
+            sae_out = self.sparse_coder.decode(latent_acts, self.latent_indices, index)
         W_skip = (
             self.sparse_coder.W_skips[index]
             if hasattr(self.sparse_coder, "W_skips")
@@ -313,18 +318,26 @@ class SparseCoder(nn.Module):
             if cfg.transcode:
 
                 def create_W_dec():
+                    num_latents = self.num_latents
+                    if self.cfg.coalesce_topk == "per-layer":
+                        num_latents *= max(1, cfg.n_sources)
                     if mesh is not None:
                         result = dtensor.zeros(
-                            (self.num_latents, d_in),
+                            (num_latents, d_in),
                             dtype=dtype,
                             device_mesh=mesh,
                             placements=[dtensor.Replicate(), dtensor.Shard(1)],
                         )
                     else:
-                        result = torch.zeros_like(self.encoder.weight.data)
+                        result = torch.zeros(
+                            num_latents, d_in, device=device, dtype=dtype
+                        )
                     return nn.Parameter(result)
 
-                if self.multi_target and self.cfg.coalesce_topk != "concat":
+                if self.multi_target and self.cfg.coalesce_topk not in (
+                    "concat",
+                    "per-layer",
+                ):
                     self.W_decs = nn.ParameterList()
                     for _ in range(cfg.n_targets):
                         self.W_decs.append(create_W_dec())
@@ -365,7 +378,7 @@ class SparseCoder(nn.Module):
                 result = torch.zeros(self.d_in, self.d_in, device=device, dtype=dtype)
             return nn.Parameter(result)
 
-        if self.multi_target and self.cfg.coalesce_topk != "concat":
+        if self.multi_target and self.cfg.coalesce_topk not in ("concat", "per-layer"):
             self.b_decs = nn.ParameterList()
             self.W_skips = nn.ParameterList()
             for _ in range(cfg.n_targets):
@@ -557,6 +570,7 @@ class SparseCoder(nn.Module):
             return x * (self.out_norm / (x.shape[-1] ** 0.5))
         return x
 
+    @torch.compile
     def encode(self, x: Tensor) -> EncoderOutput:
         """Encode the input and select the top-k latents."""
         x = self.normalize_input(x)
@@ -572,6 +586,7 @@ class SparseCoder(nn.Module):
             self.cfg.activation,
         )
 
+    @torch.compile
     def decode(
         self,
         top_acts: Tensor | dtensor.DTensor,

@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import torch
 from torch import Tensor
 
@@ -83,10 +85,16 @@ class CrossLayerRunner(object):
             elif mid_out.sparse_coder.cfg.coalesce_topk == "per-layer":
                 for i, layer_mid in enumerate(layer_mids):
                     hookpoint = hookpoints[i]
+                    is_ours = hookpoint == module_name
+                    if not is_ours:
+                        continue
                     num_latents = layer_mid.sparse_coder.num_latents
-                    best_indices_local = best_indices % num_latents
-                    best_indices_mask = best_indices // num_latents == i
-                    best_values_local = best_values * best_indices_mask.float()
+                    if is_ours:
+                        best_indices_local = best_indices
+                        best_values_local = best_values
+                    else:
+                        best_indices_local = None
+                        best_values_local = None
                     new_mid_out = layer_mid.copy(
                         indices=best_indices_local,
                         activations=best_values_local,
@@ -101,6 +109,12 @@ class CrossLayerRunner(object):
                     )
                     if hookpoint != module_name:
                         output += out.sae_out
+                    else:
+                        out = replace(
+                            out,
+                            latent_indices=(out.latent_indices % num_latents)
+                            * (out.latent_indices // num_latents == i),
+                        )
             else:
                 raise ValueError("Not implemented")
 

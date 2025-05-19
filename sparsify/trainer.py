@@ -93,6 +93,7 @@ class Trainer:
         # Initialize all the SAEs
         print(f"Initializing SAEs with random seed(s) {cfg.init_seeds}")
         self.saes = {}
+        sources = []
         for position, hook in enumerate(
             self.cfg.hookpoints,
         ):
@@ -104,11 +105,17 @@ class Trainer:
                 if cfg.cross_layer > 0:
                     n_targets = cfg.cross_layer
                     n_targets = min(n_targets, len(self.cfg.hookpoints) - position)
+                    sources.append(position + n_targets)
+                    while sources[0] < position:
+                        sources.pop(0)
+                    n_sources = len(sources)
                 else:
                     n_targets = 0
+                    n_sources = 0
                 sae_cfg = replace(
                     cfg.sae,
                     n_targets=n_targets,
+                    n_sources=n_sources,
                 )
                 self.saes[name] = SparseCoder(
                     input_widths[hook], sae_cfg, device, dtype=torch.float32, mesh=mesh
