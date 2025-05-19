@@ -20,6 +20,8 @@ from transformers import PreTrainedModel, get_linear_schedule_with_warmup
 
 from .config import TrainConfig
 from .data import MemmapDataset
+
+# from .nanogpt import Muon
 from .muon import Muon
 from .runner import CrossLayerRunner
 from .sign_sgd import SignSGD
@@ -167,10 +169,8 @@ class Trainer:
                         muon_params,
                         # Muon LR is independent of the number of latents
                         lr=cfg.lr or 2e-3,
-                        # Muon distributes the work of the Newton-Schulz iterations
-                        # across all ranks for DDP but this doesn't make sense when
-                        # we're distributing modules across ranks
                         ddp=False,
+                        # group=None if self.mesh is None else self.mesh.get_group(0),
                     ),
                     torch.optim.Adam(params - muon_params, lr=cfg.lr or 2e-3),
                 ]
