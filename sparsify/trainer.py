@@ -101,17 +101,14 @@ class Trainer:
 
                 # Add suffix to the name to disambiguate multiple seeds
                 name = f"{hook}/seed{seed}" if len(cfg.init_seeds) > 1 else hook
+                if cfg.cross_layer > 0:
+                    n_targets = cfg.cross_layer
+                    n_targets = min(n_targets, len(self.cfg.hookpoints) - position)
+                else:
+                    n_targets = 0
                 sae_cfg = replace(
                     cfg.sae,
-                    n_targets=(
-                        min(
-                            cfg.cross_layer,
-                            len(self.cfg.hookpoints) - position - 1,
-                        )
-                        + 1
-                        if cfg.cross_layer > 0
-                        else 0
-                    ),
+                    n_targets=n_targets,
                 )
                 self.saes[name] = SparseCoder(
                     input_widths[hook], sae_cfg, device, dtype=torch.float32, mesh=mesh
@@ -382,8 +379,6 @@ class Trainer:
         denom = acc_steps * self.cfg.wandb_log_frequency
         num_tokens_in_step = 0
 
-        cross_layer = self.cfg.cross_layer > 0
-
         # For logging purposes
         avg_auxk_loss = defaultdict(float)
         avg_fvu = defaultdict(float)
@@ -480,7 +475,7 @@ class Trainer:
                     mean = DTensor.from_local(mean, self.mesh, [Replicate(), Shard(0)])
                 else:
                     mean = outputs.mean(0)
-                if not cross_layer:
+                if not hasattr(raw, "b_decs"):
                     raw.b_dec.data[:] = mean.to(raw.dtype)
                 else:
                     # the current layer must be what handles the bias,

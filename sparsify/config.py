@@ -47,6 +47,13 @@ class SparseCoderConfig(Serializable):
     train_post_encoder: bool = True
     """Train the post-encoder bias."""
 
+    coalesce_topk: Literal["none", "concat", "per-layer", "group"] = "none"
+    """How to combine values and indices across layers."""
+
+    @property
+    def do_coalesce_topk(self):
+        return self.coalesce_topk != "none"
+
 
 # Support different naming conventions for the same configuration
 SaeConfig = SparseCoderConfig
