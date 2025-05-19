@@ -24,8 +24,8 @@ CONTRIB_BATCH_SIZE = 4096
 
 
 class FusedEncoder(torch.autograd.Function):
-    @staticmethod
     @torch.compile
+    @staticmethod
     def forward(
         ctx,
         input,
@@ -163,8 +163,8 @@ class FusedEncoder(torch.autograd.Function):
         ctx.activation = activation
         return values, indices, preacts
 
-    @staticmethod
     @torch.compile
+    @staticmethod
     @torch.no_grad()
     def backward(ctx, grad_values, grad_indices, grad_preacts):
         input, weight, bias, indices = ctx.saved_tensors

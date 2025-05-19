@@ -20,6 +20,8 @@ from transformers import PreTrainedModel, get_linear_schedule_with_warmup
 
 from .config import TrainConfig
 from .data import MemmapDataset
+
+# from .nanogpt import Muon
 from .muon import Muon
 from .runner import CrossLayerRunner
 from .sign_sgd import SignSGD
@@ -93,6 +95,7 @@ class Trainer:
         # Initialize all the SAEs
         print(f"Initializing SAEs with random seed(s) {cfg.init_seeds}")
         self.saes = {}
+        sources = []
         for position, hook in enumerate(
             self.cfg.hookpoints,
         ):
@@ -101,17 +104,20 @@ class Trainer:
 
                 # Add suffix to the name to disambiguate multiple seeds
                 name = f"{hook}/seed{seed}" if len(cfg.init_seeds) > 1 else hook
+                if cfg.cross_layer > 0:
+                    n_targets = cfg.cross_layer
+                    n_targets = min(n_targets, len(self.cfg.hookpoints) - position)
+                    sources.append(position + n_targets)
+                    while sources[0] < position:
+                        sources.pop(0)
+                    n_sources = len(sources)
+                else:
+                    n_targets = 0
+                    n_sources = 0
                 sae_cfg = replace(
                     cfg.sae,
-                    n_targets=(
-                        min(
-                            cfg.cross_layer,
-                            len(self.cfg.hookpoints) - position - 1,
-                        )
-                        + 1
-                        if cfg.cross_layer > 0
-                        else 0
-                    ),
+                    n_targets=n_targets,
+                    n_sources=n_sources,
                 )
                 self.saes[name] = SparseCoder(
                     input_widths[hook], sae_cfg, device, dtype=torch.float32, mesh=mesh
@@ -163,10 +169,8 @@ class Trainer:
                         muon_params,
                         # Muon LR is independent of the number of latents
                         lr=cfg.lr or 2e-3,
-                        # Muon distributes the work of the Newton-Schulz iterations
-                        # across all ranks for DDP but this doesn't make sense when
-                        # we're distributing modules across ranks
                         ddp=False,
+                        # group=None if self.mesh is None else self.mesh.get_group(0),
                     ),
                     torch.optim.Adam(params - muon_params, lr=cfg.lr or 2e-3),
                 ]
@@ -382,8 +386,6 @@ class Trainer:
         denom = acc_steps * self.cfg.wandb_log_frequency
         num_tokens_in_step = 0
 
-        cross_layer = self.cfg.cross_layer > 0
-
         # For logging purposes
         avg_auxk_loss = defaultdict(float)
         avg_fvu = defaultdict(float)
@@ -480,7 +482,7 @@ class Trainer:
                     mean = DTensor.from_local(mean, self.mesh, [Replicate(), Shard(0)])
                 else:
                     mean = outputs.mean(0)
-                if not cross_layer:
+                if not hasattr(raw, "b_decs"):
                     raw.b_dec.data[:] = mean.to(raw.dtype)
                 else:
                     # the current layer must be what handles the bias,

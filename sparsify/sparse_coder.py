@@ -1,8 +1,9 @@
 import json
 import os
+from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import NamedTuple, Optional
+from typing import Optional
 
 import einops
 import torch
@@ -18,7 +19,8 @@ from .fused_encoder import EncoderOutput, fused_encoder
 from .utils import barrier, decoder_impl, load_sharded, save_sharded
 
 
-class ForwardOutput(NamedTuple):
+@dataclass
+class ForwardOutput:
     sae_out: Tensor
 
     latent_acts: Tensor
@@ -56,7 +58,29 @@ class MidDecoder:
         self.latent_indices = indices
         self.pre_acts = pre_acts
         self.dead_mask = dead_mask
-        self._index = 0
+        self.index = 0
+
+    def copy(
+        self,
+        x: Tensor | None = None,
+        activations: Tensor | None = None,
+        indices: Tensor | None = None,
+        pre_acts: Tensor | None = None,
+        dead_mask: Tensor | None = None,
+    ):
+        if x is None:
+            x = self.x
+        if activations is None:
+            activations = self.latent_acts
+        if indices is None:
+            indices = self.latent_indices
+        if pre_acts is None:
+            pre_acts = self.pre_acts
+        if dead_mask is None:
+            dead_mask = self.dead_mask
+        return MidDecoder(
+            self.sparse_coder, x, activations, indices, pre_acts, dead_mask
+        )
 
     def detach(self):
         if not hasattr(self, "original_activations"):
@@ -72,15 +96,57 @@ class MidDecoder:
         del self.original_activations
 
     def next(self):
-        self._index += 1
+        self.index += 1
+
+    @property
+    def will_be_last(self):
+        return self.index + 1 >= self.sparse_coder.cfg.n_targets
 
     @property
     def current_w_dec(self):
         return (
-            self.sparse_coder.W_decs[self._index]
+            self.sparse_coder.W_decs[self.index]
             if self.sparse_coder.multi_target
             else self.sparse_coder.W_dec
         )
+
+    @property
+    def current_latent_acts(self):
+        post_enc = (
+            self.sparse_coder.post_encs[self.index]
+            if self.sparse_coder.multi_target
+            else self.sparse_coder.post_enc
+        )
+
+        if self.sparse_coder.cfg.post_encoder_scale:
+            post_enc_scale = (
+                self.sparse_coder.post_enc_scales[self.index]
+                if self.sparse_coder.multi_target
+                else self.sparse_coder.post_enc_scale
+            )
+            if isinstance(post_enc_scale, dtensor.DTensor):
+                post_enc_scale = post_enc_scale.to_local()
+        else:
+            post_enc_scale = None
+
+        latent_acts = self.latent_acts
+        if isinstance(latent_acts, dtensor.DTensor):
+            latent_acts = latent_acts.to_local()
+            latent_indices = self.latent_indices.to_local()
+            post_enc = post_enc.to_local()
+            latent_acts = latent_acts + post_enc[latent_indices]
+            if post_enc_scale is not None:
+                latent_acts = latent_acts * post_enc_scale[latent_indices]
+            latent_acts = dtensor.DTensor.from_local(
+                latent_acts,
+                self.latent_acts.device_mesh,
+                placements=[dtensor.Shard(0), dtensor.Replicate()],
+            )
+        else:
+            latent_acts = latent_acts + post_enc[self.latent_indices]
+            if post_enc_scale is not None:
+                latent_acts = latent_acts * post_enc_scale[self.latent_indices]
+        return latent_acts
 
     @torch.autocast(
         "cuda",
@@ -94,6 +160,7 @@ class MidDecoder:
         addition: float | Tensor = 0,
         no_extras: bool = False,
         denormalize: bool = True,
+        add_post_enc: bool = True,
     ) -> ForwardOutput:
         # If we aren't given a distinct target, we're autoencoding
         if y is None:
@@ -104,35 +171,25 @@ class MidDecoder:
                 )
 
         assert isinstance(y, Tensor), "y must be a tensor."
-        if index is None:
-            index = self._index
-            self.next()
-        is_last = self._index >= self.sparse_coder.cfg.n_targets
-
-        post_enc = (
-            self.sparse_coder.post_encs[index]
-            if self.sparse_coder.multi_target
-            else self.sparse_coder.post_enc
-        )
-        latent_acts = self.latent_acts
-        if isinstance(latent_acts, dtensor.DTensor):
-            latent_acts = latent_acts.to_local()
-            latent_indices = self.latent_indices.to_local()
-            post_enc = post_enc.to_local()
-            latent_acts = latent_acts + post_enc[latent_indices]
-            latent_acts = dtensor.DTensor.from_local(
-                latent_acts,
-                self.latent_acts.device_mesh,
-                placements=[dtensor.Shard(0), dtensor.Replicate()],
-            )
+        if add_post_enc:
+            latent_acts = self.current_latent_acts
         else:
-            latent_acts = latent_acts + post_enc[self.latent_indices]
+            latent_acts = self.latent_acts
+        if index is None:
+            index = self.index
+            self.next()
+        else:
+            assert 0 <= index < self.sparse_coder.cfg.n_targets, "Index out of bounds."
+        is_last = self.index >= self.sparse_coder.cfg.n_targets
 
         # Decode
-        sae_out = self.sparse_coder.decode(latent_acts, self.latent_indices, index)
+        if latent_acts is None and self.latent_indices is None:
+            sae_out = torch.zeros_like(self.x)
+        else:
+            sae_out = self.sparse_coder.decode(latent_acts, self.latent_indices, index)
         W_skip = (
             self.sparse_coder.W_skips[index]
-            if self.sparse_coder.multi_target
+            if hasattr(self.sparse_coder, "W_skips")
             else self.sparse_coder.W_skip
         )
         if W_skip is not None:
@@ -277,18 +334,26 @@ class SparseCoder(nn.Module):
             if cfg.transcode:
 
                 def create_W_dec():
+                    num_latents = self.num_latents
+                    if self.cfg.coalesce_topk == "per-layer":
+                        num_latents *= max(1, cfg.n_sources)
                     if mesh is not None:
                         result = dtensor.zeros(
-                            (self.num_latents, d_in),
+                            (num_latents, d_in),
                             dtype=dtype,
                             device_mesh=mesh,
                             placements=[dtensor.Replicate(), dtensor.Shard(1)],
                         )
                     else:
-                        result = torch.zeros_like(self.encoder.weight.data)
+                        result = torch.zeros(
+                            num_latents, d_in, device=device, dtype=dtype
+                        )
                     return nn.Parameter(result)
 
-                if self.multi_target:
+                if self.multi_target and self.cfg.coalesce_topk not in (
+                    "concat",
+                    "per-layer",
+                ):
                     self.W_decs = nn.ParameterList()
                     for _ in range(cfg.n_targets):
                         self.W_decs.append(create_W_dec())
@@ -329,7 +394,7 @@ class SparseCoder(nn.Module):
                 result = torch.zeros(self.d_in, self.d_in, device=device, dtype=dtype)
             return nn.Parameter(result)
 
-        if self.multi_target:
+        if self.multi_target and self.cfg.coalesce_topk not in ("concat", "per-layer"):
             self.b_decs = nn.ParameterList()
             self.W_skips = nn.ParameterList()
             for _ in range(cfg.n_targets):
@@ -367,16 +432,18 @@ class SparseCoder(nn.Module):
                     "out_norm", torch.ones(1, device=device, dtype=dtype)
                 )
 
-        def make_post_enc():
+        def make_post_enc(is_zeros: bool = True):
             if mesh is not None:
-                post_enc = dtensor.zeros(
+                post_enc = (dtensor.zeros if is_zeros else dtensor.ones)(
                     (self.num_latents,),
                     dtype=dtype,
                     device_mesh=mesh,
                     placements=[dtensor.Replicate(), dtensor.Replicate()],
                 )
             else:
-                post_enc = torch.zeros(self.num_latents, device=device, dtype=dtype)
+                post_enc = (torch.zeros if is_zeros else torch.ones)(
+                    self.num_latents, device=device, dtype=dtype
+                )
             post_enc = nn.Parameter(post_enc, requires_grad=cfg.train_post_encoder)
             return post_enc
 
@@ -386,6 +453,14 @@ class SparseCoder(nn.Module):
                 self.post_encs.append(make_post_enc())
         else:
             self.post_enc = make_post_enc()
+
+        if self.cfg.post_encoder_scale:
+            if self.multi_target:
+                self.post_enc_scales = nn.ParameterList()
+                for _ in range(cfg.n_targets):
+                    self.post_enc_scales.append(make_post_enc(is_zeros=False))
+            else:
+                self.post_enc_scale = make_post_enc(is_zeros=False)
 
     @staticmethod
     def load_many(
@@ -524,6 +599,7 @@ class SparseCoder(nn.Module):
             return x * (self.out_norm / (x.shape[-1] ** 0.5))
         return x
 
+    @torch.compile
     def encode(self, x: Tensor) -> EncoderOutput:
         """Encode the input and select the top-k latents."""
         x = self.normalize_input(x)
@@ -539,14 +615,15 @@ class SparseCoder(nn.Module):
             self.cfg.activation,
         )
 
+    @torch.compile
     def decode(
         self,
         top_acts: Tensor | dtensor.DTensor,
         top_indices: Tensor | dtensor.DTensor,
         index: int = 0,
     ) -> Tensor:
-        W_dec = self.W_decs[index] if self.multi_target else self.W_dec
-        b_dec = self.b_decs[index] if self.multi_target else self.b_dec
+        W_dec = self.W_decs[index] if hasattr(self, "W_decs") else self.W_dec
+        b_dec = self.b_decs[index] if hasattr(self, "b_decs") else self.b_dec
 
         assert W_dec is not None, "Decoder weight was not initialized."
 

@@ -38,6 +38,10 @@ class SparseCoderConfig(Serializable):
     n_targets: int = 0
     """Number of targets to predict. Only used if `transcode` is True."""
 
+    n_sources: int = 0
+    """Number of cross-layer sources writing to this layer. Only used if
+    `transcode` is True and `cross_layer` is not 0."""
+
     normalize_io: bool = False
     """Normalize the input and output of the sparse coder."""
 
@@ -46,6 +50,19 @@ class SparseCoderConfig(Serializable):
 
     train_post_encoder: bool = True
     """Train the post-encoder bias."""
+
+    post_encoder_scale: bool = False
+    """Train a scale for post-encoder layers."""
+
+    coalesce_topk: Literal["none", "concat", "per-layer", "group"] = "none"
+    """How to combine values and indices across layers."""
+
+    topk_coalesced: bool = True
+    """Whether to actually apply topk to the coalesced values."""
+
+    @property
+    def do_coalesce_topk(self):
+        return self.coalesce_topk != "none"
 
 
 # Support different naming conventions for the same configuration
