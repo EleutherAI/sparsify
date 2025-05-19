@@ -114,7 +114,19 @@ class MidDecoder:
             if self.sparse_coder.multi_target
             else self.sparse_coder.post_enc
         )
-        latent_acts = self.latent_acts + post_enc[self.latent_indices]
+        latent_acts = self.latent_acts
+        if isinstance(latent_acts, dtensor.DTensor):
+            latent_acts = latent_acts.to_local()
+            latent_indices = self.latent_indices.to_local()
+            post_enc = post_enc.to_local()
+            latent_acts = latent_acts + post_enc[latent_indices]
+            latent_acts = dtensor.DTensor.from_local(
+                latent_acts,
+                self.latent_acts.device_mesh,
+                placements=[dtensor.Shard(0), dtensor.Replicate()],
+            )
+        else:
+            latent_acts = latent_acts + post_enc[self.latent_indices]
 
         # Decode
         sae_out = self.sparse_coder.decode(latent_acts, self.latent_indices, index)
@@ -361,7 +373,7 @@ class SparseCoder(nn.Module):
                     (self.num_latents,),
                     dtype=dtype,
                     device_mesh=mesh,
-                    placements=[dtensor.Replicate(), dtensor.Shard(0)],
+                    placements=[dtensor.Replicate(), dtensor.Replicate()],
                 )
             else:
                 post_enc = torch.zeros(self.num_latents, device=device, dtype=dtype)
