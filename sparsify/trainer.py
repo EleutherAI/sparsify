@@ -382,8 +382,6 @@ class Trainer:
         denom = acc_steps * self.cfg.wandb_log_frequency
         num_tokens_in_step = 0
 
-        cross_layer = self.cfg.cross_layer > 0
-
         # For logging purposes
         avg_auxk_loss = defaultdict(float)
         avg_fvu = defaultdict(float)
@@ -480,12 +478,7 @@ class Trainer:
                     mean = DTensor.from_local(mean, self.mesh, [Replicate(), Shard(0)])
                 else:
                     mean = outputs.mean(0)
-                if not cross_layer:
-                    raw.b_dec.data[:] = mean.to(raw.dtype)
-                else:
-                    # the current layer must be what handles the bias,
-                    # not the contributing previous layers
-                    raw.b_decs[0].data[:] = mean.to(raw.dtype)
+                raw.b_dec.data.view(-1, mean.shape[-1])[:, :] = mean.to(raw.dtype)
 
                 if raw.cfg.normalize_io:
                     in_norm = inputs.norm(dim=-1).mean()
