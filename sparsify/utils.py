@@ -219,7 +219,8 @@ def save_sharded(
         save_file(state_dict, filename)
     else:
         torch.save(state_dict, filename)
-    torch.distributed.barrier()
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
     print(f"Saved {filename}")
     return True
 
