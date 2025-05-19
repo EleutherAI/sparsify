@@ -70,10 +70,14 @@ class CrossLayerRunner(object):
         if mid_out.sparse_coder.cfg.do_coalesce_topk:
             candidate_indices = torch.cat(candidate_indices, dim=1)
             candidate_values = torch.cat(candidate_values, dim=1)
-            best_values, best_indices = torch.topk(
-                candidate_values, k=mid_out.sparse_coder.cfg.k, dim=1
-            )
-            best_indices = torch.gather(candidate_indices, 1, best_indices)
+            if mid_out.sparse_coder.cfg.topk_coalesced:
+                best_values, best_indices = torch.topk(
+                    candidate_values, k=mid_out.sparse_coder.cfg.k, dim=1
+                )
+                best_indices = torch.gather(candidate_indices, 1, best_indices)
+            else:
+                best_values = candidate_values
+                best_indices = candidate_indices
             if mid_out.sparse_coder.cfg.coalesce_topk == "concat":
                 best_indices = best_indices % mid_out.sparse_coder.num_latents
                 new_mid_out = mid_out.copy(

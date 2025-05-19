@@ -117,12 +117,26 @@ class MidDecoder:
             if self.sparse_coder.multi_target
             else self.sparse_coder.post_enc
         )
+
+        if self.sparse_coder.cfg.post_encoder_scale:
+            post_enc_scale = (
+                self.sparse_coder.post_enc_scales[self.index]
+                if self.sparse_coder.multi_target
+                else self.sparse_coder.post_enc_scale
+            )
+            if isinstance(post_enc_scale, dtensor.DTensor):
+                post_enc_scale = post_enc_scale.to_local()
+        else:
+            post_enc_scale = None
+
         latent_acts = self.latent_acts
         if isinstance(latent_acts, dtensor.DTensor):
             latent_acts = latent_acts.to_local()
             latent_indices = self.latent_indices.to_local()
             post_enc = post_enc.to_local()
             latent_acts = latent_acts + post_enc[latent_indices]
+            if post_enc_scale is not None:
+                latent_acts = latent_acts * post_enc_scale[latent_indices]
             latent_acts = dtensor.DTensor.from_local(
                 latent_acts,
                 self.latent_acts.device_mesh,
@@ -130,6 +144,8 @@ class MidDecoder:
             )
         else:
             latent_acts = latent_acts + post_enc[self.latent_indices]
+            if post_enc_scale is not None:
+                latent_acts = latent_acts * post_enc_scale[self.latent_indices]
         return latent_acts
 
     @torch.autocast(
@@ -416,16 +432,18 @@ class SparseCoder(nn.Module):
                     "out_norm", torch.ones(1, device=device, dtype=dtype)
                 )
 
-        def make_post_enc():
+        def make_post_enc(is_zeros: bool = True):
             if mesh is not None:
-                post_enc = dtensor.zeros(
+                post_enc = (dtensor.zeros if is_zeros else dtensor.ones)(
                     (self.num_latents,),
                     dtype=dtype,
                     device_mesh=mesh,
                     placements=[dtensor.Replicate(), dtensor.Replicate()],
                 )
             else:
-                post_enc = torch.zeros(self.num_latents, device=device, dtype=dtype)
+                post_enc = (torch.zeros if is_zeros else torch.ones)(
+                    self.num_latents, device=device, dtype=dtype
+                )
             post_enc = nn.Parameter(post_enc, requires_grad=cfg.train_post_encoder)
             return post_enc
 
@@ -435,6 +453,14 @@ class SparseCoder(nn.Module):
                 self.post_encs.append(make_post_enc())
         else:
             self.post_enc = make_post_enc()
+
+        if self.cfg.post_encoder_scale:
+            if self.multi_target:
+                self.post_enc_scales = nn.ParameterList()
+                for _ in range(cfg.n_targets):
+                    self.post_enc_scales.append(make_post_enc(is_zeros=False))
+            else:
+                self.post_enc_scale = make_post_enc(is_zeros=False)
 
     @staticmethod
     def load_many(
