@@ -560,12 +560,22 @@ class COODecoder(torch.autograd.Function):
     def forward(
         ctx, example_indices, feature_indices, feature_values, decoder_weight, N
     ):
+        sort_examples = False
+        if sort_examples:
+            example_sort = torch.argsort(example_indices)
+        else:
+            example_sort = None
+
         ctx.save_for_backward(
-            example_indices, feature_indices, feature_values, decoder_weight
+            example_indices,
+            feature_indices,
+            feature_values,
+            decoder_weight,
+            example_sort,
         )
         feature_values = feature_values.float()
-        if 0:
-            example_sort = torch.argsort(example_indices)
+
+        if sort_examples:
             example_indices = example_indices[example_sort]
             feature_indices = feature_indices[example_sort]
             feature_values = feature_values[example_sort]
@@ -578,15 +588,20 @@ class COODecoder(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        example_indices, feature_indices, feature_values, decoder_weight = (
-            ctx.saved_tensors
-        )
+        (
+            example_indices,
+            feature_indices,
+            feature_values,
+            decoder_weight,
+            example_sort,
+        ) = ctx.saved_tensors
 
         # print("backward")
         assert grad_output.is_contiguous(), "grad_output must be contiguous"
 
         feature_values = feature_values.float()
-        if 0:
+
+        if 1:
             feature_sort = torch.argsort(feature_indices)
             feature_values_ = feature_values[feature_sort]
             feature_indices_ = feature_indices[feature_sort]
@@ -595,6 +610,7 @@ class COODecoder(torch.autograd.Function):
             feature_values_ = feature_values
             feature_indices_ = feature_indices
             example_indices_ = example_indices
+
         decoder_grad = triton_coo_sparse_dense_matmul(
             torch.stack([example_indices_, feature_indices_]),
             feature_values_,
@@ -602,6 +618,9 @@ class COODecoder(torch.autograd.Function):
             N=decoder_weight.shape[1],
             # flip_indices=True
         ).T
+
+        # example_indices = example_indices[example_sort]
+        # feature_indices = feature_indices[example_sort]
 
         feature_grad = dense_dense_cooout_matmul(
             grad_output, decoder_weight, torch.stack([example_indices, feature_indices])

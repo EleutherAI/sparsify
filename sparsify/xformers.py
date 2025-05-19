@@ -22,10 +22,11 @@ def embedding_bag_k(
     for bag in range(0, bag_size):
         my_index = tl.load(indices_ptr + out_idx * bag_size + bag).to(tl.int64)
         my_scaling = tl.load(per_sample_weights + out_idx * bag_size + bag)
-        my_weight = tl.load(
-            weight_ptr + tl.arange(0, dim_padded) + my_index * dim, mask=dim_mask
-        )
-        out_value = out_value + my_weight.to(tl.float32) * my_scaling
+        if my_scaling != 0:
+            my_weight = tl.load(
+                weight_ptr + tl.arange(0, dim_padded) + my_index * dim, mask=dim_mask
+            )
+            out_value = out_value + my_weight.to(tl.float32) * my_scaling
     tl.store(
         out_ptr + out_idx * dim + tl.arange(0, dim_padded), out_value, mask=dim_mask
     )
@@ -120,15 +121,19 @@ def aggregate_gradient_for_embedding_k(
             batch_id = output_indice_id // bag_size
             output_indice_id % bag_size
             per_sample_w = tl.load(per_sample_weights_ptr + output_indice_id)
-            gradient = tl.load(
-                gradient_ptr + batch_id * dim + tl.arange(0, dim_padded), mask=dim_mask
-            ).to(tl.float32)
-            weight_grad = weight_grad + per_sample_w * gradient
-            per_sample_weights_grad = gradient * weight
-            per_sample_weights_grad = tl.sum(per_sample_weights_grad)
-            tl.store(
-                per_sample_weights_grad_ptr + output_indice_id, per_sample_weights_grad
-            )
+            # if per_sample_w != 0:
+            if True:
+                gradient = tl.load(
+                    gradient_ptr + batch_id * dim + tl.arange(0, dim_padded),
+                    mask=dim_mask,
+                ).to(tl.float32)
+                weight_grad = weight_grad + per_sample_w * gradient
+                per_sample_weights_grad = gradient * weight
+                per_sample_weights_grad = tl.sum(per_sample_weights_grad)
+                tl.store(
+                    per_sample_weights_grad_ptr + output_indice_id,
+                    per_sample_weights_grad,
+                )
         tl.store(
             weight_grad_ptr + embedding_id * dim + tl.arange(0, dim_padded),
             weight_grad,

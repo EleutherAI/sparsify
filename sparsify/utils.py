@@ -297,6 +297,15 @@ def eager_decode(top_indices: Tensor, top_acts: Tensor, W_dec: Tensor):
 
 # Triton implementation of SAE decoder
 def triton_decode(top_indices: Tensor, top_acts: Tensor, W_dec: Tensor):
+    if 1:
+        example_indices, feature_indices = top_indices.nonzero(as_tuple=True)
+        return COODecoder.apply(
+            example_indices,
+            feature_indices,
+            top_acts[example_indices, feature_indices],
+            W_dec.T,
+            top_indices.shape[0],
+        )
     return xformers_embedding_bag(top_indices, W_dec, top_acts)
 
 
@@ -350,6 +359,7 @@ def parallelize_decoder(decoder):
 
 
 try:
+    from .kernels import COODecoder
     from .xformers import xformers_embedding_bag
 except ImportError:
     decoder_impl = eager_decode

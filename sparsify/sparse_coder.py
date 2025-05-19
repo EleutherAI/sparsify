@@ -130,6 +130,7 @@ class MidDecoder:
             latent_acts = latent_acts + post_enc[self.latent_indices]
         return latent_acts
 
+    @torch.compile
     @torch.autocast(
         "cuda",
         dtype=torch.bfloat16,
@@ -557,6 +558,7 @@ class SparseCoder(nn.Module):
             return x * (self.out_norm / (x.shape[-1] ** 0.5))
         return x
 
+    @torch.compile
     def encode(self, x: Tensor) -> EncoderOutput:
         """Encode the input and select the top-k latents."""
         x = self.normalize_input(x)
@@ -572,6 +574,7 @@ class SparseCoder(nn.Module):
             self.cfg.activation,
         )
 
+    @torch.compile
     def decode(
         self,
         top_acts: Tensor | dtensor.DTensor,
