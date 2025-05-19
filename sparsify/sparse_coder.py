@@ -478,8 +478,11 @@ class SparseCoder(nn.Module):
                 self.state_dict(),
                 self.mesh,
             )
-        if "post_enc" not in state_dict:
+        if hasattr(self, "post_enc") and "post_enc" not in state_dict:
             state_dict["post_enc"] = self.post_enc.clone()
+        if hasattr(self, "post_encs") and "post_encs" not in state_dict:
+            for i, post_enc in enumerate(self.post_encs):
+                state_dict[f"post_encs.{i}"] = post_enc.clone()
         self.load_state_dict(state_dict, strict=strict)
         barrier()
 

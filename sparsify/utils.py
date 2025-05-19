@@ -287,6 +287,7 @@ def load_sharded(
     }
     if not load_st:
         state_dict = unflatten_dict(state_dict)
+    print(f"Loaded {filename}")
     return state_dict
 
 
