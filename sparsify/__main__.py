@@ -97,6 +97,7 @@ def load_artifacts(
         torch_dtype=dtype,
         token=args.hf_token,
     )
+    model.to(f"cuda:{rank}")
 
     # For memmap-style datasets
     if args.dataset.endswith(".bin"):

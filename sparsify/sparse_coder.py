@@ -12,6 +12,7 @@ from torch import Tensor, nn
 
 from .config import SparseCoderConfig
 from .utils import decoder_impl
+from .fused_encoder import fused_encoder
 
 
 class EncoderOutput(NamedTuple):
@@ -244,7 +245,7 @@ class SparseCoder(nn.Module):
         if self.cfg.optimized_encoder_config.is_not_none:
             sae_in = self.input_preprocess(x)
             return self.encoder.topk(sae_in, k)
-        return self.select_topk(self.pre_acts(x), k)
+        return fused_encoder(x, self.encoder.weight, self.encoder.bias, k, self.cfg.activation)[:2]
 
     def decode(self, top_acts: Tensor, top_indices: Tensor) -> Tensor:
         assert self.W_dec is not None, "Decoder weight was not initialized."
