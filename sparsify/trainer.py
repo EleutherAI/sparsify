@@ -567,9 +567,16 @@ class Trainer:
 
             runner.restore()
 
-        k = self.get_current_k()
-        for name, sae in self.saes.items():
-            sae.cfg.k = k
+        if self.cfg.per_layer_k:
+            assert len(self.cfg.per_layer_k) == len(
+                self.saes
+            ), "Must specify a k for each layer"
+            for i, sae in enumerate(self.saes.values()):
+                sae.cfg.k = self.cfg.per_layer_k[i]
+        else:
+            k = self.get_current_k()
+            for name, sae in self.saes.items():
+                sae.cfg.k = k
 
         for batch in dl:
             x = self.input_ids_to_mesh(batch["input_ids"])

@@ -127,6 +127,9 @@ class TrainConfig(Serializable):
     layers: list[int] = list_field()
     """List of layer indices to train sparse coders on."""
 
+    per_layer_k: list[int] = list_field()
+    """List of k values to use for each layer."""
+
     layer_stride: int = 1
     """Stride between layers to train sparse coders on."""
 
