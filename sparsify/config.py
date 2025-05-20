@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Literal
 
-from simple_parsing import Serializable, list_field
+from simple_parsing import Serializable, list_field, field
 
 from .optimized_encoders import KroneckerConfig, OptimizedEncoderConfig, PKMConfig
 
@@ -40,10 +40,10 @@ class SparseCoderConfig(Serializable):
     optimized_encoder_config: OptimizedEncoderConfig = OptimizedEncoderConfig.None_
     """Configuration for an optimized encoder."""
 
-    pkm_config: PKMConfig = PKMConfig()
+    pkm_config: PKMConfig = field(default_factory=PKMConfig)
     """Configuration for the PKM encoder."""
 
-    kronecker_config: KroneckerConfig = KroneckerConfig()
+    kronecker_config: KroneckerConfig = field(default_factory=KroneckerConfig)
     """Configuration for the Kronecker encoder."""
 
 
