@@ -186,7 +186,13 @@ class MidDecoder:
         if latent_acts is None and self.latent_indices is None:
             sae_out = torch.zeros_like(self.x)
         else:
-            sae_out = self.sparse_coder.decode(latent_acts, self.latent_indices, index)
+            latent_indices = self.latent_indices
+            if isinstance(latent_indices, dtensor.DTensor):
+                latent_indices = latent_indices.redistribute(
+                    latent_indices.device_mesh,
+                    [dtensor.Shard(0), dtensor.Replicate()],
+                )
+            sae_out = self.sparse_coder.decode(latent_acts, latent_indices, index)
         W_skip = (
             self.sparse_coder.W_skips[index]
             if hasattr(self.sparse_coder, "W_skips")
@@ -615,7 +621,6 @@ class SparseCoder(nn.Module):
             self.cfg.activation,
         )
 
-    @torch.compile
     def decode(
         self,
         top_acts: Tensor | dtensor.DTensor,

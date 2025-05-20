@@ -495,7 +495,7 @@ class Trainer:
 
                     raw.in_norm.data[:] = in_norm
                     raw.out_norm.data[:] = out_norm
-                    for b_dec in raw.b_decs if raw.multi_target else [raw.b_dec]:
+                    for b_dec in raw.b_decs if hasattr(raw, "b_decs") else [raw.b_dec]:
                         b_dec.data[:] = b_dec.data * (
                             (b_dec.shape[-1] ** 0.5) / out_norm
                         )

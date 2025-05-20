@@ -2,6 +2,8 @@ from dataclasses import replace
 
 import torch
 from torch import Tensor
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.experimental import local_map
 
 from .sparse_coder import MidDecoder, SparseCoder
 
@@ -71,10 +73,27 @@ class CrossLayerRunner(object):
             candidate_indices = torch.cat(candidate_indices, dim=1)
             candidate_values = torch.cat(candidate_values, dim=1)
             if mid_out.sparse_coder.cfg.topk_coalesced:
-                best_values, best_indices = torch.topk(
-                    candidate_values, k=mid_out.sparse_coder.cfg.k, dim=1
-                )
-                best_indices = torch.gather(candidate_indices, 1, best_indices)
+                if isinstance(candidate_values, DTensor):
+
+                    def mapper(candidate_values, candidate_indices):
+                        best_values, best_indices = torch.topk(
+                            candidate_values, k=mid_out.sparse_coder.cfg.k, dim=1
+                        )
+                        best_indices = torch.gather(candidate_indices, 1, best_indices)
+                        return best_values, best_indices
+
+                    best_values, best_indices = local_map(
+                        mapper,
+                        out_placements=(
+                            candidate_values.placements,
+                            candidate_indices.placements,
+                        ),
+                    )(candidate_values, candidate_indices)
+                else:
+                    best_values, best_indices = torch.topk(
+                        candidate_values, k=mid_out.sparse_coder.cfg.k, dim=1
+                    )
+                    best_indices = torch.gather(candidate_indices, 1, best_indices)
             else:
                 best_values = candidate_values
                 best_indices = candidate_indices
@@ -114,11 +133,21 @@ class CrossLayerRunner(object):
                     if hookpoint != module_name:
                         output += out.sae_out
                     else:
-                        out = replace(
-                            out,
-                            latent_indices=(out.latent_indices % num_latents)
-                            * (out.latent_indices // num_latents == i),
-                        )
+                        if isinstance(out.latent_indices, DTensor):
+                            out = replace(
+                                out,
+                                latent_indices=local_map(
+                                    lambda x: (x % num_latents)
+                                    * (x // num_latents == i),
+                                    out_placements=(out.latent_indices.placements,),
+                                )(out.latent_indices),
+                            )
+                        else:
+                            out = replace(
+                                out,
+                                latent_indices=(out.latent_indices % num_latents)
+                                * (out.latent_indices // num_latents == i),
+                            )
             else:
                 raise ValueError("Not implemented")
 
