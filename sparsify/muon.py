@@ -6,6 +6,7 @@ Modifications by Nora Belrose
 import torch
 import torch.distributed as dist
 from torch import Tensor
+from torch.distributed.tensor import DTensor
 
 
 def quintic_newtonschulz(G: Tensor, steps: int) -> Tensor:
@@ -38,6 +39,12 @@ def quintic_newtonschulz(G: Tensor, steps: int) -> Tensor:
     if G.size(-2) > G.size(-1):
         X = X.mT
     return X
+
+
+def ploc(p: Tensor) -> Tensor:
+    if isinstance(p, DTensor):
+        return p.to_local()
+    return p
 
 
 class Muon(torch.optim.Optimizer):
@@ -75,6 +82,7 @@ class Muon(torch.optim.Optimizer):
         weight_decay: float = 0.1,
         ns_steps: int = 5,
         ddp: bool = True,
+        group: dist.ProcessGroup | None = None,
     ):
         defaults = dict(
             lr=lr,
@@ -83,8 +91,14 @@ class Muon(torch.optim.Optimizer):
             ns_steps=ns_steps,
             weight_decay=weight_decay,
         )
-        self.rank = dist.get_rank() if dist.is_initialized() and ddp else 0
-        self.world_size = dist.get_world_size() if dist.is_initialized() and ddp else 1
+        if group is None:
+            self.rank = dist.get_rank() if dist.is_initialized() and ddp else 0
+            self.world_size = (
+                dist.get_world_size() if dist.is_initialized() and ddp else 1
+            )
+        else:
+            self.rank = group.rank()
+            self.world_size = group.size()
 
         # Distributed Data Parallel (DDP) setup
         if dist.is_initialized() and ddp:
@@ -97,12 +111,12 @@ class Muon(torch.optim.Optimizer):
 
             # Group parameters by their device and number of elements. For each group,
             # we pre-allocate a buffer to store the updates from all ranks.
-            for size in {p.numel() for p in params}:
+            for size in {ploc(p.data).numel() for p in params}:
                 b = torch.empty(
                     self.world_size, size, dtype=torch.bfloat16, device=device
                 )
                 group = dict(
-                    params=[p for p in params if p.numel() == size],
+                    params=[p for p in params if ploc(p.data).numel() == size],
                     update_buffer=b,
                     update_buffer_views=[b[i] for i in range(self.world_size)],
                 )
@@ -121,6 +135,7 @@ class Muon(torch.optim.Optimizer):
             # communication, since it's a simple element-wise operation.
             if group["weight_decay"] > 0.0:
                 for p in params:
+                    p = ploc(p.data)
                     p.mul_(1 - group["lr"] * group["weight_decay"])
 
             # These will be None / empty list if we're not using DDP
@@ -137,8 +152,10 @@ class Muon(torch.optim.Optimizer):
 
                 for p_world, g_world in zip(params_world, update_buffer_views):
                     # Heuristic from <https://arxiv.org/abs/2502.16982>
-                    scale = 0.2 * max(p_world.shape) ** 0.5
-                    p_world.add_(g_world.view_as(p_world), alpha=-group["lr"] * scale)
+                    scale = 0.2 * max(ploc(p_world.data).shape) ** 0.5
+                    ploc(p_world.data).add_(
+                        g_world.view_as(p_world), alpha=-group["lr"] * scale
+                    )
 
             for i in range(0, len(params), self.world_size):
                 # Compute Muon update
@@ -147,6 +164,8 @@ class Muon(torch.optim.Optimizer):
                     state = self.state[p]
 
                     g = p.grad
+                    g = ploc(g)
+                    p = ploc(p.data)
                     assert (
                         g is not None
                     ), f"Parameter {i + self.rank} (shape: {p.shape}) has no gradient."
@@ -177,7 +196,7 @@ class Muon(torch.optim.Optimizer):
                     params_world = params[i : i + self.world_size]
                 else:
                     scale = 0.2 * max(params[i].shape) ** 0.5
-                    params[i].add_(g, alpha=-group["lr"] * scale)
+                    ploc(params[i].data).add_(g, alpha=-group["lr"] * scale)
 
             if self.world_size > 1:
                 update_prev()

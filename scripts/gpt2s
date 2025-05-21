@@ -8,10 +8,12 @@
 # --run_name clt-gpt2/$1 ${@:2}
 # exit
 set -e
-WANDB_ENTITY=eleutherai uv run torchrun --master_port $RANDOM --nproc_per_node gpu -m sparsify \
+PORT=$RANDOM
+PORT=$((PORT + 1000))
+WANDB_ENTITY=eleutherai uv run torchrun --master_port $PORT --nproc_per_node gpu -m sparsify \
 openai-community/gpt2 --ctx_len 1024 \
 --transcode=True --skip_connection=True \
---batch_size=8 --expansion_factor=128 --tp=3 \
+--batch_size=4 --expansion_factor=128 --tp=3 \
 --hookpoints h.0.mlp h.1.mlp h.2.mlp h.3.mlp h.4.mlp h.5.mlp h.6.mlp h.7.mlp h.8.mlp h.9.mlp h.10.mlp h.11.mlp \
 --run_name clt-gpt2/$1 ${@:2} \
 --cross_layer=12 \

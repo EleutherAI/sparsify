@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.distributed.tensor import DTensor
 
 # Custom operators: FP8 matmul by @YouJiacheng
 
@@ -138,6 +139,12 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     return X
 
 
+def ploc(p: Tensor) -> Tensor:
+    if isinstance(p, DTensor):
+        return p.to_local()
+    return p
+
+
 class Muon(torch.optim.Optimizer):
     """
     Muon - MomentUm Orthogonalized by Newton-schulz
@@ -185,10 +192,10 @@ class Muon(torch.optim.Optimizer):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
         params: list[Tensor] = [*params]
         param_groups = []
-        for size in {p.numel() for p in params}:
+        for size in {ploc(p.data).numel() for p in params}:
             b = torch.empty(self.world_size, size, dtype=torch.bfloat16, device="cuda")
             group = dict(
-                params=[p for p in params if p.numel() == size],
+                params=[p for p in params if ploc(p.data).numel() == size],
                 update_buffer=b,
                 update_buffer_views=[b[i] for i in range(self.world_size)],
             )
@@ -210,6 +217,7 @@ class Muon(torch.optim.Optimizer):
                 if handle is not None:
                     handle.wait()
                 for p_world, g_world in zip(params_world, update_buffer_views):
+                    p_world = ploc(p_world.data)
                     p_world.add_(
                         g_world.view_as(p_world),
                         alpha=-group["lr"]
@@ -220,6 +228,8 @@ class Muon(torch.optim.Optimizer):
                 if base_i + self.rank < len(params):
                     p = params[base_i + self.rank]
                     g = p.grad
+                    p = ploc(p.data)
+                    g = ploc(g)
                     assert g is not None
                     state = self.state[p]
                     if "momentum_buffer" not in state:

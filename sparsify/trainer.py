@@ -169,8 +169,8 @@ class Trainer:
                         muon_params,
                         # Muon LR is independent of the number of latents
                         lr=cfg.lr or 2e-3,
-                        ddp=False,
-                        # group=None if self.mesh is None else self.mesh.get_group(0),
+                        ddp=True,
+                        group=None if self.mesh is None else self.mesh.get_group(0),
                     ),
                     torch.optim.Adam(params - muon_params, lr=cfg.lr or 2e-3),
                 ]
