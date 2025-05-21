@@ -313,6 +313,18 @@ class Trainer:
         progress = self.global_step / self.cfg.k_decay_steps
         return round(self.initial_k * (1 - progress) + self.final_k * progress)
 
+    def set_correct_k(self):
+        if self.cfg.per_layer_k:
+            assert len(self.cfg.per_layer_k) == len(
+                self.saes
+            ), "Must specify a k for each layer"
+            for i, sae in enumerate(self.saes.values()):
+                sae.cfg.k = self.cfg.per_layer_k[i]
+        else:
+            k = self.get_current_k()
+            for sae in self.saes.values():
+                sae.cfg.k = k
+
     def fit(self):
         # Use Tensor Cores even for fp32 matmuls
         torch.set_float32_matmul_precision("high")
@@ -567,17 +579,6 @@ class Trainer:
 
             runner.restore()
 
-        if self.cfg.per_layer_k:
-            assert len(self.cfg.per_layer_k) == len(
-                self.saes
-            ), "Must specify a k for each layer"
-            for i, sae in enumerate(self.saes.values()):
-                sae.cfg.k = self.cfg.per_layer_k[i]
-        else:
-            k = self.get_current_k()
-            for name, sae in self.saes.items():
-                sae.cfg.k = k
-
         for batch in dl:
             x = self.input_ids_to_mesh(batch["input_ids"])
 
@@ -645,9 +646,7 @@ class Trainer:
                 for scheduler in self.lr_schedulers:
                     scheduler.step()
 
-                k = self.get_current_k()
-                for name, sae in self.saes.items():
-                    sae.cfg.k = k
+                self.set_correct_k()
 
                 ###############
                 with torch.no_grad():
@@ -694,7 +693,7 @@ class Trainer:
                             info[f"multi_topk_fvu/{name}"] = avg_multi_topk_fvu[name]
 
                     if rank_zero:
-                        info["k"] = k
+                        info["k"] = self.get_current_k()
 
                         if wandb is not None:
                             wandb.log(info, step=step)
