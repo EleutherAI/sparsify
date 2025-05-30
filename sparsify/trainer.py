@@ -1,3 +1,4 @@
+import os
 from collections import defaultdict
 from dataclasses import asdict
 from fnmatch import fnmatchcase
@@ -246,8 +247,9 @@ class Trainer:
                 import wandb
 
                 wandb.init(
+                    entity=os.environ.get("WANDB_ENTITY", None),
                     name=self.cfg.run_name,
-                    project="sparsify",
+                    project=os.environ.get("WANDB_PROJECT", "sparsify"),
                     config=asdict(self.cfg),
                     save_code=True,
                 )
