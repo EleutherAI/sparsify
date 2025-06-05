@@ -1,6 +1,7 @@
 from typing import Literal, NamedTuple
 
 import torch
+from torch import Tensor
 import torch.nn.functional as F
 
 
@@ -18,7 +19,7 @@ class EncoderOutput(NamedTuple):
 class FusedEncoder(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx, input, weight, bias, k: int, activation: Literal["groupmax", "topk"]
+        ctx, input, weight, bias, k: int, activation: Literal["groupmax", "topk"], banned: Tensor | None = None
     ):
         """
         input:  (N, D)
@@ -27,6 +28,8 @@ class FusedEncoder(torch.autograd.Function):
         k:      int (number of top elements to select along dim=1)
         """
         preacts = F.relu(F.linear(input, weight, bias))
+        if banned is not None:
+            preacts.scatter_(1, banned, -float("inf"))
 
         # Get top-k values and indices for each row
         if activation == "topk":
@@ -84,7 +87,7 @@ class FusedEncoder(torch.autograd.Function):
             )
 
         # The k parameter is an int, so return None for its gradient.
-        return grad_input, grad_weight, grad_bias, None, None
+        return grad_input, grad_weight, grad_bias, None, None, None
 
 
 def fused_encoder(
@@ -93,11 +96,12 @@ def fused_encoder(
     bias,
     k: int,
     activation: Literal["groupmax", "topk"],
+    banned: Tensor | None = None,
 ) -> EncoderOutput:
     """
     Convenience wrapper that performs an nn.Linear followed by `activation` with
     a backward pass optimized using index_add.
     """
     return EncoderOutput(
-        *FusedEncoder.apply(input, weight, bias, k, activation)  # type: ignore
+        *FusedEncoder.apply(input, weight, bias, k, activation, banned)  # type: ignore
     )

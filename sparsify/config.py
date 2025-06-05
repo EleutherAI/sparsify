@@ -17,7 +17,7 @@ class SparseCoderConfig(Serializable):
     expansion_factor: int = 32
     """Multiple of the input dimension to use as the sparse coder dimension."""
 
-    normalize_decoder: bool = True
+    normalize_decoder: bool = False
     """Normalize the decoder weights to have unit norm."""
 
     num_latents: int = 0
@@ -37,6 +37,21 @@ class SparseCoderConfig(Serializable):
 
     matching_pursuit: bool = False
     """Use matching pursuit to find the sparse coders."""
+    
+    mp_detach: bool = False
+    """Detach the residual before passing it to the per-step encoder."""
+    
+    mp_untie: bool = True
+    """Untie transcoder decoder weights."""
+    
+    per_step_loss: bool = False
+    """Use a per-step loss instead of a global loss."""
+    
+    slice_encoder: bool = False
+    """Use a separate slice of the encoder for each step of matching pursuit."""
+    
+    slice_decoder: bool = False
+    """Use a separate slice of the decoder for each step of matching pursuit."""
 
 
 # Support different naming conventions for the same configuration

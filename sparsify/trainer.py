@@ -385,7 +385,7 @@ class Trainer:
                 raw.b_dec.data = mean.to(raw.dtype)
 
             # Make sure the W_dec is still unit-norm if we're autoencoding
-            if raw.cfg.normalize_decoder and not self.cfg.sae.transcode:
+            if raw.cfg.normalize_decoder:
                 raw.set_decoder_norm_to_unit_norm()
 
             wrapped = maybe_wrapped[name]

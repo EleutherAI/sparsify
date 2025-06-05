@@ -13,6 +13,7 @@ from torch import Tensor, nn
 from .config import SparseCoderConfig
 from .fused_encoder import EncoderOutput, fused_encoder
 from .utils import decoder_impl
+from .kernels import DenseDenseSparseOutMatmul
 
 
 class ForwardOutput(NamedTuple):
@@ -49,13 +50,21 @@ class SparseCoder(nn.Module):
         self.d_in = d_in
         self.num_latents = cfg.num_latents or d_in * cfg.expansion_factor
 
-        self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
+        encoder_num_latents, decoder_num_latents = self.num_latents, self.num_latents
+        if cfg.slice_encoder and not cfg.slice_decoder:
+            encoder_num_latents = encoder_num_latents * cfg.k
+        elif not cfg.slice_encoder and cfg.slice_decoder:
+            decoder_num_latents = decoder_num_latents * cfg.k
+        self.encoder_slice_size = encoder_num_latents // cfg.k
+        self.decoder_slice_size = decoder_num_latents // cfg.k
+
+        self.encoder = nn.Linear(d_in, encoder_num_latents, device=device, dtype=dtype)
         self.encoder.bias.data.zero_()
 
         if decoder:
             # Transcoder initialization: use zeros
             if cfg.transcode:
-                self.W_dec = nn.Parameter(torch.zeros_like(self.encoder.weight.data))
+                self.W_dec = nn.Parameter(torch.zeros((decoder_num_latents, d_in), device=device, dtype=dtype))
 
             # Sparse autoencoder initialization: use the transpose of encoder weights
             else:
@@ -64,8 +73,16 @@ class SparseCoder(nn.Module):
                     self.set_decoder_norm_to_unit_norm()
         else:
             self.W_dec = None
-
+        
         self.b_dec = nn.Parameter(torch.zeros(d_in, dtype=dtype, device=device))
+
+        if cfg.transcode and cfg.matching_pursuit and cfg.mp_untie:
+            self.W_dec_2 = nn.Parameter(torch.zeros_like(self.encoder.weight.data))
+            self.b_dec_2 = nn.Parameter(torch.zeros(d_in, dtype=dtype, device=device))
+        else:
+            self.W_dec_2 = self.W_dec
+            self.b_dec_2 = self.b_dec
+
         self.W_skip = (
             nn.Parameter(torch.zeros(d_in, d_in, device=device, dtype=dtype))
             if cfg.skip_connection
@@ -176,21 +193,70 @@ class SparseCoder(nn.Module):
     def dtype(self):
         return self.encoder.weight.dtype
 
-    def encode(self, x: Tensor) -> EncoderOutput:
+    def encode_single(self, x: Tensor, k: int = None, banned: Tensor | None = None, start: int | None = None, end: int | None = None) -> EncoderOutput:
         """Encode the input and select the top-k latents."""
         
         if not self.cfg.transcode:
             x = x - self.b_dec
-    
+            
+        if start is None:
+            start = 0
+        if end is None:
+            end = self.encoder.weight.shape[0]
+        weight = self.encoder.weight[start:end]
+        bias = self.encoder.bias[start:end]
         return fused_encoder(
-            x, self.encoder.weight, self.encoder.bias, self.cfg.k, self.cfg.activation
+            x, weight, bias, k, self.cfg.activation, banned=banned
         )
-        
-    def decode(self, top_acts: Tensor, top_indices: Tensor) -> Tensor:
-        assert self.W_dec is not None, "Decoder weight was not initialized."
-        y = decoder_impl(top_indices, top_acts.to(self.dtype), self.W_dec.mT)
+    
+    @torch.compile
+    def encode(self, x: Tensor, k: int | None = None) -> EncoderOutput:
+        if k is None:
+            k = self.cfg.k
         if not self.cfg.matching_pursuit:
-            y += self.b_dec
+            return self.encode_single(x, k)
+        else:
+            sae_out = torch.zeros_like(x)
+            sae_out += self.b_dec_2
+            all_acts, all_indices = [], []
+            banned_indices = []
+            for i in range(self.cfg.k):
+                residual = x - sae_out
+                if self.cfg.mp_detach:
+                    residual = residual.detach()
+                # Encode
+                encoding = self.encode_single(
+                    residual,
+                    k=1,
+                    banned=torch.cat(banned_indices, dim=-1) if banned_indices else None,
+                    start=None if not self.cfg.slice_encoder else i * self.encoder_slice_size,
+                    end=None if not self.cfg.slice_encoder else (i + 1) * self.encoder_slice_size,
+                )
+                top_act, top_index = encoding.top_acts, encoding.top_indices
+                if not self.cfg.slice_encoder:
+                    banned_indices.append(top_index)
+                else:
+                    if self.cfg.slice_decoder:
+                        top_index = top_index + i * self.decoder_slice_size
+                all_acts.append(top_act)
+                all_indices.append(top_index)
+                # Decode
+                if i != self.cfg.k - 1: 
+                    sae_out += self.decode(top_act, top_index, secondary=True, use_bias=True)
+            top_acts = torch.cat(all_acts, dim=-1)
+            top_indices = torch.cat(all_indices, dim=-1)
+            top_acts = top_acts + (top_acts - top_acts.detach())
+            return EncoderOutput(top_acts, top_indices, None)
+
+    def decode(self, top_acts: Tensor, top_indices: Tensor, secondary: bool = False, use_bias: bool = True) -> Tensor:
+        assert self.W_dec is not None, "Decoder weight was not initialized."
+        if not secondary:
+            W_dec, b_dec = self.W_dec, self.b_dec
+        else:
+            W_dec, b_dec = self.W_dec_2, self.b_dec_2
+        y = decoder_impl(top_indices, top_acts.to(self.dtype), W_dec.mT)
+        if not self.cfg.matching_pursuit and use_bias:
+            y += b_dec
         return y 
 
     # Wrapping the forward in bf16 autocast improves performance by almost 2x
@@ -206,47 +272,7 @@ class SparseCoder(nn.Module):
         if y is None:
             y = x
 
-        if self.cfg.matching_pursuit:
-            residual = x.clone()
-            sae_out = torch.zeros_like(x)
-            if self.W_skip is not None:
-                x += x.to(self.dtype) @ self.W_skip.mT 
-                sae_out += x.to(self.dtype) @ self.W_skip.mT
-            residual -= self.b_dec
-            sae_out -= self.b_dec
-            all_acts = list()
-            all_indices = list()
-            for i in range(self.cfg.k):
-                # Encode
-                z = self.encoder(residual)
-
-                top_act, top_indice = z.topk(k=1, sorted=False)
-                all_acts.append(top_act)
-                all_indices.append(top_indice)
-                # Decode
-                if i != self.cfg.k - 1: 
-                    if self.W_dec is not None:
-                        decoded = self.decode(top_act, top_indice)
-                        sae_out += decoded
-                        residual = y - sae_out
-                        # if mse smaller than threshold, break
-                        if (residual ** 2).mean() < 1e-5:
-                            break
-            top_acts = torch.stack(all_acts).squeeze(-1).T
-            top_indices = torch.stack(all_indices).squeeze(-1).T
-            pre_acts = nn.functional.relu(residual)
-        else:
-            top_acts, top_indices, pre_acts = self.encode(x)
-
-            # Decode
-            sae_out = self.decode(top_acts, top_indices) 
-            if self.W_skip is not None: 
-                sae_out += x.to(self.dtype) @ self.W_skip.mT
-
-
-        
-        # Compute the residual
-        e = y - sae_out
+        top_acts, top_indices, pre_acts = self.encode(x)
 
         # Used as a denominator for putting everything on a reasonable scale
         total_variance = (y - y.mean(0)).pow(2).sum()
@@ -272,10 +298,21 @@ class SparseCoder(nn.Module):
             auxk_loss = (e_hat - e.detach()).pow(2).sum()
             auxk_loss = scale * auxk_loss / total_variance
         else:
-            auxk_loss = sae_out.new_tensor(0.0)
+            auxk_loss = top_acts.new_tensor(0.0)
 
-        l2_loss = e.pow(2).sum()
-        fvu = l2_loss / total_variance
+        for k_ in (range(self.cfg.k + 1) if self.cfg.per_step_loss else [self.cfg.k]):
+            # Decode
+            sae_out = self.decode(top_acts[:, :k_], top_indices[:, :k_]) 
+            if self.W_skip is not None: 
+                sae_out += x.to(self.dtype) @ self.W_skip.mT
+            
+            # Compute the residual
+            e = y - sae_out
+            
+            l2_loss = e.pow(2).sum()
+            fvu = l2_loss / total_variance
+            if k_ < self.cfg.k:
+                auxk_loss += fvu
 
         if self.cfg.multi_topk:
             top_acts, top_indices = pre_acts.topk(4 * self.cfg.k, sorted=False)
