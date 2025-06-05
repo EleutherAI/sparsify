@@ -178,18 +178,20 @@ class SparseCoder(nn.Module):
 
     def encode(self, x: Tensor) -> EncoderOutput:
         """Encode the input and select the top-k latents."""
+        
         if not self.cfg.transcode:
             x = x - self.b_dec
-
+    
         return fused_encoder(
             x, self.encoder.weight, self.encoder.bias, self.cfg.k, self.cfg.activation
         )
-
+        
     def decode(self, top_acts: Tensor, top_indices: Tensor) -> Tensor:
         assert self.W_dec is not None, "Decoder weight was not initialized."
-
         y = decoder_impl(top_indices, top_acts.to(self.dtype), self.W_dec.mT)
-        return y + self.b_dec
+        if not self.cfg.matching_pursuit:
+            y += self.b_dec
+        return y 
 
     # Wrapping the forward in bf16 autocast improves performance by almost 2x
     @torch.autocast(
@@ -200,17 +202,49 @@ class SparseCoder(nn.Module):
     def forward(
         self, x: Tensor, y: Tensor | None = None, *, dead_mask: Tensor | None = None
     ) -> ForwardOutput:
-        top_acts, top_indices, pre_acts = self.encode(x)
-
         # If we aren't given a distinct target, we're autoencoding
-        if y is None:
+        if y is not None:
             y = x
 
-        # Decode
-        sae_out = self.decode(top_acts, top_indices)
-        if self.W_skip is not None:
-            sae_out += x.to(self.dtype) @ self.W_skip.mT
+        if self.cfg.matching_pursuit:
+            residual = x.clone()
+            sae_out = torch.zeros_like(x)
+            if self.W_skip is not None:
+                x += x.to(self.dtype) @ self.W_skip.mT 
+                sae_out += x.to(self.dtype) @ self.W_skip.mT
+            residual -= self.b_dec
+            sae_out -= self.b_dec
+            all_acts = list()
+            all_indices = list()
+            for i in range(self.cfg.k):
+                # Encode
+                z = self.encoder(residual)
 
+                top_act, top_indice = z.topk(k=1, sorted=False)
+                all_acts.append(top_act)
+                all_indices.append(top_indice)
+                # Decode
+                if i != self.cfg.k - 1: 
+                    if self.W_dec is not None:
+                        decoded = self.decode(top_act, top_indice)
+                        sae_out += decoded
+                        residual = y - sae_out
+                        # if mse smaller than threshold, break
+                        if (residual ** 2).mean() < 1e-5:
+                            break
+            top_acts = torch.stack(all_acts).squeeze(-1).T
+            top_indices = torch.stack(all_indices).squeeze(-1).T
+            pre_acts = nn.functional.relu(residual)
+        else:
+            top_acts, top_indices, pre_acts = self.encode(x)
+
+            # Decode
+            sae_out = self.decode(top_acts, top_indices) 
+            if self.W_skip is not None: 
+                sae_out += x.to(self.dtype) @ self.W_skip.mT
+
+
+        
         # Compute the residual
         e = y - sae_out
 

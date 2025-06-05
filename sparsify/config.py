@@ -35,6 +35,9 @@ class SparseCoderConfig(Serializable):
     transcode: bool = False
     """Whether we want to predict the output of a module given its input."""
 
+    matching_pursuit: bool = False
+    """Use matching pursuit to find the sparse coders."""
+
 
 # Support different naming conventions for the same configuration
 SaeConfig = SparseCoderConfig
