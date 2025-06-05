@@ -366,7 +366,6 @@ class Trainer:
 
                 if name not in self.module_plan[dist.get_rank()]:
                     return
-
             # Flatten the batch and sequence dimensions
             outputs = outputs.flatten(0, 1)
             inputs = inputs.flatten(0, 1) if self.cfg.sae.transcode else outputs

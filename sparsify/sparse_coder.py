@@ -203,7 +203,7 @@ class SparseCoder(nn.Module):
         self, x: Tensor, y: Tensor | None = None, *, dead_mask: Tensor | None = None
     ) -> ForwardOutput:
         # If we aren't given a distinct target, we're autoencoding
-        if y is not None:
+        if y is None:
             y = x
 
         if self.cfg.matching_pursuit:
