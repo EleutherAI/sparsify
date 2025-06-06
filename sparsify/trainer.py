@@ -223,6 +223,21 @@ class Trainer:
         for name, sae in self.saes.items():
             load_model(sae, f"{path}/{name}/sae.safetensors", device=str(device))
 
+    def set_correct_k(self):
+        k = self.get_current_k()
+        for name, sae in self.saes.items():
+            sae.cfg.k = k
+            if self.cfg.turn_on_mp_step:
+                if self.global_step < self.cfg.turn_on_mp_step:
+                    if sae.cfg.slice_encoder and sae.cfg.slice_decoder:
+                        sae.cfg.activation = "groupmax"
+                    sae.cfg.matching_pursuit = False
+                else:
+                    if sae.cfg.slice_encoder and sae.cfg.slice_decoder:
+                        sae.cfg.activation = "topk"
+                    sae.cfg.matching_pursuit = True
+        return k
+
     def get_current_k(self) -> int:
         """Get the current k value based on a linear decay schedule."""
         if self.global_step >= self.cfg.k_decay_steps:
@@ -425,9 +440,7 @@ class Trainer:
             )
             loss.div(acc_steps).backward()
 
-        k = self.get_current_k()
-        for name, sae in self.saes.items():
-            sae.cfg.k = k
+        k = self.set_correct_k()
 
         for batch in dl:
             x = batch["input_ids"].to(device)
@@ -499,9 +512,7 @@ class Trainer:
                 for scheduler in self.lr_schedulers:
                     scheduler.step()
 
-                k = self.get_current_k()
-                for name, sae in self.saes.items():
-                    sae.cfg.k = k
+                k = self.set_correct_k()
 
                 ###############
                 with torch.no_grad():
