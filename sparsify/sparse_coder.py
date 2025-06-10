@@ -12,7 +12,7 @@ from torch import Tensor, nn
 
 from .config import SparseCoderConfig
 from .fused_encoder import EncoderOutput, fused_encoder
-from .utils import decoder_impl
+from .utils import decoder_impl, ito_step
 from .kernels import DenseDenseSparseOutMatmul
 
 
@@ -60,6 +60,8 @@ class SparseCoder(nn.Module):
 
         self.encoder = nn.Linear(d_in, encoder_num_latents, device=device, dtype=dtype)
         self.encoder.bias.data.zero_()
+        if cfg.normalize_encoder:
+            self.set_encoder_norm_to_unit_norm()
 
         if decoder:
             # Transcoder initialization: use zeros
@@ -77,7 +79,10 @@ class SparseCoder(nn.Module):
         self.b_dec = nn.Parameter(torch.zeros(d_in, dtype=dtype, device=device))
 
         if cfg.transcode and cfg.matching_pursuit and cfg.mp_untie:
-            self.W_dec_2 = nn.Parameter(torch.zeros_like(self.encoder.weight.data))
+            if cfg.mp_encoder:
+                self.W_dec_2 = self.encoder.weight
+            else:
+                self.W_dec_2 = nn.Parameter(torch.zeros_like(self.encoder.weight.data))
             self.b_dec_2 = nn.Parameter(torch.zeros(d_in, dtype=dtype, device=device))
         else:
             self.W_dec_2 = self.W_dec
@@ -88,6 +93,13 @@ class SparseCoder(nn.Module):
             if cfg.skip_connection
             else None
         )
+        
+        self.in_proj = None
+        # self.in_proj = (
+        #     nn.Parameter(torch.eye(d_in, device=device, dtype=dtype))
+        #     if cfg.matching_pursuit
+        #     else None
+        # )
 
     @staticmethod
     def load_many(
@@ -198,6 +210,9 @@ class SparseCoder(nn.Module):
         
         if not self.cfg.transcode:
             x = x - self.b_dec
+        
+        if self.in_proj is not None:
+            x = x @ self.in_proj.mT
             
         if start is None:
             start = 0
@@ -216,11 +231,13 @@ class SparseCoder(nn.Module):
         if not self.cfg.matching_pursuit:
             return self.encode_single(x, k)
         else:
+            # x = x / x.norm(dim=-1, keepdim=True).clamp(min=1e-6)
             sae_out = torch.zeros_like(x)
             sae_out += self.b_dec_2
-            all_acts, all_indices = [], []
             banned_indices = []
             for i in range(self.cfg.k):
+                if i > 0:
+                    sae_out = self.decode(top_acts, top_indices, secondary=True, use_bias=True)
                 residual = x - sae_out
                 if self.cfg.mp_detach:
                     residual = residual.detach()
@@ -238,14 +255,14 @@ class SparseCoder(nn.Module):
                 else:
                     if self.cfg.slice_decoder:
                         top_index = top_index + i * self.decoder_slice_size
-                all_acts.append(top_act)
-                all_indices.append(top_index)
-                # Decode
-                if i != self.cfg.k - 1: 
-                    sae_out += self.decode(top_act, top_index, secondary=True, use_bias=True)
-            top_acts = torch.cat(all_acts, dim=-1)
-            top_indices = torch.cat(all_indices, dim=-1)
-            top_acts = top_acts + (top_acts - top_acts.detach())
+                if i == 0:
+                    top_acts, top_indices = top_act, top_index
+                else:
+                    top_acts = torch.cat([top_acts, top_act], dim=-1)
+                    top_indices = torch.cat([top_indices, top_index], dim=-1)
+                    if self.cfg.ito:
+                        assert self.cfg.mp_encoder, "Inference-time optimization requires mp_encoder to be enabled."
+                        top_acts = ito_step(top_acts, top_indices, self.encoder.weight, x - sae_out)
             return EncoderOutput(top_acts, top_indices, None)
 
     def decode(self, top_acts: Tensor, top_indices: Tensor, secondary: bool = False, use_bias: bool = True) -> Tensor:
@@ -338,6 +355,13 @@ class SparseCoder(nn.Module):
         eps = torch.finfo(self.W_dec.dtype).eps
         norm = torch.norm(self.W_dec.data, dim=1, keepdim=True)
         self.W_dec.data /= norm + eps
+    
+    @torch.no_grad()
+    def set_encoder_norm_to_unit_norm(self):
+        assert self.encoder.weight is not None, "Encoder weight was not initialized."
+        eps = torch.finfo(self.encoder.weight.dtype).eps
+        norm = torch.norm(self.encoder.weight.data, dim=1, keepdim=True)
+        self.encoder.weight.data /= norm + eps
 
     @torch.no_grad()
     def remove_gradient_parallel_to_decoder_directions(self):
@@ -354,7 +378,22 @@ class SparseCoder(nn.Module):
             self.W_dec.data,
             "d_sae, d_sae d_in -> d_sae d_in",
         )
-
+    
+    @torch.no_grad()
+    def remove_gradient_parallel_to_encoder_directions(self):
+        assert self.encoder.weight is not None, "Encoder weight was not initialized."
+        assert self.encoder.weight.grad is not None  # keep pyright happy
+        
+        parallel_component = einops.einsum(
+            self.encoder.weight.grad,
+            self.encoder.weight.data,
+            "d_sae d_in, d_sae d_in -> d_sae",
+        )
+        self.encoder.weight.grad -= einops.einsum(
+            parallel_component,
+            self.encoder.weight.data,
+            "d_sae, d_sae d_in -> d_sae d_in",
+        )
 
 # Allow for alternate naming conventions
 Sae = SparseCoder

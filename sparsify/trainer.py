@@ -402,6 +402,8 @@ class Trainer:
             # Make sure the W_dec is still unit-norm if we're autoencoding
             if raw.cfg.normalize_decoder:
                 raw.set_decoder_norm_to_unit_norm()
+            if raw.cfg.normalize_encoder:
+                raw.set_encoder_norm_to_unit_norm()
 
             wrapped = maybe_wrapped[name]
             out = wrapped(
@@ -504,6 +506,10 @@ class Trainer:
                 if self.cfg.sae.normalize_decoder and not self.cfg.sae.transcode:
                     for sae in self.saes.values():
                         sae.remove_gradient_parallel_to_decoder_directions()
+                
+                if self.cfg.sae.normalize_encoder:
+                    for sae in self.saes.values():
+                        sae.remove_gradient_parallel_to_encoder_directions()
 
                 for optimizer in self.optimizers:
                     optimizer.step()

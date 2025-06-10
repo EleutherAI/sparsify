@@ -6,6 +6,8 @@ from accelerate.utils import send_to_device
 from torch import Tensor, nn
 from transformers import PreTrainedModel
 
+from .kernels import DenseDenseSparseOutMatmul
+
 T = TypeVar("T")
 
 
@@ -101,3 +103,12 @@ else:
         decoder_impl = eager_decode
     else:
         decoder_impl = triton_decode
+
+
+def ito_step(top_acts: Tensor, top_indices: Tensor, W_enc: Tensor, residual: Tensor):
+    grad = DenseDenseSparseOutMatmul.apply(residual, W_enc.T, top_indices)
+    c = decoder_impl(top_indices, grad, W_enc.T)
+    step_size = torch.einsum('bv,bv->b', c, residual) / torch.einsum('bv,bv->b', c, c)
+    top_acts = top_acts + step_size[:, None] * grad
+    top_acts = top_acts.relu()
+    return top_acts

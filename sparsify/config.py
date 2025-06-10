@@ -19,6 +19,9 @@ class SparseCoderConfig(Serializable):
 
     normalize_decoder: bool = False
     """Normalize the decoder weights to have unit norm."""
+    
+    normalize_encoder: bool = False
+    """Normalize the encoder weights to have unit norm."""
 
     num_latents: int = 0
     """Number of latents to use. If 0, use `expansion_factor`."""
@@ -37,6 +40,12 @@ class SparseCoderConfig(Serializable):
 
     matching_pursuit: bool = False
     """Use matching pursuit to find the sparse coders."""
+    
+    ito: bool = False
+    """Use Inference-time Optimization."""
+    
+    mp_encoder: bool = True
+    """Use the encoder as the decoder for matching pursuit."""
     
     mp_detach: bool = False
     """Detach the residual before passing it to the per-step encoder."""
