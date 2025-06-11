@@ -31,6 +31,9 @@ class ForwardOutput(NamedTuple):
     auxk_loss: Tensor
     """AuxK loss, if applicable."""
 
+    aux_loss: Tensor
+    """Auxiliary loss, if applicable."""
+
     multi_topk_fvu: Tensor
     """Multi-TopK FVU, if applicable."""
 
@@ -317,10 +320,11 @@ class SparseCoder(nn.Module):
         else:
             auxk_loss = top_acts.new_tensor(0.0)
 
-        for k_ in (range(self.cfg.k + 1) if self.cfg.per_step_loss else [self.cfg.k]):
-            # Decode
-            sae_out = self.decode(top_acts[:, :k_], top_indices[:, :k_]) 
-            if self.W_skip is not None: 
+        # Decode
+        aux_loss = top_acts.new_tensor(0.0)
+        for is_encoder in ((True, False) if self.cfg.mp_aux else (False,)):
+            sae_out = self.decode(top_acts, top_indices, secondary=is_encoder)
+            if self.W_skip is not None and not is_encoder: 
                 sae_out += x.to(self.dtype) @ self.W_skip.mT
             
             # Compute the residual
@@ -328,8 +332,8 @@ class SparseCoder(nn.Module):
             
             l2_loss = e.pow(2).sum()
             fvu = l2_loss / total_variance
-            if k_ < self.cfg.k:
-                auxk_loss += fvu
+            if is_encoder:
+                aux_loss = fvu
 
         if self.cfg.multi_topk:
             top_acts, top_indices = pre_acts.topk(4 * self.cfg.k, sorted=False)
@@ -345,6 +349,7 @@ class SparseCoder(nn.Module):
             top_indices,
             fvu,
             auxk_loss,
+            aux_loss,
             multi_topk_fvu,
         )
 

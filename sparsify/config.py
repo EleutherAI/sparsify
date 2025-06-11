@@ -53,6 +53,9 @@ class SparseCoderConfig(Serializable):
     mp_untie: bool = True
     """Untie transcoder decoder weights."""
     
+    mp_aux: bool = False
+    """Use an auxiliary loss for transcoder matching pursuit."""
+    
     per_step_loss: bool = False
     """Use a per-step loss instead of a global loss."""
     

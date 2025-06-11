@@ -438,7 +438,7 @@ class Trainer:
 
             # Do a "local" backward pass if we're not training end-to-end
             loss = (
-                out.fvu + self.cfg.auxk_alpha * out.auxk_loss + out.multi_topk_fvu / 8
+                out.fvu + self.cfg.auxk_alpha * out.auxk_loss + out.multi_topk_fvu / 8 + out.aux_loss
             )
             loss.div(acc_steps).backward()
 
