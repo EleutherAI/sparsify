@@ -227,7 +227,7 @@ class SparseCoder(nn.Module):
             x, weight, bias, k, self.cfg.activation, banned=banned
         )
     
-    @torch.compile
+    # @torch.compile
     def encode(self, x: Tensor, k: int | None = None) -> EncoderOutput:
         if k is None:
             k = self.cfg.k

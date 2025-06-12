@@ -4,6 +4,8 @@ import torch
 from torch import Tensor
 import torch.nn.functional as F
 
+from .kernels import triton_sparse_transpose_dense_matmul
+
 
 class EncoderOutput(NamedTuple):
     top_acts: torch.Tensor
@@ -68,16 +70,13 @@ class FusedEncoder(torch.autograd.Function):
 
         # --- Grad w.r.t. weight ---
         if ctx.needs_input_grad[1]:
-            grad_weight = torch.zeros_like(weight)
-            # Compute contributions from each top-k element:
-            # computed as grad_values * input for each top-k location.
-            contributions = grad_values.unsqueeze(2) * input.unsqueeze(1)
-            _, _, D = contributions.shape
-            # Flatten contributions to shape (N*k, D)
-            contributions = contributions.reshape(-1, D)
-
-            # Accumulate contributions into the correct rows of grad_weight.
-            grad_weight.index_add_(0, indices.flatten(), contributions.type_as(weight))
+            # grad_values (B, D[k]) @ input (B, D) -> (M, D)
+            grad_weight = triton_sparse_transpose_dense_matmul(
+                indices,
+                grad_values.float(),
+                input,
+                N=weight.shape[0],
+            )
 
         # --- Grad w.r.t. bias ---
         if bias is not None and ctx.needs_input_grad[2]:
