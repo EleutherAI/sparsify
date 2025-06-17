@@ -280,6 +280,7 @@ class SparseCoder(nn.Module):
         return y 
 
     # Wrapping the forward in bf16 autocast improves performance by almost 2x
+    @torch.compile
     @torch.autocast(
         "cuda",
         dtype=torch.bfloat16,
@@ -296,6 +297,17 @@ class SparseCoder(nn.Module):
 
         # Used as a denominator for putting everything on a reasonable scale
         total_variance = (y - y.mean(0)).pow(2).sum()
+
+        # Decode
+        sae_out = self.decode(top_acts, top_indices, secondary=False)
+        if self.W_skip is not None: 
+            sae_out += x.to(self.dtype) @ self.W_skip.mT
+        
+        # Compute the residual
+        e = y - sae_out
+        
+        l2_loss = e.pow(2).sum()
+        fvu = l2_loss / total_variance
 
         # Second decoder pass for AuxK loss
         if dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
@@ -319,21 +331,8 @@ class SparseCoder(nn.Module):
             auxk_loss = scale * auxk_loss / total_variance
         else:
             auxk_loss = top_acts.new_tensor(0.0)
-
-        # Decode
+        
         aux_loss = top_acts.new_tensor(0.0)
-        for is_encoder in ((True, False) if self.cfg.mp_aux else (False,)):
-            sae_out = self.decode(top_acts, top_indices, secondary=is_encoder)
-            if self.W_skip is not None and not is_encoder: 
-                sae_out += x.to(self.dtype) @ self.W_skip.mT
-            
-            # Compute the residual
-            e = y - sae_out
-            
-            l2_loss = e.pow(2).sum()
-            fvu = l2_loss / total_variance
-            if is_encoder:
-                aux_loss = fvu
 
         if self.cfg.multi_topk:
             top_acts, top_indices = pre_acts.topk(4 * self.cfg.k, sorted=False)

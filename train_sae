@@ -1,0 +1,25 @@
+#!/bin/bash
+
+i=$1
+
+if [ $i -eq 0 ]; then
+    x=64
+    k=64
+elif [ $i -eq 1 ]; then
+    x=64
+    k=128
+elif [ $i -eq 2 ]; then
+    x=128
+    k=64
+elif [ $i -eq 3 ]; then
+    x=128
+    k=128
+fi
+
+WANDB_ENTITY=eleutherai CUDA_VISIBLE_DEVICES=$i uv run python -m sparsify \
+HuggingFaceTB/SmolLM2-135M \
+--hookpoints layers.10.mlp layers.15.mlp layers.20.mlp \
+layers.10 layers.15 layers.20 \
+--run_name sae-k$k-ef$x --k $k --expansion_factor $x \
+--max_examples 200000 --batch_size 32 --optimizer=muon --lr_warmup_steps 50 \
+--auxk_alpha 1e-3

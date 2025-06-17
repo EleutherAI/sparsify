@@ -19,6 +19,7 @@ class EncoderOutput(NamedTuple):
 
 
 class FusedEncoder(torch.autograd.Function):
+    @torch.compile
     @staticmethod
     def forward(
         ctx, input, weight, bias, k: int, activation: Literal["groupmax", "topk"], banned: Tensor | None = None
@@ -54,6 +55,7 @@ class FusedEncoder(torch.autograd.Function):
         ctx.k = k
         return values, indices, preacts
 
+    @torch.compile
     @staticmethod
     def backward(ctx, grad_values, grad_indices, grad_preacts):
         input, weight, bias, indices = ctx.saved_tensors

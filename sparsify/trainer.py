@@ -138,7 +138,7 @@ class Trainer:
                         # Muon distributes the work of the Newton-Schulz iterations
                         # across all ranks for DDP but this doesn't make sense when
                         # we're distributing modules across ranks
-                        ddp=not cfg.distribute_modules,
+                        ddp=False,
                     ),
                     torch.optim.Adam(
                         [param for param in params if param not in muon_param_set],
@@ -179,7 +179,7 @@ class Trainer:
         }
 
         num_latents = list(self.saes.values())[0].num_latents
-        self.initial_k = min(num_latents, round(list(input_widths.values())[0] * 10))
+        self.initial_k = min(num_latents, round(list(input_widths.values())[0]))
         self.final_k = self.cfg.sae.k
 
         self.best_loss = (
