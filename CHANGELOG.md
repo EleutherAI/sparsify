@@ -1,6 +1,13 @@
 # CHANGELOG
 
 
+## v1.1.4 (2025-07-06)
+
+### Features
+
+- Add new initialization strategy for the transcoder.
+
+
 ## v1.1.3 (2025-04-17)
 
 ### Bug Fixes
