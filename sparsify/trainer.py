@@ -379,10 +379,7 @@ class Trainer:
                 # Ensure the preactivations are centered at initialization
                 # This is mathematically equivalent to Anthropic's proposal of
                 # subtracting the decoder bias
-                if (
-                    self.cfg.sae.transcode
-                    and self.cfg.sae.init_method == "linear"
-                ):
+                if self.cfg.sae.transcode and self.cfg.sae.init_method == "linear":
                     mean = self.maybe_all_reduce(inputs.mean(0)).to(raw.dtype)
                     mean_image = -mean @ raw.encoder.weight.data.T
                     raw.encoder.bias.data = mean_image
