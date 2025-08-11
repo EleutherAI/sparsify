@@ -169,6 +169,9 @@ class Trainer:
             name: torch.zeros(sae.num_latents, device=device, dtype=torch.long)
             for name, sae in self.saes.items()
         }
+        self.exclude_tokens = torch.tensor(
+            self.cfg.exclude_tokens, device=device, dtype=torch.long
+        )
 
         num_latents = list(self.saes.values())[0].num_latents
         self.initial_k = min(num_latents, round(list(input_widths.values())[0] * 10))
@@ -294,6 +297,8 @@ class Trainer:
             for name, sae in self.saes.items()
         }
 
+        tokens_mask: torch.Tensor
+
         acc_steps = self.cfg.grad_acc_steps * self.cfg.micro_acc_steps
         denom = acc_steps * self.cfg.wandb_log_frequency
         num_tokens_in_step = 0
@@ -340,6 +345,7 @@ class Trainer:
                 inputs = inputs[0]
             if isinstance(outputs, tuple):
                 outputs, *aux_out = outputs
+            mask = tokens_mask
 
             # Name may optionally contain a suffix of the form /seedN where N is an
             # integer. We only care about the part before the slash.
@@ -364,12 +370,24 @@ class Trainer:
                     dist.all_gather_into_tensor(world_inputs, inputs)
                     inputs = world_inputs
 
+                world_mask = mask.new_empty(
+                    mask.shape[0] * dist.get_world_size(), *mask.shape[1:]
+                )
+                dist.all_gather_into_tensor(world_mask, mask)
+                mask = world_mask.bool()
+
                 if name not in self.module_plan[dist.get_rank()]:
                     return
 
             # Flatten the batch and sequence dimensions
             outputs = outputs.flatten(0, 1)
             inputs = inputs.flatten(0, 1) if self.cfg.sae.transcode else outputs
+            mask = mask.flatten(0, 1)
+
+            # Remove tokens not used for training
+            all_outputs = outputs.detach().clone()
+            outputs = outputs[mask]
+            inputs = inputs[mask]
 
             # On the first iteration, initialize the encoder and decoder biases
             raw = self.saes[name]
@@ -406,7 +424,9 @@ class Trainer:
 
             if self.cfg.loss_fn in ("ce", "kl"):
                 # Replace the normal output with the SAE output
-                output = out.sae_out.reshape(out_shape).type_as(outputs)
+                output = all_outputs.clone()
+                output[mask] = out.sae_out.type_as(output)
+                output = output.reshape(out_shape)
                 return (output, *aux_out) if aux_out is not None else output
 
             # Metrics that only make sense for local
@@ -432,6 +452,7 @@ class Trainer:
 
         for batch in dl:
             x = batch["input_ids"].to(device)
+            tokens_mask = torch.isin(x, self.exclude_tokens, invert=True)
 
             if not maybe_wrapped:
                 # Wrap the SAEs with Distributed Data Parallel. We have to do this
@@ -447,7 +468,7 @@ class Trainer:
                 )
 
             # Bookkeeping for dead feature detection
-            N = x.numel()
+            N = tokens_mask.sum().item()
             num_tokens_in_step += N
 
             # Compute clean logits if using KL loss

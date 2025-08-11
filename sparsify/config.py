@@ -82,6 +82,9 @@ class TrainConfig(Serializable):
     dead_feature_threshold: int = 10_000_000
     """Number of tokens after which a feature is considered dead."""
 
+    exclude_tokens: list[int] = list_field()
+    """List of tokens to ignore during sparse coders training."""
+
     hookpoints: list[str] = list_field()
     """List of hookpoints to train sparse coders on."""
 
