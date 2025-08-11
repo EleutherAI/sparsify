@@ -35,6 +35,9 @@ class SparseCoderConfig(Serializable):
     transcode: bool = False
     """Whether we want to predict the output of a module given its input."""
 
+    init_method: Literal["linear", "mlp"] = "linear"
+    """Initialization method to use for the transcoder."""
+
 
 # Support different naming conventions for the same configuration
 SaeConfig = SparseCoderConfig

@@ -1,4 +1,4 @@
-__version__ = "1.1.3"
+__version__ = "1.1.4"
 
 from .config import SaeConfig, SparseCoderConfig, TrainConfig, TranscoderConfig
 from .sparse_coder import Sae, SparseCoder
