@@ -22,19 +22,18 @@ from .data import MemmapDataset
 from .muon import Muon
 from .sign_sgd import SignSGD
 from .sparse_coder import SparseCoder
-from .utils import get_layer_list, resolve_widths, set_submodule
-
-
+from .utils import get_layer_list, resolve_widths, set_submodule,kl_divergence
+from sparsify.hooks import edit_for_generation
 class Trainer:
     def __init__(
         self,
         cfg: TrainConfig,
         dataset: HfDataset | MemmapDataset,
         model: PreTrainedModel,
+        eval_dataset=None
     ):
         # Store the whole model, including any potential causal LM wrapper
         self.model = model
-
         if cfg.hookpoints:
             assert not cfg.layers, "Cannot specify both `hookpoints` and `layers`."
 
@@ -61,7 +60,7 @@ class Trainer:
         self.cfg = cfg
         self.dataset = dataset
         self.distribute_modules()
-
+        self.eval_dataset = eval_dataset
         device = model.device
         input_widths = resolve_widths(model, cfg.hookpoints)
         unique_widths = set(input_widths.values())
@@ -331,7 +330,6 @@ class Trainer:
         }
         maybe_wrapped: dict[str, DDP] | dict[str, SparseCoder] = {}
         module_to_name = {v: k for k, v in name_to_module.items()}
-
         def hook(module: nn.Module, inputs, outputs):
             aux_out = None
 
@@ -518,10 +516,11 @@ class Trainer:
 
                 if (step + 1) % self.cfg.save_every == 0:
                     self.save()
-
-                    if self.cfg.save_best:
-                        self.save_best(avg_losses)
-
+                if self.cfg.save_best:
+                    self.save_best(avg_losses)
+                # Run evaluation if eval split was provided
+                if self.eval_dataset is not None and (step + 1) % self.cfg.eval_every == 0:
+                    self.evaluate(self.eval_dataset, step + 1)
                 if (
                     self.cfg.log_to_wandb
                     and (step + 1) % self.cfg.wandb_log_frequency == 0
@@ -573,7 +572,9 @@ class Trainer:
             self.save_best(avg_losses)
 
         pbar.close()
+    
 
+        self.model.train()
     def local_hookpoints(self) -> list[str]:
         return (
             self.module_plan[dist.get_rank()]
@@ -701,6 +702,45 @@ class Trainer:
         # Barrier to ensure all ranks have saved before continuing
         if dist.is_initialized():
             dist.barrier()
+    @torch.no_grad()
+    def evaluate(self, eval_dataset, step: int):
+        """Run eval set through spliced vs unspliced model, compute mean KL divergence."""
+        if eval_dataset is None:
+            return
+
+        rank_zero = not dist.is_initialized() or dist.get_rank() == 0
+        if not rank_zero:
+            return  # only rank 0 does eval to avoid duplication
+
+        device = self.model.device
+        dl = DataLoader(eval_dataset, batch_size=self.cfg.batch_size, shuffle=False)
+
+        self.model.eval()
+
+        total_kl, total_count = 0.0, 0
+
+        # === Run inference twice per batch ===
+        for batch in tqdm(dl, desc=f"Eval@{step}", disable=not rank_zero):
+            x = batch["input_ids"].to(device)
+            # 1. Unspliced logits
+            logits_unspliced = self.model(x).logits
+            
+            # 2. Spliced logits (with SAE edits)
+            with edit_for_generation(self.model, self.cfg.hookpoints, self.saes, device=device):
+                logits_spliced = self.model(x).logits
+            
+            # === Compute KL divergence ===
+            kl = kl_divergence(logits_spliced, logits_unspliced, dim=-1)
+            total_kl += kl.sum().item()
+            total_count += kl.numel()
+        mean_kl = total_kl / total_count if total_count > 0 else float("nan")
+        if rank_zero:
+            print(f"[Eval @ step {step}] Mean KL divergence: {mean_kl:.6f}")
+            if self.cfg.log_to_wandb:
+                import wandb
+                wandb.log({"eval/kl_div": mean_kl, "step": step})
+
+        return mean_kl
 
 
 # Support old name for compatibility

@@ -1,11 +1,11 @@
 import os
 from typing import Any, Type, TypeVar, cast
-
+import math
 import torch
 from accelerate.utils import send_to_device
 from torch import Tensor, nn
 from transformers import PreTrainedModel
-
+import torch.nn.functional as F
 T = TypeVar("T")
 
 
@@ -28,6 +28,23 @@ def get_layer_list(model: PreTrainedModel) -> tuple[str, nn.ModuleList]:
     assert len(candidates) == 1, "Could not find the list of layers."
 
     return candidates[0]
+def kl_divergence(
+    logit_p: torch.Tensor, logit_q: torch.Tensor, dim: int = -1
+) -> torch.Tensor:
+    """
+    Compute the KL divergence KL(P || Q) between two sets of logits.
+    Both logit_p and logit_q are unnormalized scores (logits).
+    """
+    # Turn logits into log-probs
+    # print(logit_p)
+    log_p = F.log_softmax(logit_p, dim=dim)
+    log_q = F.log_softmax(logit_q, dim=dim)
+    print(log_p)
+    # Convert to probabilities
+    p = log_p.exp()
+    kl = torch.sum(p * (log_p - log_q), dim=dim)
+
+    return kl
 
 
 @torch.inference_mode()

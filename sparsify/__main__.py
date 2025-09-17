@@ -41,10 +41,11 @@ class RunConfig(TrainConfig):
     ctx_len: int = 2048
     """Context length to use for training."""
 
-    # Use a dummy encoding function to prevent the token from being saved
-    # to disk in plain text
     hf_token: str | None = field(default=None, encoding_fn=lambda _: None)
     """Huggingface API token for downloading models."""
+
+    eval_split: str | None = None
+    """Optional dataset split to use for evaluation."""
 
     revision: str | None = None
     """Model revision to use for training."""
@@ -56,7 +57,7 @@ class RunConfig(TrainConfig):
     """Maximum number of examples to use for training."""
 
     resume: bool = False
-    """Whether to try resuming from the checkpoint present at `checkpoints/run_name`."""
+    """Whether to try resuming from checkpoint at `checkpoints/run_name`."""
 
     text_column: str = "text"
     """Column name to use for text data."""
@@ -72,15 +73,14 @@ class RunConfig(TrainConfig):
 
 def load_artifacts(
     args: RunConfig, rank: int
-) -> tuple[PreTrainedModel, Dataset | MemmapDataset]:
+) -> tuple[PreTrainedModel, Dataset | MemmapDataset, Dataset | None]:
     if args.load_in_8bit:
         dtype = torch.float16
     elif torch.cuda.is_bf16_supported():
         dtype = torch.bfloat16
     else:
-        dtype = "auto"
+        dtype = torch.float32
 
-    # End-to-end training requires a model with a causal LM head
     model_cls = AutoModel if args.loss_fn == "fvu" else AutoModelForCausalLM
     model = model_cls.from_pretrained(
         args.model,
@@ -91,50 +91,50 @@ def load_artifacts(
             else None
         ),
         revision=args.revision,
-        torch_dtype=dtype,
+        dtype=dtype,  # ✅ replaces deprecated torch_dtype
         token=args.hf_token,
     )
 
-    # For memmap-style datasets
-    if args.dataset.endswith(".bin"):
-        dataset = MemmapDataset(args.dataset, args.ctx_len, args.max_examples)
-    else:
-        # For Huggingface datasets
-        try:
-            dataset = load_dataset(
-                args.dataset,
-                split=args.split,
-                # TODO: Maybe set this to False by default? But RPJ requires it.
-                trust_remote_code=True,
-            )
-        except ValueError as e:
-            # Automatically use load_from_disk if appropriate
-            if "load_from_disk" in str(e):
-                dataset = Dataset.load_from_disk(args.dataset, keep_in_memory=False)
-            else:
-                raise e
+    def prepare_dataset(split: str) -> Dataset | MemmapDataset:
+        if args.dataset.endswith(".bin"):
+            return MemmapDataset(args.dataset, args.ctx_len, args.max_examples)
 
-        assert isinstance(dataset, Dataset)
-        if "input_ids" not in dataset.column_names:
+        ds = load_dataset(
+            args.dataset,
+            split=split,
+            trust_remote_code=True,
+        )
+
+        assert isinstance(ds, Dataset)
+        if "input_ids" not in ds.column_names:
             tokenizer = AutoTokenizer.from_pretrained(args.model, token=args.hf_token)
-            dataset = chunk_and_tokenize(
-                dataset,
+            ds = chunk_and_tokenize(
+                ds,
                 tokenizer,
                 max_seq_len=args.ctx_len,
                 num_proc=args.data_preprocessing_num_proc,
                 text_key=args.text_column,
             )
         else:
-            print("Dataset already tokenized; skipping tokenization.")
+            print(f"Split '{split}' already tokenized; skipping tokenization.")
 
-        print(f"Shuffling dataset with seed {args.shuffle_seed}")
-        dataset = dataset.shuffle(args.shuffle_seed)
-
-        dataset = dataset.with_format("torch")
+        print(f"Shuffling split '{split}' with seed {args.shuffle_seed}")
+        ds = ds.shuffle(args.shuffle_seed).with_format("torch")
         if limit := args.max_examples:
-            dataset = dataset.select(range(limit))
+            ds = ds.select(range(limit))
+        return ds
 
-    return model, dataset
+    # Train dataset
+    dataset = prepare_dataset(args.split)
+    print(f"Train dataset size: {len(dataset)}")
+
+    # Optional eval dataset
+    eval_dataset = None
+    if args.eval_split:
+        eval_dataset = prepare_dataset(args.eval_split)
+        print(f"Eval dataset size: {len(eval_dataset)}")
+
+    return model, dataset, eval_dataset
 
 
 def run():
@@ -144,42 +144,38 @@ def run():
 
     if ddp:
         torch.cuda.set_device(int(local_rank))
-
-        # Increase the default timeout in order to account for slow downloads
-        # and data preprocessing on the main rank
         dist.init_process_group(
             "nccl", device_id=torch.device(rank), timeout=timedelta(weeks=1)
         )
-
         if rank == 0:
             print(f"Using DDP across {dist.get_world_size()} GPUs.")
 
     args = parse(RunConfig)
 
-    # Prevent ranks other than 0 from printing
     with nullcontext() if rank == 0 else redirect_stdout(None):
-        # Awkward hack to prevent other ranks from duplicating data preprocessing
         if not ddp or rank == 0:
-            model, dataset = load_artifacts(args, rank)
+            model, dataset, eval_dataset = load_artifacts(args, rank)
         if ddp:
             dist.barrier()
             if rank != 0:
-                model, dataset = load_artifacts(args, rank)
+                model, dataset, eval_dataset = load_artifacts(args, rank)
 
-            # Drop examples that are indivisible across processes to prevent deadlock
             remainder_examples = len(dataset) % dist.get_world_size()
             dataset = dataset.select(range(len(dataset) - remainder_examples))
-
             dataset = dataset.shard(dist.get_world_size(), rank)
 
-            # Drop examples that are indivisible across processes to prevent deadlock
-            remainder_examples = len(dataset) % dist.get_world_size()
-            dataset = dataset.select(range(len(dataset) - remainder_examples))
-
         print(f"Training on '{args.dataset}' (split '{args.split}')")
+        if args.eval_split:
+            print(f"Evaluating on split '{args.eval_split}'")
         print(f"Storing model weights in {model.dtype}")
 
-        trainer = Trainer(args, dataset, model)
+        # ✅ Ensure training won’t silently skip
+        if args.epochs == 0 and args.max_steps == 0:
+            args.epochs = 1
+            print("⚠️  No training length specified, defaulting to epochs=1")
+
+        trainer = Trainer(args, dataset, model, eval_dataset=eval_dataset)
+
         if args.resume:
             trainer.load_state(f"checkpoints/{args.run_name}" or "checkpoints/unnamed")
         elif args.finetune:
