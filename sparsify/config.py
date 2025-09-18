@@ -104,6 +104,7 @@ class TrainConfig(Serializable):
     save_best: bool = False
     """Save the best checkpoint found for each hookpoint."""
     eval_every: int = 300
+    """eval steps """
     finetune: str | None = None
     """Finetune the sparse coders from a pretrained checkpoint."""
 
