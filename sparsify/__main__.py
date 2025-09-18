@@ -40,7 +40,8 @@ class RunConfig(TrainConfig):
 
     ctx_len: int = 2048
     """Context length to use for training."""
-
+    # Use a dummy encoding function to prevent the token from being saved
+    # to disk in plain text
     hf_token: str | None = field(default=None, encoding_fn=lambda _: None)
     """Huggingface API token for downloading models."""
 

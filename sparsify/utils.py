@@ -35,12 +35,9 @@ def kl_divergence(
     Compute the KL divergence KL(P || Q) between two sets of logits.
     Both logit_p and logit_q are unnormalized scores (logits).
     """
-    # Turn logits into log-probs
-    # print(logit_p)
     log_p = F.log_softmax(logit_p, dim=dim)
     log_q = F.log_softmax(logit_q, dim=dim)
     print(log_p)
-    # Convert to probabilities
     p = log_p.exp()
     kl = torch.sum(p * (log_p - log_q), dim=dim)
 
