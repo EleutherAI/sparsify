@@ -1,11 +1,12 @@
 import os
 from typing import Any, Type, TypeVar, cast
-import math
+
 import torch
+import torch.nn.functional as F
 from accelerate.utils import send_to_device
 from torch import Tensor, nn
 from transformers import PreTrainedModel
-import torch.nn.functional as F
+
 T = TypeVar("T")
 
 
@@ -28,6 +29,8 @@ def get_layer_list(model: PreTrainedModel) -> tuple[str, nn.ModuleList]:
     assert len(candidates) == 1, "Could not find the list of layers."
 
     return candidates[0]
+
+
 def kl_divergence(
     logit_p: torch.Tensor, logit_q: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:

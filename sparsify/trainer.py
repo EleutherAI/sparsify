@@ -17,20 +17,23 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import PreTrainedModel, get_linear_schedule_with_warmup
 
+from sparsify.hooks import edit_for_generation
+
 from .config import TrainConfig
 from .data import MemmapDataset
 from .muon import Muon
 from .sign_sgd import SignSGD
 from .sparse_coder import SparseCoder
-from .utils import get_layer_list, resolve_widths, set_submodule,kl_divergence
-from sparsify.hooks import edit_for_generation
+from .utils import get_layer_list, kl_divergence, resolve_widths, set_submodule
+
+
 class Trainer:
     def __init__(
         self,
         cfg: TrainConfig,
         dataset: HfDataset | MemmapDataset,
         model: PreTrainedModel,
-        eval_dataset=None
+        eval_dataset=None,
     ):
         # Store the whole model, including any potential causal LM wrapper
         self.model = model
@@ -330,6 +333,7 @@ class Trainer:
         }
         maybe_wrapped: dict[str, DDP] | dict[str, SparseCoder] = {}
         module_to_name = {v: k for k, v in name_to_module.items()}
+
         def hook(module: nn.Module, inputs, outputs):
             aux_out = None
 
@@ -519,7 +523,10 @@ class Trainer:
                 if self.cfg.save_best:
                     self.save_best(avg_losses)
                 # Run evaluation if eval split was provided
-                if self.eval_dataset is not None and (step + 1) % self.cfg.eval_every == 0:
+                if (
+                    self.eval_dataset is not None
+                    and (step + 1) % self.cfg.eval_every == 0
+                ):
                     self.evaluate(self.eval_dataset, step + 1)
                 if (
                     self.cfg.log_to_wandb
@@ -572,9 +579,9 @@ class Trainer:
             self.save_best(avg_losses)
 
         pbar.close()
-    
 
         self.model.train()
+
     def local_hookpoints(self) -> list[str]:
         return (
             self.module_plan[dist.get_rank()]
@@ -702,6 +709,7 @@ class Trainer:
         # Barrier to ensure all ranks have saved before continuing
         if dist.is_initialized():
             dist.barrier()
+
     @torch.no_grad()
     def evaluate(self, eval_dataset, step: int):
         """Run eval set through spliced vs unspliced model, compute mean KL divergence."""
@@ -724,11 +732,13 @@ class Trainer:
             x = batch["input_ids"].to(device)
             # 1. Unspliced logits
             logits_unspliced = self.model(x).logits
-            
+
             # 2. Spliced logits (with SAE edits)
-            with edit_for_generation(self.model, self.cfg.hookpoints, self.saes, device=device):
+            with edit_for_generation(
+                self.model, self.cfg.hookpoints, self.saes, device=device
+            ):
                 logits_spliced = self.model(x).logits
-            
+
             # === Compute KL divergence ===
             kl = kl_divergence(logits_spliced, logits_unspliced, dim=-1)
             total_kl += kl.sum().item()
@@ -738,6 +748,7 @@ class Trainer:
             print(f"[Eval @ step {step}] Mean KL divergence: {mean_kl:.6f}")
             if self.cfg.log_to_wandb:
                 import wandb
+
                 wandb.log({"eval/kl_div": mean_kl, "step": step})
 
         return mean_kl
