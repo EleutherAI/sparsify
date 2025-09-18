@@ -704,7 +704,8 @@ class Trainer:
             dist.barrier()
     @torch.no_grad()
     def evaluate(self, eval_dataset, step: int):
-        """Run eval set through spliced vs unspliced model, compute mean KL divergence."""
+        """Run eval set through spliced vs unspliced model, 
+        compute mean KL divergence."""
         if eval_dataset is None:
             return
 
