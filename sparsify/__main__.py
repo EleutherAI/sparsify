@@ -92,7 +92,7 @@ def load_artifacts(
             else None
         ),
         revision=args.revision,
-        dtype=dtype, 
+        dtype=dtype,
         token=args.hf_token,
     )
 
