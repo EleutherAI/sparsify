@@ -26,7 +26,8 @@ class FusedEncoder(torch.autograd.Function):
         bias:   (M,)
         k:      int (number of top elements to select along dim=1)
         """
-        preacts = F.relu(F.linear(input, weight, bias))
+        if b_enc is not None:
+        pre_acts = pre_acts + b_enc
 
         # Get top-k values and indices for each row
         if activation == "topk":
@@ -88,11 +89,11 @@ class FusedEncoder(torch.autograd.Function):
 
 
 def fused_encoder(
-    input,
-    weight,
-    bias,
+    x: Tensor,
+    W_enc: Tensor,
+    b_enc: Tensor | None,
     k: int,
-    activation: Literal["groupmax", "topk"],
+    activation: Literal["groupmax", "topk"] = "topk",
 ) -> EncoderOutput:
     """
     Convenience wrapper that performs an nn.Linear followed by `activation` with

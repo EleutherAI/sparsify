@@ -85,6 +85,8 @@ class Trainer:
                 self.saes[name] = SparseCoder(
                     input_widths[hook], cfg.sae, device, dtype=torch.float32
                 )
+                if cfg.sae.init_method == "mlp":
+                    self.saes[name].init_from_mlp(model.base_model, 0, hook)
 
         assert isinstance(dataset, Sized)
         num_batches = len(dataset) // cfg.batch_size
@@ -377,13 +379,14 @@ class Trainer:
                 # Ensure the preactivations are centered at initialization
                 # This is mathematically equivalent to Anthropic's proposal of
                 # subtracting the decoder bias
-                if self.cfg.sae.transcode:
+                if self.cfg.sae.transcode and self.cfg.sae.init_method == "linear":
                     mean = self.maybe_all_reduce(inputs.mean(0)).to(raw.dtype)
                     mean_image = -mean @ raw.encoder.weight.data.T
                     raw.encoder.bias.data = mean_image
 
-                mean = self.maybe_all_reduce(outputs.mean(0))
-                raw.b_dec.data = mean.to(raw.dtype)
+                if raw.b_dec is not None:
+                    mean = self.maybe_all_reduce(outputs.mean(0))
+                    raw.b_dec.data = mean.to(raw.dtype)
 
             # Make sure the W_dec is still unit-norm if we're autoencoding
             if raw.cfg.normalize_decoder and not self.cfg.sae.transcode:

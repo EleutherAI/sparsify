@@ -49,28 +49,53 @@ class SparseCoder(nn.Module):
         self.d_in = d_in
         self.num_latents = cfg.num_latents or d_in * cfg.expansion_factor
 
-        self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
-        self.encoder.bias.data.zero_()
+        if cfg.init_method == "linear":
+            self.encoder = nn.Linear(
+                d_in, self.num_latents, device=device, dtype=dtype
+            )
+            self.encoder.bias.data.zero_()
+        elif cfg.init_method == "mlp":
+            # Initialize the encoder with the weights of the first layer of the MLP
+            # and the decoder with the weights of the second layer.
+            self.encoder = nn.Linear(
+                d_in, self.num_latents, bias=False, device=device, dtype=dtype
+            )
+            self.W_dec = nn.Parameter(
+                torch.zeros(self.num_latents, d_in, device=device, dtype=dtype)
+            )
+        else:
+            raise ValueError(f"Unknown init_method: {cfg.init_method}")
 
-        if decoder:
+        else:
+            self.W_dec = None
+
+        if decoder and self.W_dec is None:
             # Transcoder initialization: use zeros
             if cfg.transcode:
-                self.W_dec = nn.Parameter(torch.zeros_like(self.encoder.weight.data))
+                if cfg.init_method == "linear":
+                    self.W_dec = nn.Parameter(
+                        torch.zeros_like(self.encoder.weight.data)
+                    )
 
             # Sparse autoencoder initialization: use the transpose of encoder weights
             else:
                 self.W_dec = nn.Parameter(self.encoder.weight.data.clone())
                 if self.cfg.normalize_decoder:
                     self.set_decoder_norm_to_unit_norm()
-        else:
-            self.W_dec = None
 
-        self.b_dec = nn.Parameter(torch.zeros(d_in, dtype=dtype, device=device))
-        self.W_skip = (
-            nn.Parameter(torch.zeros(d_in, d_in, device=device, dtype=dtype))
-            if cfg.skip_connection
-            else None
-        )
+        if self.cfg.init_method == "linear":
+            self.b_dec = nn.Parameter(torch.zeros(d_in, dtype=dtype, device=device))
+        else:
+            self.b_dec = None
+
+        if cfg.skip_connection and cfg.init_method == "linear":
+            self.W_skip = nn.Parameter(
+                torch.zeros(d_in, d_in, device=device, dtype=dtype)
+            )
+        else:
+            self.W_skip = None
+        else:
+            self.W_skip = None
 
     @staticmethod
     def load_many(
@@ -168,6 +193,41 @@ class SparseCoder(nn.Module):
                 f,
             )
 
+    @torch.no_grad()
+    def init_from_mlp(
+        self, model: nn.Module, layer_idx: int, hookpoint: str
+    ):
+        """Initialize the transcoder from an MLP layer."""
+        assert self.cfg.init_method == "mlp"
+
+        # Get the MLP layer
+        mlp = model.get_submodule(hookpoint)
+
+        # The encoder of the sparse coder is analogous to the up-projection in the MLP
+        up_proj_weight = mlp.gate_proj.weight.data
+
+        # The decoder of the sparse coder is analogous to the down-projection in the MLP
+        down_proj_weight = mlp.down_proj.weight.data
+
+        # Check if we need to stack the weights
+        mlp_hidden_dim = up_proj_weight.shape[0]
+        if self.num_latents % mlp_hidden_dim != 0:
+            raise ValueError(
+                f"Number of latents ({self.num_latents}) must be a multiple of the "
+                f"MLP hidden dimension ({mlp_hidden_dim}) for MLP initialization."
+            )
+
+        num_stacks = self.num_latents // mlp_hidden_dim
+
+        # Initialize the encoder with stacked copies of the MLP's up-projection
+        stacked_up_proj = up_proj_weight.repeat(num_stacks, 1)
+        self.encoder.weight.data.copy_(stacked_up_proj)
+
+        # The decoder weights are the transpose of the down-projection
+        # So we stack the transpose of the down-projection
+        stacked_down_proj_t = down_proj_weight.t().repeat(1, num_stacks)
+        self.W_dec.data.copy_(stacked_down_proj_t.t())
+
     @property
     def device(self):
         return self.encoder.weight.device
@@ -178,18 +238,22 @@ class SparseCoder(nn.Module):
 
     def encode(self, x: Tensor) -> EncoderOutput:
         """Encode the input and select the top-k latents."""
-        if not self.cfg.transcode:
+        if not self.cfg.transcode and self.b_dec is not None:
             x = x - self.b_dec
 
         return fused_encoder(
             x, self.encoder.weight, self.encoder.bias, self.cfg.k, self.cfg.activation
+        ) if self.encoder.bias is not None else fused_encoder(
+            x, self.encoder.weight, torch.zeros_like(self.encoder.weight[:, 0]), self.cfg.k, self.cfg.activation
         )
 
     def decode(self, top_acts: Tensor, top_indices: Tensor) -> Tensor:
         assert self.W_dec is not None, "Decoder weight was not initialized."
 
         y = decoder_impl(top_indices, top_acts.to(self.dtype), self.W_dec.mT)
-        return y + self.b_dec
+        if self.b_dec is not None:
+            y = y + self.b_dec
+        return y
 
     # Wrapping the forward in bf16 autocast improves performance by almost 2x
     @torch.autocast(
