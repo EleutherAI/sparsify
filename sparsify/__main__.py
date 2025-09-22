@@ -81,7 +81,7 @@ def load_artifacts(
         dtype = torch.bfloat16
     else:
         dtype = torch.float32
-
+        # End-to-end training requires a model with a causal LM head
     model_cls = AutoModel if args.loss_fn == "fvu" else AutoModelForCausalLM
     model = model_cls.from_pretrained(
         args.model,
@@ -92,7 +92,7 @@ def load_artifacts(
             else None
         ),
         revision=args.revision,
-        dtype=dtype,  # ✅ replaces deprecated torch_dtype
+        dtype=dtype, 
         token=args.hf_token,
     )
 
@@ -133,8 +133,6 @@ def load_artifacts(
     eval_dataset = None
     if args.eval_split:
         eval_dataset = prepare_dataset(args.eval_split)
-        print(f"Eval dataset size: {len(eval_dataset)}")
-
     return model, dataset, eval_dataset
 
 
@@ -169,11 +167,9 @@ def run():
         if args.eval_split:
             print(f"Evaluating on split '{args.eval_split}'")
         print(f"Storing model weights in {model.dtype}")
-
-        # ✅ Ensure training won’t silently skip
         if args.epochs == 0 and args.max_steps == 0:
             args.epochs = 1
-            print("⚠️  No training length specified, defaulting to epochs=1")
+            print("No training length specified, defaulting to epochs=1")
 
         trainer = Trainer(args, dataset, model, eval_dataset=eval_dataset)
 

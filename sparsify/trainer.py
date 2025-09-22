@@ -31,7 +31,7 @@ class Trainer:
     def __init__(
         self,
         cfg: TrainConfig,
-        dataset: HfDataset | MemmapDataset,
+        train_dataset: HfDataset | MemmapDataset,
         model: PreTrainedModel,
         eval_dataset=None,
     ):
@@ -61,7 +61,7 @@ class Trainer:
         cfg.hookpoints = cfg.hookpoints[:: cfg.layer_stride]
 
         self.cfg = cfg
-        self.dataset = dataset
+        self.train_dataset = train_dataset
         self.distribute_modules()
         self.eval_dataset = eval_dataset
         device = model.device
@@ -88,8 +88,8 @@ class Trainer:
                     input_widths[hook], cfg.sae, device, dtype=torch.float32
                 )
 
-        assert isinstance(dataset, Sized)
-        num_batches = len(dataset) // cfg.batch_size
+        assert isinstance(train_dataset, Sized)
+        num_batches = len(train_dataset) // cfg.batch_size
 
         match cfg.optimizer:
             case "adam":
@@ -267,14 +267,14 @@ class Trainer:
         print(f"Number of SAE parameters: {num_sae_params:_}")
         print(f"Number of model parameters: {num_model_params:_}")
 
-        num_batches = len(self.dataset) // self.cfg.batch_size
+        num_batches = len(self.train_dataset) // self.cfg.batch_size
         if self.global_step > 0:
-            assert hasattr(self.dataset, "select"), "Dataset must implement `select`"
+            assert hasattr(self.train_dataset, "select"), "Dataset must implement `select`"
 
             n = self.global_step * self.cfg.batch_size
-            ds = self.dataset.select(range(n, len(self.dataset)))  # type: ignore
+            ds = self.train_dataset.select(range(n, len(self.train_dataset)))  # type: ignore
         else:
-            ds = self.dataset
+            ds = self.train_dataset
 
         device = self.model.device
         dl = DataLoader(
@@ -716,10 +716,11 @@ class Trainer:
         compute mean KL divergence."""
         if eval_dataset is None:
             return
-
+        # Only rank 0 should run evaluation
         rank_zero = not dist.is_initialized() or dist.get_rank() == 0
         if not rank_zero:
-            return  # only rank 0 does eval to avoid duplication
+            return  
+        # only rank 0 does eval to avoid duplication
 
         device = self.model.device
         dl = DataLoader(eval_dataset, batch_size=self.cfg.batch_size, shuffle=False)
@@ -729,7 +730,7 @@ class Trainer:
         total_kl, total_count = 0.0, 0
 
         # === Run inference twice per batch ===
-        for batch in tqdm(dl, desc=f"Eval@{step}", disable=not rank_zero):
+        for batch in tqdm(dl, desc=f"Eval@{step}", disable=False):
             x = batch["input_ids"].to(device)
             # 1. Unspliced logits
             logits_unspliced = self.model(x).logits
@@ -745,14 +746,14 @@ class Trainer:
             total_kl += kl.sum().item()
             total_count += kl.numel()
         mean_kl = total_kl / total_count if total_count > 0 else float("nan")
-        if rank_zero:
-            print(f"[Eval @ step {step}] Mean KL divergence: {mean_kl:.6f}")
-            if self.cfg.log_to_wandb:
-                import wandb
 
-                wandb.log({"eval/kl_div": mean_kl, "step": step})
 
+        # Only rank 0 reaches here, so no further rank checks required
+        if self.cfg.log_to_wandb:
+            import wandb
+            wandb.log({"eval/kl_div": mean_kl, "step": step})
         return mean_kl
+
 
 
 # Support old name for compatibility

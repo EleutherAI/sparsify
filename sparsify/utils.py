@@ -40,7 +40,6 @@ def kl_divergence(
     """
     log_p = F.log_softmax(logit_p, dim=dim)
     log_q = F.log_softmax(logit_q, dim=dim)
-    print(log_p)
     p = log_p.exp()
     kl = torch.sum(p * (log_p - log_q), dim=dim)
 
