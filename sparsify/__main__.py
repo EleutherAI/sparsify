@@ -93,7 +93,7 @@ def load_artifacts(
             else None
         ),
         revision=args.revision,
-        dtype=dtype, 
+        dtype=dtype,
         token=args.hf_token,
     )
 
@@ -101,13 +101,13 @@ def load_artifacts(
         # For memmap-style datasets
         if args.dataset.endswith(".bin"):
             return MemmapDataset(args.dataset, args.ctx_len, args.max_examples)
-        
+
         try:
             # For Huggingface datasets
             ds = load_dataset(
                 args.dataset,
                 split=split,
-                trust_remote_code=True,  
+                trust_remote_code=True,
             )
         except ValueError as e:
             # Automatically use load_from_disk if appropriate
@@ -133,7 +133,6 @@ def load_artifacts(
             ds = ds.select(range(limit))
 
         return ds
-
 
     # Train dataset
     dataset = prepare_dataset(args.split)

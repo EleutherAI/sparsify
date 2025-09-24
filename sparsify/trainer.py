@@ -714,11 +714,11 @@ class Trainer:
     def evaluate(self, eval_dataset, step: int):
         """Run eval set through spliced vs unspliced model,
         compute mean KL divergence."""
-        
+
         # ====== Only rank 0 should run evaluation ========
         rank_zero = not dist.is_initialized() or dist.get_rank() == 0
         if not rank_zero:
-            return  
+            return
         # only rank 0 does eval to avoid duplication
 
         device = self.model.device
@@ -744,7 +744,6 @@ class Trainer:
             total_kl += kl.sum().item()
             total_count += kl.numel()
         mean_kl = total_kl / total_count if total_count > 0 else float("nan")
-
 
         # Only rank 0 reaches here, so no further rank checks required
         if self.cfg.log_to_wandb:
