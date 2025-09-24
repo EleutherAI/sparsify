@@ -269,7 +269,9 @@ class Trainer:
 
         num_batches = len(self.train_dataset) // self.cfg.batch_size
         if self.global_step > 0:
-            assert hasattr(self.train_dataset, "select"), "Dataset must implement `select`"
+            assert hasattr(
+                self.train_dataset, "select"
+            ), "Dataset must implement `select`"
 
             n = self.global_step * self.cfg.batch_size
             ds = self.train_dataset.select(range(n, len(self.train_dataset)))  # type: ignore
@@ -717,7 +719,8 @@ class Trainer:
         rank_zero = not dist.is_initialized() or dist.get_rank() == 0
         if not rank_zero:
             return  
-        # ==== only rank 0 does eval to avoid duplication ===
+        # only rank 0 does eval to avoid duplication
+
         device = self.model.device
         dl = DataLoader(eval_dataset, batch_size=self.cfg.batch_size, shuffle=False)
 
@@ -742,11 +745,13 @@ class Trainer:
             total_count += kl.numel()
         mean_kl = total_kl / total_count if total_count > 0 else float("nan")
 
+
+        # Only rank 0 reaches here, so no further rank checks required
         if self.cfg.log_to_wandb:
             import wandb
+
             wandb.log({"eval/kl_div": mean_kl, "step": step})
         return mean_kl
-
 
 
 # Support old name for compatibility

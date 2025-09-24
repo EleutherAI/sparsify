@@ -93,7 +93,7 @@ def load_artifacts(
             else None
         ),
         revision=args.revision,
-        torch_dtype=dtype, 
+        dtype=dtype, 
         token=args.hf_token,
     )
 
