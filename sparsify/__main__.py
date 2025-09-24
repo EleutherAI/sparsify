@@ -163,7 +163,9 @@ def run():
 
     args = parse(RunConfig)
 
+    # Prevent ranks other than 0 from printing
     with nullcontext() if rank == 0 else redirect_stdout(None):
+        # Awkward hack to prevent other ranks from duplicating data preprocessing
         if not ddp or rank == 0:
             model, dataset, eval_dataset = load_artifacts(args, rank)
         if ddp:
