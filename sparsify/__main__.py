@@ -58,7 +58,8 @@ class RunConfig(TrainConfig):
     """Maximum number of examples to use for training."""
 
     resume: bool = False
-    """Whether to try resuming from checkpoint at `checkpoints/run_name`."""
+    """Whether to try resuming from the checkpoint present at `checkpoints/
+    run_name`."""
 
     text_column: str = "text"
     """Column name to use for text data."""
@@ -81,7 +82,7 @@ def load_artifacts(
         dtype = torch.bfloat16
     else:
         dtype = torch.float32
-        # End-to-end training requires a model with a causal LM head
+    # End-to-end training requires a model with a causal LM head
     model_cls = AutoModel if args.loss_fn == "fvu" else AutoModelForCausalLM
     model = model_cls.from_pretrained(
         args.model,
@@ -92,20 +93,28 @@ def load_artifacts(
             else None
         ),
         revision=args.revision,
-        dtype=dtype, 
+        torch_dtype=dtype, 
         token=args.hf_token,
     )
 
     def prepare_dataset(split: str) -> Dataset | MemmapDataset:
+        # For memmap-style datasets
         if args.dataset.endswith(".bin"):
             return MemmapDataset(args.dataset, args.ctx_len, args.max_examples)
-
-        ds = load_dataset(
-            args.dataset,
-            split=split,
-            trust_remote_code=True,
-        )
-
+        
+        try:
+            # For Huggingface datasets
+            ds = load_dataset(
+                args.dataset,
+                split=split,
+                trust_remote_code=True,  
+            )
+        except ValueError as e:
+            # Automatically use load_from_disk if appropriate
+            if "load_from_disk" in str(e):
+                ds = Dataset.load_from_disk(args.dataset, keep_in_memory=False)
+            else:
+                raise e
         assert isinstance(ds, Dataset)
         if "input_ids" not in ds.column_names:
             tokenizer = AutoTokenizer.from_pretrained(args.model, token=args.hf_token)
@@ -118,12 +127,13 @@ def load_artifacts(
             )
         else:
             print(f"Split '{split}' already tokenized; skipping tokenization.")
-
         print(f"Shuffling split '{split}' with seed {args.shuffle_seed}")
         ds = ds.shuffle(args.shuffle_seed).with_format("torch")
         if limit := args.max_examples:
             ds = ds.select(range(limit))
+
         return ds
+
 
     # Train dataset
     dataset = prepare_dataset(args.split)
@@ -143,6 +153,8 @@ def run():
 
     if ddp:
         torch.cuda.set_device(int(local_rank))
+        # Increase the default timeout in order to account for slow downloads
+        # and data preprocessing on the main rank
         dist.init_process_group(
             "nccl", device_id=torch.device(rank), timeout=timedelta(weeks=1)
         )
@@ -158,11 +170,10 @@ def run():
             dist.barrier()
             if rank != 0:
                 model, dataset, eval_dataset = load_artifacts(args, rank)
-
+            # Drop examples that are indivisible across processes to prevent deadlock
             remainder_examples = len(dataset) % dist.get_world_size()
             dataset = dataset.select(range(len(dataset) - remainder_examples))
             dataset = dataset.shard(dist.get_world_size(), rank)
-
         print(f"Training on '{args.dataset}' (split '{args.split}')")
         if args.eval_split:
             print(f"Evaluating on split '{args.eval_split}'")

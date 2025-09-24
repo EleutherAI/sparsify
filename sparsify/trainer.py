@@ -505,8 +505,6 @@ class Trainer:
                 k = self.get_current_k()
                 for name, sae in self.saes.items():
                     sae.cfg.k = k
-
-                ###############
                 with torch.no_grad():
                     # Update the dead feature mask
                     for name, counts in self.num_tokens_since_fired.items():
@@ -714,23 +712,20 @@ class Trainer:
     def evaluate(self, eval_dataset, step: int):
         """Run eval set through spliced vs unspliced model,
         compute mean KL divergence."""
-        if eval_dataset is None:
-            return
-        # Only rank 0 should run evaluation
+        
+        # ====== Only rank 0 should run evaluation ========
         rank_zero = not dist.is_initialized() or dist.get_rank() == 0
         if not rank_zero:
             return  
-        # only rank 0 does eval to avoid duplication
-
+        # ==== only rank 0 does eval to avoid duplication ===
         device = self.model.device
         dl = DataLoader(eval_dataset, batch_size=self.cfg.batch_size, shuffle=False)
 
         self.model.eval()
-
         total_kl, total_count = 0.0, 0
 
         # === Run inference twice per batch ===
-        for batch in tqdm(dl, desc=f"Eval@{step}", disable=False):
+        for batch in tqdm(dl, desc=f"Eval@{step}"):
             x = batch["input_ids"].to(device)
             # 1. Unspliced logits
             logits_unspliced = self.model(x).logits
@@ -747,8 +742,6 @@ class Trainer:
             total_count += kl.numel()
         mean_kl = total_kl / total_count if total_count > 0 else float("nan")
 
-
-        # Only rank 0 reaches here, so no further rank checks required
         if self.cfg.log_to_wandb:
             import wandb
             wandb.log({"eval/kl_div": mean_kl, "step": step})
