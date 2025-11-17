@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v1.3.0 (2025-11-17)
+
+### Features
+
+- Pass arbitrary ds loading arguments
+  ([`80ebed4`](https://github.com/EleutherAI/sparsify/commit/80ebed43f511601e73b71a9213d14a93e6ec686d))
+
+
 ## v1.2.2 (2025-09-30)
 
 ### Bug Fixes
