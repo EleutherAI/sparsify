@@ -19,6 +19,7 @@ from transformers import (
 
 from .data import MemmapDataset, chunk_and_tokenize
 from .trainer import TrainConfig, Trainer
+from .utils import simple_parse_args_string
 
 
 @dataclass
@@ -69,6 +70,11 @@ class RunConfig(TrainConfig):
     )
     """Number of processes to use for preprocessing data"""
 
+    data_args: str = field(
+        default="",
+    )
+    """Arguments to pass to the HuggingFace dataset constructor."""
+
 
 def load_artifacts(
     args: RunConfig, rank: int
@@ -101,12 +107,8 @@ def load_artifacts(
     else:
         # For Huggingface datasets
         try:
-            dataset = load_dataset(
-                args.dataset,
-                split=args.split,
-                # TODO: Maybe set this to False by default? But RPJ requires it.
-                trust_remote_code=True,
-            )
+            kwargs = simple_parse_args_string(args.data_args)
+            dataset = load_dataset(args.dataset, split=args.split, **kwargs)
         except ValueError as e:
             # Automatically use load_from_disk if appropriate
             if "load_from_disk" in str(e):
