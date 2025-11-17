@@ -53,7 +53,7 @@ To train SAEs from the command line, you can use the following command:
 ```bash
 python -m sparsify EleutherAI/pythia-160m [optional dataset] [--transcode]
 ```
-By default, we use the `EleutherAI/SmolLM2-135M-10B` dataset for training, but you can use any dataset from the HuggingFace Hub, or any local dataset in HuggingFace format (the string is passed to `load_dataset` from the `datasets` library).
+By default, we use the `EleutherAI/SmolLM2-135M-10B` dataset for training, but you can use any dataset from the HuggingFace Hub, or any local dataset in HuggingFace format (the string is passed to `load_dataset` from the `datasets` library). You can pass arbitrary dataset loading arguments to HuggingFace using `--data_args "arg1=x,arg2=y".
 
 The CLI supports all of the config options provided by the `TrainConfig` class. You can see them by running `python -m sparsify --help`.
 

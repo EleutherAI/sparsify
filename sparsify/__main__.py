@@ -73,7 +73,8 @@ class RunConfig(TrainConfig):
     data_args: str = field(
         default="",
     )
-    """Arguments to pass to the HuggingFace dataset constructor."""
+    """Arguments to pass to the HuggingFace dataset constructor in the
+    format 'arg1=val1,arg2=val2'."""
 
 
 def load_artifacts(
