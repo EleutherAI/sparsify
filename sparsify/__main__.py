@@ -18,6 +18,7 @@ from transformers import (
 )
 
 from .data import MemmapDataset, chunk_and_tokenize
+from .distributed import handle_distribute
 from .trainer import TrainConfig, Trainer
 from .utils import simple_parse_args_string
 
@@ -77,31 +78,7 @@ class RunConfig(TrainConfig):
     format 'arg1=val1,arg2=val2'."""
 
 
-def load_artifacts(
-    args: RunConfig, rank: int
-) -> tuple[PreTrainedModel, Dataset | MemmapDataset]:
-    if args.load_in_8bit:
-        dtype = torch.float16
-    elif torch.cuda.is_bf16_supported():
-        dtype = torch.bfloat16
-    else:
-        dtype = "auto"
-
-    # End-to-end training requires a model with a causal LM head
-    model_cls = AutoModel if args.loss_fn == "fvu" else AutoModelForCausalLM
-    model = model_cls.from_pretrained(
-        args.model,
-        device_map={"": f"cuda:{rank}"},
-        quantization_config=(
-            BitsAndBytesConfig(load_in_8bit=args.load_in_8bit)
-            if args.load_in_8bit
-            else None
-        ),
-        revision=args.revision,
-        torch_dtype=dtype,
-        token=args.hf_token,
-    )
-
+def load_data(args: RunConfig):
     # For memmap-style datasets
     if args.dataset.endswith(".bin"):
         dataset = MemmapDataset(args.dataset, args.ctx_len, args.max_examples)
@@ -137,10 +114,36 @@ def load_artifacts(
         if limit := args.max_examples:
             dataset = dataset.select(range(limit))
 
-    return model, dataset
+    return dataset
 
 
-def run():
+def load_model_artifact(args: RunConfig, rank: int) -> PreTrainedModel:
+    if args.load_in_8bit:
+        dtype = torch.float16
+    elif torch.cuda.is_bf16_supported():
+        dtype = torch.bfloat16
+    else:
+        dtype = "auto"
+
+    # End-to-end training requires a model with a causal LM head
+    model_cls = AutoModel if args.loss_fn == "fvu" else AutoModelForCausalLM
+    model = model_cls.from_pretrained(
+        args.model,
+        device_map={"": f"cuda:{rank}"},
+        quantization_config=(
+            BitsAndBytesConfig(load_in_8bit=args.load_in_8bit)
+            if args.load_in_8bit
+            else None
+        ),
+        revision=args.revision,
+        torch_dtype=dtype,
+        token=args.hf_token,
+    )
+
+    return model
+
+
+def worker(args: RunConfig, dataset: Dataset | MemmapDataset):
     local_rank = os.environ.get("LOCAL_RANK")
     ddp = local_rank is not None
     rank = int(local_rank) if ddp else 0
@@ -157,17 +160,15 @@ def run():
         if rank == 0:
             print(f"Using DDP across {dist.get_world_size()} GPUs.")
 
-    args = parse(RunConfig)
-
     # Prevent ranks other than 0 from printing
     with nullcontext() if rank == 0 else redirect_stdout(None):
         # Awkward hack to prevent other ranks from duplicating data preprocessing
         if not ddp or rank == 0:
-            model, dataset = load_artifacts(args, rank)
+            model = load_model_artifact(args, rank)
         if ddp:
             dist.barrier()
             if rank != 0:
-                model, dataset = load_artifacts(args, rank)
+                model = load_model_artifact(args, rank)
 
             # Drop examples that are indivisible across processes to prevent deadlock
             remainder_examples = len(dataset) % dist.get_world_size()
@@ -194,6 +195,18 @@ def run():
                 )
 
         trainer.fit()
+
+
+def run():
+    args = parse(RunConfig)
+
+    dataset = load_data(args)
+
+    handle_distribute(
+        process_name="sparsify",
+        worker=worker,
+        const_worker_args=[args, dataset],
+    )
 
 
 if __name__ == "__main__":
