@@ -18,7 +18,7 @@ def chunk_and_tokenize(
     tokenizer: PreTrainedTokenizerBase,
     *,
     format: str = "torch",
-    num_proc: int = min(48, cpu_count() // 2),
+    num_proc: int = min(64, cpu_count() // 2),
     text_key: str = "text",
     max_seq_len: int = 2048,
     return_final_batch: bool = False,
