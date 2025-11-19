@@ -39,6 +39,9 @@ class RunConfig(TrainConfig):
     split: str = "train"
     """Dataset split to use for training."""
 
+    tokenizer: str = ""
+    """Name of the tokenizer to use for training."""
+
     ctx_len: int = 2048
     """Context length to use for training."""
 
@@ -118,8 +121,16 @@ def load_artifacts(
                 raise e
 
         assert isinstance(dataset, Dataset)
+
+        print(f"Shuffling dataset with seed {args.shuffle_seed}")
+        dataset = dataset.shuffle(args.shuffle_seed)
+        if limit := args.max_examples:
+            dataset = dataset.select(range(limit))
+
         if "input_ids" not in dataset.column_names:
-            tokenizer = AutoTokenizer.from_pretrained(args.model, token=args.hf_token)
+            tokenizer = AutoTokenizer.from_pretrained(
+                args.tokenizer or args.model, token=args.hf_token
+            )
             dataset = chunk_and_tokenize(
                 dataset,
                 tokenizer,
@@ -130,12 +141,7 @@ def load_artifacts(
         else:
             print("Dataset already tokenized; skipping tokenization.")
 
-        print(f"Shuffling dataset with seed {args.shuffle_seed}")
-        dataset = dataset.shuffle(args.shuffle_seed)
-
         dataset = dataset.with_format("torch")
-        if limit := args.max_examples:
-            dataset = dataset.select(range(limit))
 
     return model, dataset
 
