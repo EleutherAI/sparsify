@@ -79,6 +79,9 @@ class RunConfig(TrainConfig):
     """Arguments to pass to the HuggingFace dataset constructor in the
     format 'arg1=val1,arg2=val2'."""
 
+    subset: str | None = None
+    """Subset of the dataset to use for training."""
+
 
 def load_artifacts(
     args: RunConfig, rank: int
@@ -112,7 +115,12 @@ def load_artifacts(
         # For Huggingface datasets
         try:
             kwargs = simple_parse_args_string(args.data_args)
-            dataset = load_dataset(args.dataset, split=args.split, **kwargs)
+            if args.subset:
+                dataset = load_dataset(
+                    args.dataset, args.subset, split=args.split, **kwargs
+                )
+            else:
+                dataset = load_dataset(args.dataset, split=args.split, **kwargs)
         except ValueError as e:
             # Automatically use load_from_disk if appropriate
             if "load_from_disk" in str(e):
