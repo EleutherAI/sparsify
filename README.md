@@ -133,7 +133,7 @@ There are several features that we'd like to add in the near future:
 - [ ] Support for caching activations
 - [ ] Evaluate SAEs with KL divergence when grafted into the model
 
-If you'd like to help out with any of these, please feel free to open a PR! You can collaborate with us in the sparse-autoencoders channel of the EleutherAI Discord.
+If you'd like to help out with any of these, please feel free to open a PR! You can collaborate with us in the sparse-autoencoders channel of the EleutherAI Discord, or email lucia@eleuther.ai.
 
 ## Installation
 
