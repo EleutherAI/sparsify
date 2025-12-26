@@ -52,7 +52,9 @@ class TrainConfig(Serializable):
     """Number of steps over which to accumulate gradients."""
 
     micro_acc_steps: int = 1
-    """Multiplier for gradient accumulation (Note: does not currently split data/save memory)"""
+    """Multiplier for gradient accumulation.
+    Note: does not currently split data or save memory.
+    """
 
     loss_fn: Literal["ce", "fvu", "kl"] = "fvu"
     """Loss function to use for training the sparse coders.
