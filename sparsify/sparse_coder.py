@@ -243,8 +243,11 @@ class SparseCoder(nn.Module):
             auxk_acts, auxk_indices = auxk_latents.topk(k_aux, sorted=False)
 
             # Encourage the top ~50% of dead latents to predict the residual of the
-            # top k living latents
-            e_hat = self.decode(auxk_acts, auxk_indices)
+            # top k living latents. We call decoder_impl directly rather than
+            # self.decode because the residual target e already accounts for b_dec
+            # (sae_out includes it), so adding b_dec again here would double-count it.
+            assert self.W_dec is not None, "Decoder weight was not initialized."
+            e_hat = decoder_impl(auxk_indices, auxk_acts.to(self.dtype), self.W_dec.mT)
             auxk_loss = (e_hat - e.detach()).pow(2).sum()
             auxk_loss = scale * auxk_loss / total_variance
         else:
