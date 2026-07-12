@@ -26,7 +26,8 @@ from .utils import get_layer_list, resolve_widths, set_submodule
 
 
 def get_saes_by_layer_name(saes: dict, module_name: str):
-    return { k:v for k, v in saes.items() if module_name in k}
+    return {k: v for k, v in saes.items() if module_name in k}
+
 
 class Trainer:
     def __init__(
@@ -418,7 +419,8 @@ class Trainer:
                     x=inputs,
                     y=outputs,
                     dead_mask=(
-                        self.num_tokens_since_fired[sae_name] > self.cfg.dead_feature_threshold
+                        self.num_tokens_since_fired[sae_name]
+                        > self.cfg.dead_feature_threshold
                         if self.cfg.auxk_alpha > 0
                         else None
                     ),
@@ -436,7 +438,9 @@ class Trainer:
                     return (output, *aux_out) if aux_out is not None else output
 
                 # Metrics that only make sense for local
-                avg_fvu[sae_name] += float(self.maybe_all_reduce(out.fvu.detach()) / denom)
+                avg_fvu[sae_name] += float(
+                    self.maybe_all_reduce(out.fvu.detach()) / denom
+                )
                 if self.cfg.auxk_alpha > 0:
                     avg_auxk_loss[sae_name] += float(
                         self.maybe_all_reduce(out.auxk_loss.detach()) / denom
@@ -448,7 +452,9 @@ class Trainer:
 
                 # Do a "local" backward pass if we're not training end-to-end
                 loss = (
-                    out.fvu + self.cfg.auxk_alpha * out.auxk_loss + out.multi_topk_fvu / 8
+                    out.fvu
+                    + self.cfg.auxk_alpha * out.auxk_loss
+                    + out.multi_topk_fvu / 8
                 )
                 loss.div(acc_steps).backward()
 
