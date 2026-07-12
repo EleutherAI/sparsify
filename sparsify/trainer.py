@@ -84,9 +84,7 @@ class Trainer:
                 torch.manual_seed(seed)
 
                 # Add suffix to the name to disambiguate multiple seeds
-                # how we are setting the suffix
                 name = f"{hook}/seed{seed}" if len(cfg.init_seeds) > 1 else hook
-                print("setting name", name)
                 self.saes[name] = SparseCoder(
                     input_widths[hook], cfg.sae, device, dtype=torch.float32
                 )
@@ -343,8 +341,6 @@ class Trainer:
         maybe_wrapped: dict[str, DDP] | dict[str, SparseCoder] = {}
         module_to_name = {v: k for k, v in name_to_module.items()}
 
-        print("name to module", name_to_module, self.cfg.hookpoints)
-
         def hook(module: nn.Module, inputs, outputs):
             aux_out = None
 
@@ -357,10 +353,7 @@ class Trainer:
 
             # Name may optionally contain a suffix of the form /seedN where N is an
             # integer. We only care about the part before the slash.
-            full_name = module_to_name[module]
-            name, _, _ = full_name.partition("/")
-
-            print("recovered name from hook", name, full_name)
+            name, _, _ = module_to_name[module].partition("/")
 
             # Remember the original output shape since we'll need it for e2e training
             out_shape = outputs.shape
