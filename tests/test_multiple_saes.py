@@ -2,7 +2,7 @@ import torch
 from datasets import Dataset
 from transformers import GPT2Config, GPT2LMHeadModel
 
-from sparsify import SaeConfig, Trainer, TrainConfig
+from sparsify import SaeConfig, TrainConfig, Trainer
 
 VOCAB_SIZE = 64
 
@@ -45,8 +45,7 @@ def test_multi_seed_training(tmp_path):
     assert set(trainer.saes) == expected_names
 
     initial_weights = {
-        name: sae.encoder.weight.detach().clone()
-        for name, sae in trainer.saes.items()
+        name: sae.encoder.weight.detach().clone() for name, sae in trainer.saes.items()
     }
 
     # Used to raise KeyError: 'h.0' on the first batch

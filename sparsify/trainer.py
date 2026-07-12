@@ -32,6 +32,7 @@ def get_saes_by_layer_name(saes: dict, module_name: str):
         if k == module_name or k.startswith(f"{module_name}/")
     }
 
+
 class Trainer:
     def __init__(
         self,
