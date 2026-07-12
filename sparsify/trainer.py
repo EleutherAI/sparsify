@@ -26,7 +26,11 @@ from .utils import get_layer_list, resolve_widths, set_submodule
 
 
 def get_saes_by_layer_name(saes: dict, module_name: str):
-    return { k:v for k, v in saes.items() if module_name in k}
+    return {
+        k: v
+        for k, v in saes.items()
+        if k == module_name or k.startswith(f"{module_name}/")
+    }
 
 class Trainer:
     def __init__(
