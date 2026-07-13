@@ -25,6 +25,14 @@ from .sparse_coder import SparseCoder
 from .utils import get_layer_list, resolve_widths, set_submodule
 
 
+def get_saes_by_layer_name(saes: dict, module_name: str):
+    return {
+        k: v
+        for k, v in saes.items()
+        if k == module_name or k.startswith(f"{module_name}/")
+    }
+
+
 class Trainer:
     def __init__(
         self,
@@ -334,6 +342,7 @@ class Trainer:
             name: self.model.base_model.get_submodule(name)
             for name in self.cfg.hookpoints
         }
+
         maybe_wrapped: dict[str, DDP] | dict[str, SparseCoder] = {}
         module_to_name = {v: k for k, v in name_to_module.items()}
 
@@ -390,61 +399,68 @@ class Trainer:
             inputs = inputs[mask]
 
             # On the first iteration, initialize the encoder and decoder biases
-            raw = self.saes[name]
-            if self.global_step == 0 and not self.cfg.finetune:
-                # Ensure the preactivations are centered at initialization
-                # This is mathematically equivalent to Anthropic's proposal of
-                # subtracting the decoder bias
-                if self.cfg.sae.transcode:
-                    mean = self.maybe_all_reduce(inputs.mean(0)).to(raw.dtype)
-                    mean_image = -mean @ raw.encoder.weight.data.T
-                    raw.encoder.bias.data = mean_image
+            saes_per_layer = get_saes_by_layer_name(self.saes, name)
 
-                mean = self.maybe_all_reduce(outputs.mean(0))
-                raw.b_dec.data = mean.to(raw.dtype)
+            for sae_name, raw in saes_per_layer.items():
+                if self.global_step == 0 and not self.cfg.finetune:
+                    # Ensure the preactivations are centered at initialization
+                    # This is mathematically equivalent to Anthropic's proposal of
+                    # subtracting the decoder bias
+                    if self.cfg.sae.transcode:
+                        mean = self.maybe_all_reduce(inputs.mean(0)).to(raw.dtype)
+                        mean_image = -mean @ raw.encoder.weight.data.T
+                        raw.encoder.bias.data = mean_image
 
-            # Make sure the W_dec is still unit-norm if we're autoencoding
-            if raw.cfg.normalize_decoder and not self.cfg.sae.transcode:
-                raw.set_decoder_norm_to_unit_norm()
+                    mean = self.maybe_all_reduce(outputs.mean(0))
+                    raw.b_dec.data = mean.to(raw.dtype)
 
-            wrapped = maybe_wrapped[name]
-            out = wrapped(
-                x=inputs,
-                y=outputs,
-                dead_mask=(
-                    self.num_tokens_since_fired[name] > self.cfg.dead_feature_threshold
-                    if self.cfg.auxk_alpha > 0
-                    else None
-                ),
-            )
+                # Make sure the W_dec is still unit-norm if we're autoencoding
+                if raw.cfg.normalize_decoder and not self.cfg.sae.transcode:
+                    raw.set_decoder_norm_to_unit_norm()
 
-            # Update the did_fire mask
-            did_fire[name][out.latent_indices.flatten()] = True
-            self.maybe_all_reduce(did_fire[name], "max")  # max is boolean "any"
-
-            if self.cfg.loss_fn in ("ce", "kl"):
-                # Replace the normal output with the SAE output
-                output = all_outputs.clone()
-                output[mask] = out.sae_out.type_as(output)
-                output = output.reshape(out_shape)
-                return (output, *aux_out) if aux_out is not None else output
-
-            # Metrics that only make sense for local
-            avg_fvu[name] += float(self.maybe_all_reduce(out.fvu.detach()) / denom)
-            if self.cfg.auxk_alpha > 0:
-                avg_auxk_loss[name] += float(
-                    self.maybe_all_reduce(out.auxk_loss.detach()) / denom
-                )
-            if self.cfg.sae.multi_topk:
-                avg_multi_topk_fvu[name] += float(
-                    self.maybe_all_reduce(out.multi_topk_fvu.detach()) / denom
+                wrapped = maybe_wrapped[sae_name]
+                out = wrapped(
+                    x=inputs,
+                    y=outputs,
+                    dead_mask=(
+                        self.num_tokens_since_fired[sae_name]
+                        > self.cfg.dead_feature_threshold
+                        if self.cfg.auxk_alpha > 0
+                        else None
+                    ),
                 )
 
-            # Do a "local" backward pass if we're not training end-to-end
-            loss = (
-                out.fvu + self.cfg.auxk_alpha * out.auxk_loss + out.multi_topk_fvu / 8
-            )
-            loss.div(acc_steps).backward()
+                # Update the did_fire mask
+                did_fire[sae_name][out.latent_indices.flatten()] = True
+                self.maybe_all_reduce(did_fire[sae_name], "max")  # max is boolean "any"
+
+                if self.cfg.loss_fn in ("ce", "kl"):
+                    # Replace the normal output with the SAE output
+                    output = all_outputs.clone()
+                    output[mask] = out.sae_out.type_as(output)
+                    output = output.reshape(out_shape)
+                    return (output, *aux_out) if aux_out is not None else output
+
+                # Metrics that only make sense for local
+                avg_fvu[sae_name] += float(
+                    self.maybe_all_reduce(out.fvu.detach()) / denom
+                )
+                if self.cfg.auxk_alpha > 0:
+                    avg_auxk_loss[sae_name] += float(
+                        self.maybe_all_reduce(out.auxk_loss.detach()) / denom
+                    )
+                if self.cfg.sae.multi_topk:
+                    avg_multi_topk_fvu[sae_name] += float(
+                        self.maybe_all_reduce(out.multi_topk_fvu.detach()) / denom
+                    )
+
+                # Do a "local" backward pass if we're not training end-to-end
+                loss = (
+                    out.fvu
+                    + self.cfg.auxk_alpha * out.auxk_loss
+                    + out.multi_topk_fvu / 8
+                )
+                loss.div(acc_steps).backward()
 
         k = self.get_current_k()
         for name, sae in self.saes.items():
