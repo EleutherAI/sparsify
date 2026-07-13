@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v1.3.1 (2026-07-13)
+
+### Bug Fixes
+
+- Release
+  ([`61b37db`](https://github.com/EleutherAI/sparsify/commit/61b37dba146ddfe79892d412e87190646ee0d1c8))
+
+
 ## v1.3.0 (2025-11-17)
 
 ### Features
