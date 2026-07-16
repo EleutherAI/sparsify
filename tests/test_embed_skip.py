@@ -66,11 +66,15 @@ def test_embed_skip_forward_requires_embed():
     from sparsify.config import SaeConfig
     from sparsify.sparse_coder import SparseCoder
 
-    sae = SparseCoder(16, SaeConfig(expansion_factor=2, k=4, embed_skip=True), device="cuda")
+    sae = SparseCoder(
+        16, SaeConfig(expansion_factor=2, k=4, embed_skip=True), device="cuda"
+    )
     x = torch.randn(8, 16, device="cuda")
     try:
         sae(x)
     except AssertionError:
         pass
     else:
-        raise AssertionError("Expected forward() to require `embed` when embed_skip=True")
+        raise AssertionError(
+            "Expected forward() to require `embed` when embed_skip=True"
+        )
