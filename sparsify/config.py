@@ -32,13 +32,6 @@ class SparseCoderConfig(Serializable):
     skip_connection: bool = False
     """Include a linear skip connection."""
 
-    embed_skip: bool = False
-    """Include a learned affine skip connection from the model's embedding
-    activations (rather than this hookpoint's own input) to the sparse coder
-    output, as in a skip transcoder. Meant to control for aspects of the
-    reconstruction explainable by generic token/dataset geometry already
-    present at the embedding layer."""
-
     transcode: bool = False
     """Whether we want to predict the output of a module given its input."""
 

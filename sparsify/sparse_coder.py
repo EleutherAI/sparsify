@@ -44,12 +44,10 @@ class SparseCoder(nn.Module):
         dtype: torch.dtype | None = None,
         *,
         decoder: bool = True,
-        d_embed: int | None = None,
     ):
         super().__init__()
         self.cfg = cfg
         self.d_in = d_in
-        self.d_embed = d_embed or d_in
         self.num_latents = cfg.num_latents or d_in * cfg.expansion_factor
 
         self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
@@ -74,17 +72,6 @@ class SparseCoder(nn.Module):
             if cfg.skip_connection
             else None
         )
-
-        if cfg.embed_skip:
-            self.W_embed_skip = nn.Parameter(
-                torch.zeros(d_in, self.d_embed, device=device, dtype=dtype)
-            )
-            self.b_embed_skip = nn.Parameter(
-                torch.zeros(d_in, device=device, dtype=dtype)
-            )
-        else:
-            self.W_embed_skip = None
-            self.b_embed_skip = None
 
     @staticmethod
     def load_many(
@@ -156,7 +143,6 @@ class SparseCoder(nn.Module):
         with open(path / "cfg.json", "r") as f:
             cfg_dict = json.load(f)
             d_in = cfg_dict.pop("d_in")
-            d_embed = cfg_dict.pop("d_embed", None)
             cfg = SparseCoderConfig.from_dict(cfg_dict, drop_extra_fields=True)
 
         safetensors_path = str(path / "sae.safetensors")
@@ -166,12 +152,7 @@ class SparseCoder(nn.Module):
             reference_dtype = f.get_tensor(first_key).dtype
 
         sae = SparseCoder(
-            d_in,
-            cfg,
-            device=device,
-            decoder=decoder,
-            dtype=reference_dtype,
-            d_embed=d_embed,
+            d_in, cfg, device=device, decoder=decoder, dtype=reference_dtype
         )
 
         load_model(
@@ -193,7 +174,6 @@ class SparseCoder(nn.Module):
                 {
                     **self.cfg.to_dict(),
                     "d_in": self.d_in,
-                    "d_embed": self.d_embed,
                 },
                 f,
             )
@@ -232,7 +212,6 @@ class SparseCoder(nn.Module):
         x: Tensor,
         y: Tensor | None = None,
         *,
-        embed: Tensor | None = None,
         dead_mask: Tensor | None = None,
         total_variance: Tensor | None = None,
     ) -> ForwardOutput:
@@ -246,12 +225,6 @@ class SparseCoder(nn.Module):
         sae_out = self.decode(top_acts, top_indices)
         if self.W_skip is not None:
             sae_out += x.to(self.dtype) @ self.W_skip.mT
-        if self.W_embed_skip is not None:
-            assert embed is not None, (
-                "cfg.embed_skip=True requires embedding activations to be passed "
-                "to forward() via the `embed` argument."
-            )
-            sae_out += embed.to(self.dtype) @ self.W_embed_skip.mT + self.b_embed_skip
 
         # Compute the residual
         e = y - sae_out
