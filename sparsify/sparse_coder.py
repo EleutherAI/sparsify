@@ -229,7 +229,7 @@ class SparseCoder(nn.Module):
         # Compute the residual
         e = y - sae_out
 
-        # Denominator for scale; chunked callers should pass the unchunked batch's variance
+        # Denominator for scale; chunked callers pass the unchunked batch's variance
         if total_variance is None:
             total_variance = (y - y.mean(0)).pow(2).sum()
 
