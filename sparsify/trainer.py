@@ -352,6 +352,15 @@ class Trainer:
         maybe_wrapped: dict[str, DDP] | dict[str, SparseCoder] = {}
         module_to_name = {v: k for k, v in name_to_module.items()}
 
+        # Some SAEs use an embed-activation skip connection instead of their own input
+        needs_embed = any(sae.cfg.embed_skip for sae in self.saes.values())
+        embed_module = self.model.get_input_embeddings() if needs_embed else None
+        embed_acts: Tensor | None = None
+
+        def embed_hook(module: nn.Module, inputs, outputs):
+            nonlocal embed_acts
+            embed_acts = outputs.detach()
+
         def hook(module: nn.Module, inputs, outputs):
             aux_out = None
 
@@ -369,6 +378,9 @@ class Trainer:
             # Remember the original output shape since we'll need it for e2e training
             out_shape = outputs.shape
 
+            # Local copy so we don't clobber embed_acts across hookpoints in this pass
+            local_embed = embed_acts if needs_embed else None
+
             # Scatter and gather the hidden states across ranks if necessary
             if self.cfg.distribute_modules:
                 world_outputs = outputs.new_empty(
@@ -385,6 +397,14 @@ class Trainer:
                     dist.all_gather_into_tensor(world_inputs, inputs)
                     inputs = world_inputs
 
+                if local_embed is not None:
+                    world_embed = local_embed.new_empty(
+                        local_embed.shape[0] * dist.get_world_size(),
+                        *local_embed.shape[1:],
+                    )
+                    dist.all_gather_into_tensor(world_embed, local_embed)
+                    local_embed = world_embed
+
                 world_mask = mask.new_empty(
                     mask.shape[0] * dist.get_world_size(), *mask.shape[1:]
                 )
@@ -398,6 +418,8 @@ class Trainer:
             outputs = outputs.flatten(0, 1)
             inputs = inputs.flatten(0, 1) if self.cfg.sae.transcode else outputs
             mask = mask.flatten(0, 1)
+            if local_embed is not None:
+                local_embed = local_embed.flatten(0, 1)[mask]
 
             # Remove tokens not used for training
             all_outputs = outputs.detach().clone()
@@ -431,9 +453,12 @@ class Trainer:
                     if self.cfg.auxk_alpha > 0
                     else None
                 )
+                sae_embed = local_embed if raw.cfg.embed_skip else None
 
                 if self.cfg.loss_fn in ("ce", "kl"):
-                    out = wrapped(x=inputs, y=outputs, dead_mask=dead_mask)
+                    out = wrapped(
+                        x=inputs, y=outputs, embed=sae_embed, dead_mask=dead_mask
+                    )
 
                     # Update the did_fire mask
                     did_fire[sae_name][out.latent_indices.flatten()] = True
@@ -447,9 +472,25 @@ class Trainer:
 
                 in_chunks = inputs.chunk(self.cfg.micro_acc_steps)
                 out_chunks = outputs.chunk(self.cfg.micro_acc_steps)
+                embed_chunks = (
+                    sae_embed.chunk(self.cfg.micro_acc_steps)
+                    if sae_embed is not None
+                    else [None] * len(out_chunks)
+                )
 
-                for in_chunk, out_chunk in zip(in_chunks, out_chunks):
-                    out = wrapped(x=in_chunk, y=out_chunk, dead_mask=dead_mask)
+                # Normalize every chunk against the unchunked batch's variance
+                total_variance = (outputs - outputs.mean(0)).pow(2).sum()
+
+                for in_chunk, out_chunk, embed_chunk in zip(
+                    in_chunks, out_chunks, embed_chunks
+                ):
+                    out = wrapped(
+                        x=in_chunk,
+                        y=out_chunk,
+                        embed=embed_chunk,
+                        dead_mask=dead_mask,
+                        total_variance=total_variance,
+                    )
 
                     # Update the did_fire mask
                     did_fire[sae_name][out.latent_indices.flatten()] = True
@@ -512,6 +553,8 @@ class Trainer:
             handles = [
                 mod.register_forward_hook(hook) for mod in name_to_module.values()
             ]
+            if embed_module is not None:
+                handles.append(embed_module.register_forward_hook(embed_hook))
             try:
                 match self.cfg.loss_fn:
                     case "ce":
