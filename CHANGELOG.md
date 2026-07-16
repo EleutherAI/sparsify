@@ -1,6 +1,55 @@
 # CHANGELOG
 
 
+## v1.3.2 (2026-07-16)
+
+### Bug Fixes
+
+- Make micro_acc_steps actually chunk activations
+  ([`959030d`](https://github.com/EleutherAI/sparsify/commit/959030d1e4a15417efae9302f62da35ff34e654d))
+
+`micro_acc_steps` has been a no-op since #60 (Support end-to-end training). That PR removed the loop
+  that chunked the activations, but kept the `acc_steps = grad_acc_steps * micro_acc_steps`
+  denominator that the loop existed to compensate for.
+
+The result was worse than the flag simply being ignored: setting micro_acc_steps=N saved no memory
+  at all, while still dividing the loss by an extra factor of N, silently scaling down the
+  gradients.
+
+Restore the chunking loop, so the existing `acc_steps`/`denom` factors are correct again. Chunking
+  is only wired up for the `fvu` loss, where the backward pass happens inside the hook; the
+  `ce`/`kl` losses are computed on the model's logits and need the full reconstruction in one piece,
+  so combining them with micro_acc_steps > 1 now raises instead of being quietly ignored.
+
+Note that chunking is exact only in the limit of large chunks: FVU normalizes by `total_variance`, a
+  sum over the batch, computed per chunk against that chunk's own y.mean(0). Tiny chunks therefore
+  diverge from an unchunked step (~22% of the update norm at 32 tokens/chunk, ~9% at 256),
+  converging to float-noise exact by ~1024 tokens/chunk -- far below any realistic training config.
+  The added test asserts this equivalence at 1024 tokens/chunk.
+
+- Normalize micro_acc_steps chunks against unchunked batch variance
+  ([`f19b274`](https://github.com/EleutherAI/sparsify/commit/f19b274ec3a84b43e67b03501e0dbbbf9d493d4e))
+
+Each chunk was computing total_variance from its own local y.mean(0), which biased the
+  FVU/auxk/multi-topk loss scale relative to an unchunked run (verified failing
+  test_micro_acc_steps_matches_unchunked_update: ~3% off even at 1024 tokens/chunk, not shrinking
+  with chunk size). SparseCoder.forward() now accepts an optional total_variance override; Trainer
+  computes it once from the full pre-chunk batch and shares it across all chunks.
+
+Also carries the embed_skip config/SparseCoder/Trainer plumbing this branch's own
+  test_micro_acc_steps_with_embed_skip depends on, which wasn't committed here yet.
+
+- Remove embed_skip from this branch, keep only the total_variance fix
+  ([`001d98e`](https://github.com/EleutherAI/sparsify/commit/001d98eb1a0a71e1d605dc3c0d55aa53a5b662e5))
+
+The previous commit accidentally bundled the embed_skip feature (an unrelated, separate piece of
+  work) in with the total_variance fix. This branch should only contain the micro_acc_steps chunking
+  fix plus the total_variance normalization fix on top of it.
+
+- Shorten comment to satisfy ruff E501 line-length
+  ([`4b35cee`](https://github.com/EleutherAI/sparsify/commit/4b35ceebfa4c1add37e6abde909b70d33f032273))
+
+
 ## v1.3.1 (2026-07-13)
 
 ### Bug Fixes
