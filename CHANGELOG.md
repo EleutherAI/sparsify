@@ -1,6 +1,22 @@
 # CHANGELOG
 
 
+## v1.3.3 (2026-07-16)
+
+### Bug Fixes
+
+- Don't double-count b_dec in TopK AuxK loss
+  ([#132](https://github.com/EleutherAI/sparsify/pull/132),
+  [`b1fbd0b`](https://github.com/EleutherAI/sparsify/commit/b1fbd0b2a119b7aced21e8ed0e8089e3ab2d7a94))
+
+The AuxK loss target e = y - sae_out already accounts for b_dec, since sae_out is produced by
+  decode() which adds b_dec. Computing e_hat via self.decode() added b_dec a second time, pulling
+  dead latents toward (e - b_dec) and placing an unintended gradient on b_dec whenever b_dec != 0
+  (the normal case after init centers it on the data mean).
+
+Call decoder_impl directly so e_hat does not re-add b_dec.
+
+
 ## v1.3.2 (2026-07-16)
 
 ### Bug Fixes
