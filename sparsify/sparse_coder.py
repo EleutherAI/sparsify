@@ -208,7 +208,12 @@ class SparseCoder(nn.Module):
         enabled=torch.cuda.is_bf16_supported(),
     )
     def forward(
-        self, x: Tensor, y: Tensor | None = None, *, dead_mask: Tensor | None = None
+        self,
+        x: Tensor,
+        y: Tensor | None = None,
+        *,
+        dead_mask: Tensor | None = None,
+        total_variance: Tensor | None = None,
     ) -> ForwardOutput:
         top_acts, top_indices, pre_acts = self.encode(x)
 
@@ -224,8 +229,9 @@ class SparseCoder(nn.Module):
         # Compute the residual
         e = y - sae_out
 
-        # Used as a denominator for putting everything on a reasonable scale
-        total_variance = (y - y.mean(0)).pow(2).sum()
+        # Denominator for scale; chunked callers pass the unchunked batch's variance
+        if total_variance is None:
+            total_variance = (y - y.mean(0)).pow(2).sum()
 
         # Second decoder pass for AuxK loss
         if dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:

@@ -66,6 +66,12 @@ class Trainer:
 
         cfg.hookpoints = cfg.hookpoints[:: cfg.layer_stride]
 
+        if cfg.micro_acc_steps > 1 and cfg.loss_fn in ("ce", "kl"):
+            raise ValueError(
+                f"micro_acc_steps > 1 is not supported with loss_fn='{cfg.loss_fn}'; "
+                f"use grad_acc_steps to reduce memory instead."
+            )
+
         self.cfg = cfg
         self.dataset = dataset
         self.distribute_modules()
@@ -419,48 +425,64 @@ class Trainer:
                     raw.set_decoder_norm_to_unit_norm()
 
                 wrapped = maybe_wrapped[sae_name]
-                out = wrapped(
-                    x=inputs,
-                    y=outputs,
-                    dead_mask=(
-                        self.num_tokens_since_fired[sae_name]
-                        > self.cfg.dead_feature_threshold
-                        if self.cfg.auxk_alpha > 0
-                        else None
-                    ),
+                dead_mask = (
+                    self.num_tokens_since_fired[sae_name]
+                    > self.cfg.dead_feature_threshold
+                    if self.cfg.auxk_alpha > 0
+                    else None
                 )
 
-                # Update the did_fire mask
-                did_fire[sae_name][out.latent_indices.flatten()] = True
-                self.maybe_all_reduce(did_fire[sae_name], "max")  # max is boolean "any"
-
                 if self.cfg.loss_fn in ("ce", "kl"):
+                    out = wrapped(x=inputs, y=outputs, dead_mask=dead_mask)
+
+                    # Update the did_fire mask
+                    did_fire[sae_name][out.latent_indices.flatten()] = True
+                    self.maybe_all_reduce(did_fire[sae_name], "max")
+
                     # Replace the normal output with the SAE output
                     output = all_outputs.clone()
                     output[mask] = out.sae_out.type_as(output)
                     output = output.reshape(out_shape)
                     return (output, *aux_out) if aux_out is not None else output
 
-                # Metrics that only make sense for local
-                avg_fvu[sae_name] += float(
-                    self.maybe_all_reduce(out.fvu.detach()) / denom
-                )
-                if self.cfg.auxk_alpha > 0:
-                    avg_auxk_loss[sae_name] += float(
-                        self.maybe_all_reduce(out.auxk_loss.detach()) / denom
-                    )
-                if self.cfg.sae.multi_topk:
-                    avg_multi_topk_fvu[sae_name] += float(
-                        self.maybe_all_reduce(out.multi_topk_fvu.detach()) / denom
+                in_chunks = inputs.chunk(self.cfg.micro_acc_steps)
+                out_chunks = outputs.chunk(self.cfg.micro_acc_steps)
+
+                # Normalize every chunk against the unchunked batch's variance
+                total_variance = (outputs - outputs.mean(0)).pow(2).sum()
+
+                for in_chunk, out_chunk in zip(in_chunks, out_chunks):
+                    out = wrapped(
+                        x=in_chunk,
+                        y=out_chunk,
+                        dead_mask=dead_mask,
+                        total_variance=total_variance,
                     )
 
-                # Do a "local" backward pass if we're not training end-to-end
-                loss = (
-                    out.fvu
-                    + self.cfg.auxk_alpha * out.auxk_loss
-                    + out.multi_topk_fvu / 8
-                )
-                loss.div(acc_steps).backward()
+                    # Update the did_fire mask
+                    did_fire[sae_name][out.latent_indices.flatten()] = True
+                    self.maybe_all_reduce(did_fire[sae_name], "max")  # max is "any"
+
+                    # Metrics that only make sense for local
+                    avg_fvu[sae_name] += float(
+                        self.maybe_all_reduce(out.fvu.detach()) / denom
+                    )
+                    if self.cfg.auxk_alpha > 0:
+                        avg_auxk_loss[sae_name] += float(
+                            self.maybe_all_reduce(out.auxk_loss.detach()) / denom
+                        )
+                    if self.cfg.sae.multi_topk:
+                        avg_multi_topk_fvu[sae_name] += float(
+                            self.maybe_all_reduce(out.multi_topk_fvu.detach()) / denom
+                        )
+
+                    # Do a "local" backward pass if we're not training end-to-end
+                    loss = (
+                        out.fvu
+                        + self.cfg.auxk_alpha * out.auxk_loss
+                        + out.multi_topk_fvu / 8
+                    )
+                    loss.div(acc_steps).backward()
 
         k = self.get_current_k()
         for name, sae in self.saes.items():
