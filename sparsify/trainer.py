@@ -66,6 +66,12 @@ class Trainer:
 
         cfg.hookpoints = cfg.hookpoints[:: cfg.layer_stride]
 
+        if cfg.micro_acc_steps > 1 and cfg.loss_fn in ("ce", "kl"):
+            raise ValueError(
+                f"micro_acc_steps > 1 is not supported with loss_fn='{cfg.loss_fn}'; "
+                f"use grad_acc_steps to reduce memory instead."
+            )
+
         self.cfg = cfg
         self.dataset = dataset
         self.distribute_modules()
@@ -346,6 +352,15 @@ class Trainer:
         maybe_wrapped: dict[str, DDP] | dict[str, SparseCoder] = {}
         module_to_name = {v: k for k, v in name_to_module.items()}
 
+        # Some SAEs use an embed-activation skip connection instead of their own input
+        needs_embed = any(sae.cfg.embed_skip for sae in self.saes.values())
+        embed_module = self.model.get_input_embeddings() if needs_embed else None
+        embed_acts: Tensor | None = None
+
+        def embed_hook(module: nn.Module, inputs, outputs):
+            nonlocal embed_acts
+            embed_acts = outputs.detach()
+
         def hook(module: nn.Module, inputs, outputs):
             aux_out = None
 
@@ -363,6 +378,9 @@ class Trainer:
             # Remember the original output shape since we'll need it for e2e training
             out_shape = outputs.shape
 
+            # Local copy so we don't clobber embed_acts across hookpoints in this pass
+            local_embed = embed_acts if needs_embed else None
+
             # Scatter and gather the hidden states across ranks if necessary
             if self.cfg.distribute_modules:
                 world_outputs = outputs.new_empty(
@@ -379,6 +397,14 @@ class Trainer:
                     dist.all_gather_into_tensor(world_inputs, inputs)
                     inputs = world_inputs
 
+                if local_embed is not None:
+                    world_embed = local_embed.new_empty(
+                        local_embed.shape[0] * dist.get_world_size(),
+                        *local_embed.shape[1:],
+                    )
+                    dist.all_gather_into_tensor(world_embed, local_embed)
+                    local_embed = world_embed
+
                 world_mask = mask.new_empty(
                     mask.shape[0] * dist.get_world_size(), *mask.shape[1:]
                 )
@@ -392,6 +418,8 @@ class Trainer:
             outputs = outputs.flatten(0, 1)
             inputs = inputs.flatten(0, 1) if self.cfg.sae.transcode else outputs
             mask = mask.flatten(0, 1)
+            if local_embed is not None:
+                local_embed = local_embed.flatten(0, 1)[mask]
 
             # Remove tokens not used for training
             all_outputs = outputs.detach().clone()
@@ -419,48 +447,75 @@ class Trainer:
                     raw.set_decoder_norm_to_unit_norm()
 
                 wrapped = maybe_wrapped[sae_name]
-                out = wrapped(
-                    x=inputs,
-                    y=outputs,
-                    dead_mask=(
-                        self.num_tokens_since_fired[sae_name]
-                        > self.cfg.dead_feature_threshold
-                        if self.cfg.auxk_alpha > 0
-                        else None
-                    ),
+                dead_mask = (
+                    self.num_tokens_since_fired[sae_name]
+                    > self.cfg.dead_feature_threshold
+                    if self.cfg.auxk_alpha > 0
+                    else None
                 )
-
-                # Update the did_fire mask
-                did_fire[sae_name][out.latent_indices.flatten()] = True
-                self.maybe_all_reduce(did_fire[sae_name], "max")  # max is boolean "any"
+                sae_embed = local_embed if raw.cfg.embed_skip else None
 
                 if self.cfg.loss_fn in ("ce", "kl"):
+                    out = wrapped(
+                        x=inputs, y=outputs, embed=sae_embed, dead_mask=dead_mask
+                    )
+
+                    # Update the did_fire mask
+                    did_fire[sae_name][out.latent_indices.flatten()] = True
+                    self.maybe_all_reduce(did_fire[sae_name], "max")
+
                     # Replace the normal output with the SAE output
                     output = all_outputs.clone()
                     output[mask] = out.sae_out.type_as(output)
                     output = output.reshape(out_shape)
                     return (output, *aux_out) if aux_out is not None else output
 
-                # Metrics that only make sense for local
-                avg_fvu[sae_name] += float(
-                    self.maybe_all_reduce(out.fvu.detach()) / denom
+                in_chunks = inputs.chunk(self.cfg.micro_acc_steps)
+                out_chunks = outputs.chunk(self.cfg.micro_acc_steps)
+                embed_chunks = (
+                    sae_embed.chunk(self.cfg.micro_acc_steps)
+                    if sae_embed is not None
+                    else [None] * len(out_chunks)
                 )
-                if self.cfg.auxk_alpha > 0:
-                    avg_auxk_loss[sae_name] += float(
-                        self.maybe_all_reduce(out.auxk_loss.detach()) / denom
-                    )
-                if self.cfg.sae.multi_topk:
-                    avg_multi_topk_fvu[sae_name] += float(
-                        self.maybe_all_reduce(out.multi_topk_fvu.detach()) / denom
+
+                # Normalize every chunk against the unchunked batch's variance
+                total_variance = (outputs - outputs.mean(0)).pow(2).sum()
+
+                for in_chunk, out_chunk, embed_chunk in zip(
+                    in_chunks, out_chunks, embed_chunks
+                ):
+                    out = wrapped(
+                        x=in_chunk,
+                        y=out_chunk,
+                        embed=embed_chunk,
+                        dead_mask=dead_mask,
+                        total_variance=total_variance,
                     )
 
-                # Do a "local" backward pass if we're not training end-to-end
-                loss = (
-                    out.fvu
-                    + self.cfg.auxk_alpha * out.auxk_loss
-                    + out.multi_topk_fvu / 8
-                )
-                loss.div(acc_steps).backward()
+                    # Update the did_fire mask
+                    did_fire[sae_name][out.latent_indices.flatten()] = True
+                    self.maybe_all_reduce(did_fire[sae_name], "max")  # max is "any"
+
+                    # Metrics that only make sense for local
+                    avg_fvu[sae_name] += float(
+                        self.maybe_all_reduce(out.fvu.detach()) / denom
+                    )
+                    if self.cfg.auxk_alpha > 0:
+                        avg_auxk_loss[sae_name] += float(
+                            self.maybe_all_reduce(out.auxk_loss.detach()) / denom
+                        )
+                    if self.cfg.sae.multi_topk:
+                        avg_multi_topk_fvu[sae_name] += float(
+                            self.maybe_all_reduce(out.multi_topk_fvu.detach()) / denom
+                        )
+
+                    # Do a "local" backward pass if we're not training end-to-end
+                    loss = (
+                        out.fvu
+                        + self.cfg.auxk_alpha * out.auxk_loss
+                        + out.multi_topk_fvu / 8
+                    )
+                    loss.div(acc_steps).backward()
 
         k = self.get_current_k()
         for name, sae in self.saes.items():
@@ -498,6 +553,8 @@ class Trainer:
             handles = [
                 mod.register_forward_hook(hook) for mod in name_to_module.values()
             ]
+            if embed_module is not None:
+                handles.append(embed_module.register_forward_hook(embed_hook))
             try:
                 match self.cfg.loss_fn:
                     case "ce":
