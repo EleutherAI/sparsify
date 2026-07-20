@@ -62,7 +62,7 @@ class TrainConfig(Serializable):
     - `kl`: KL divergence of the final model logits w.r.t. the original logits.
     """
 
-    optimizer: Literal["adam", "muon", "signum"] = "signum"
+    optimizer: Literal["adam", "muon", "signum"] = "adam"
     """Optimizer to use."""
 
     lr: float | None = None
