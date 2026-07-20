@@ -233,14 +233,31 @@ class SparseCoder(nn.Module):
         y: Tensor | None = None,
         *,
         embed: Tensor | None = None,
+        gram_means: Tensor | None = None,
         dead_mask: Tensor | None = None,
         total_variance: Tensor | None = None,
     ) -> ForwardOutput:
-        top_acts, top_indices, pre_acts = self.encode(x)
-
         # If we aren't given a distinct target, we're autoencoding
         if y is None:
             y = x
+
+        # Frozen n-gram lookup: subtract the conditional-mean activation so the coder
+        # only has to explain the residual. For autoencoders the encoder sees the
+        # residual too (subtract from x); for transcoders only the output side is
+        # shifted. The mean is added back to `sae_out` before returning so downstream
+        # (CE/KL patching, eval) sees the full reconstruction.
+        mu_b: Tensor | None = None
+        if self.cfg.gram_lookup:
+            assert gram_means is not None, (
+                "cfg.gram_lookup=True requires per-token n-gram means to be passed to "
+                "forward() via the `gram_means` argument."
+            )
+            mu_b = gram_means.to(y.dtype)
+            y = y - mu_b
+            if not self.cfg.transcode:
+                x = x - mu_b
+
+        top_acts, top_indices, pre_acts = self.encode(x)
 
         # Decode
         sae_out = self.decode(top_acts, top_indices)
@@ -293,6 +310,11 @@ class SparseCoder(nn.Module):
             multi_topk_fvu = (sae_out - y).pow(2).sum() / total_variance
         else:
             multi_topk_fvu = sae_out.new_tensor(0.0)
+
+        # Add the frozen n-gram mean back so callers get the full reconstruction; the
+        # losses above are all computed on the residual scale, which is what we train.
+        if mu_b is not None:
+            sae_out = sae_out + mu_b
 
         return ForwardOutput(
             sae_out,

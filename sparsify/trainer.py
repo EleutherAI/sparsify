@@ -19,6 +19,7 @@ from transformers import PreTrainedModel, get_linear_schedule_with_warmup
 
 from .config import TrainConfig
 from .data import MemmapDataset
+from .ngram import GramTable, annotate
 from .muon import Muon
 from .sign_sgd import SignSGD
 from .sparse_coder import SparseCoder
@@ -98,6 +99,37 @@ class Trainer:
                 name = f"{hook}/seed{seed}" if len(cfg.init_seeds) > 1 else hook
                 self.saes[name] = SparseCoder(
                     input_widths[hook], cfg.sae, device, dtype=torch.float32
+                )
+
+        # Frozen n-gram lookup table (shared by every gram_lookup coder in the run).
+        # The full [G, d_model] means live in CPU RAM (too large for a 48 GB GPU) and
+        # are gathered per batch; annotation runs on-device from the batch input_ids.
+        self.gram_mu: Tensor | None = None
+        self.gram_vocab_t = None
+        if any(sae.cfg.gram_lookup for sae in self.saes.values()):
+            assert cfg.gram_table_path, (
+                "sae.gram_lookup=True requires cfg.gram_table_path pointing at a table "
+                "built by `python -m sparsify.ngram_stats`."
+            )
+            table = GramTable.load(cfg.gram_table_path)
+            _, mu_eff = table.remap_to_order(cfg.sae.lookup_max_order)
+            self.gram_mu = torch.from_numpy(mu_eff).to(torch.bfloat16)
+            self.gram_vocab_t = table.vocab.to_torch(device)
+            table_hash = table.manifest.get("hash")
+            for sae in self.saes.values():
+                if sae.cfg.gram_lookup:
+                    sae.cfg.gram_table_hash = table_hash
+            eff_orders = int(min(cfg.sae.lookup_max_order, table.vocab.max_order))
+            print(
+                f"Loaded n-gram table from {cfg.gram_table_path}: "
+                f"G={table.mu.shape[0]:,} d_model={table.d_model} hookpoint={table.hookpoint} "
+                f"lookup_max_order={eff_orders} (table max_order={table.vocab.max_order}) "
+                f"hash={table_hash}"
+            )
+            if table.hookpoint not in cfg.hookpoints:
+                print(
+                    f"  WARNING: table was built for hookpoint '{table.hookpoint}' but "
+                    f"training hookpoints are {cfg.hookpoints}; means may be mismatched."
                 )
 
         assert isinstance(dataset, Sized)
@@ -357,6 +389,13 @@ class Trainer:
         embed_module = self.model.get_input_embeddings() if needs_embed else None
         embed_acts: Tensor | None = None
 
+        # Some SAEs subtract a frozen n-gram conditional-mean from their target. Unlike
+        # embed acts (which come from a forward hook), the per-token means are gathered
+        # from the CPU table using gram ids annotated straight from the batch input_ids;
+        # `gram_means_full` is [B, S, d_model] for the current batch, set in the loop.
+        needs_gram = any(sae.cfg.gram_lookup for sae in self.saes.values())
+        gram_means_full: Tensor | None = None
+
         def embed_hook(module: nn.Module, inputs, outputs):
             nonlocal embed_acts
             embed_acts = outputs.detach()
@@ -378,8 +417,9 @@ class Trainer:
             # Remember the original output shape since we'll need it for e2e training
             out_shape = outputs.shape
 
-            # Local copy so we don't clobber embed_acts across hookpoints in this pass
+            # Local copies so we don't clobber batch-level tensors across hookpoints
             local_embed = embed_acts if needs_embed else None
+            local_gram = gram_means_full if needs_gram else None
 
             # Scatter and gather the hidden states across ranks if necessary
             if self.cfg.distribute_modules:
@@ -405,6 +445,14 @@ class Trainer:
                     dist.all_gather_into_tensor(world_embed, local_embed)
                     local_embed = world_embed
 
+                if local_gram is not None:
+                    world_gram = local_gram.new_empty(
+                        local_gram.shape[0] * dist.get_world_size(),
+                        *local_gram.shape[1:],
+                    )
+                    dist.all_gather_into_tensor(world_gram, local_gram)
+                    local_gram = world_gram
+
                 world_mask = mask.new_empty(
                     mask.shape[0] * dist.get_world_size(), *mask.shape[1:]
                 )
@@ -420,6 +468,8 @@ class Trainer:
             mask = mask.flatten(0, 1)
             if local_embed is not None:
                 local_embed = local_embed.flatten(0, 1)[mask]
+            if local_gram is not None:
+                local_gram = local_gram.flatten(0, 1)[mask]
 
             # Remove tokens not used for training
             all_outputs = outputs.detach().clone()
@@ -454,10 +504,15 @@ class Trainer:
                     else None
                 )
                 sae_embed = local_embed if raw.cfg.embed_skip else None
+                sae_gram = local_gram if raw.cfg.gram_lookup else None
 
                 if self.cfg.loss_fn in ("ce", "kl"):
                     out = wrapped(
-                        x=inputs, y=outputs, embed=sae_embed, dead_mask=dead_mask
+                        x=inputs,
+                        y=outputs,
+                        embed=sae_embed,
+                        gram_means=sae_gram,
+                        dead_mask=dead_mask,
                     )
 
                     # Update the did_fire mask
@@ -477,17 +532,29 @@ class Trainer:
                     if sae_embed is not None
                     else [None] * len(out_chunks)
                 )
+                gram_chunks = (
+                    sae_gram.chunk(self.cfg.micro_acc_steps)
+                    if sae_gram is not None
+                    else [None] * len(out_chunks)
+                )
 
-                # Normalize every chunk against the unchunked batch's variance
-                total_variance = (outputs - outputs.mean(0)).pow(2).sum()
+                # Normalize every chunk against the unchunked batch's variance. With a
+                # gram lookup the coder reconstructs the residual, so variance is taken
+                # on the residual target to keep FVU on the trained scale.
+                if sae_gram is not None:
+                    resid = outputs - sae_gram
+                    total_variance = (resid - resid.mean(0)).pow(2).sum()
+                else:
+                    total_variance = (outputs - outputs.mean(0)).pow(2).sum()
 
-                for in_chunk, out_chunk, embed_chunk in zip(
-                    in_chunks, out_chunks, embed_chunks
+                for in_chunk, out_chunk, embed_chunk, gram_chunk in zip(
+                    in_chunks, out_chunks, embed_chunks, gram_chunks
                 ):
                     out = wrapped(
                         x=in_chunk,
                         y=out_chunk,
                         embed=embed_chunk,
+                        gram_means=gram_chunk,
                         dead_mask=dead_mask,
                         total_variance=total_variance,
                     )
@@ -524,6 +591,12 @@ class Trainer:
         for batch in dl:
             x = batch["input_ids"].to(device)
             tokens_mask = torch.isin(x, self.exclude_tokens, invert=True)
+
+            # Annotate gram ids on-device, then gather the frozen means from CPU RAM.
+            if needs_gram:
+                assert self.gram_mu is not None and self.gram_vocab_t is not None
+                gram_ids = annotate(x, self.gram_vocab_t)
+                gram_means_full = self.gram_mu[gram_ids.to("cpu")].to(device)
 
             if not maybe_wrapped:
                 # Wrap the SAEs with Distributed Data Parallel. We have to do this

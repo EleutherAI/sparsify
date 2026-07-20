@@ -164,3 +164,4 @@ wandb/
 statistics/
 results/
 images/
+ngram_tables/

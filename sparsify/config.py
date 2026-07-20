@@ -39,6 +39,23 @@ class SparseCoderConfig(Serializable):
     reconstruction explainable by generic token/dataset geometry already
     present at the embedding layer."""
 
+    gram_lookup: bool = False
+    """Subtract a frozen n-gram conditional-mean activation from the target (and, for
+    autoencoders, from the encoder input) before training, reconstructing the residual
+    ``y - mu[gram_id]``. This is a null model for local-context/token geometry: whatever
+    the frozen table explains is provably not SAE computation. The table (mean activations
+    per suffix n-gram) is built offline by ``sparsify.ngram_stats`` and supplied per batch
+    by the trainer via the ``gram_means`` argument to ``forward``. Generalizes
+    ``embed_skip`` and the Tokenized-SAE per-token bias. Kept orthogonal to ``embed_skip``."""
+
+    lookup_max_order: int = 4
+    """Maximum n-gram order used by ``gram_lookup``. 0 subtracts the global mean only
+    (a near-baseline), 1 is a frozen per-token bias, 2-4 use the longest-suffix table
+    restricted to that order via the backoff-parent ancestor remap."""
+
+    gram_table_hash: str | None = None
+    """Manifest hash of the n-gram table this coder was trained against (provenance)."""
+
     transcode: bool = False
     """Whether we want to predict the output of a module given its input."""
 
@@ -122,6 +139,10 @@ class TrainConfig(Serializable):
     wandb_log_frequency: int = 1
 
     save_dir: str = "checkpoints"
+
+    gram_table_path: str | None = None
+    """Path to a frozen n-gram table (built by ``sparsify.ngram_stats``). Required when
+    any sparse coder sets ``sae.gram_lookup=True``; ignored otherwise."""
 
     def __post_init__(self):
         """Validate the configuration."""
