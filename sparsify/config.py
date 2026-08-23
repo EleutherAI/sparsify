@@ -101,6 +101,14 @@ class TrainConfig(Serializable):
     distribute_modules: bool = False
     """Store one copy of each sparse coder, instead of copying them across devices."""
 
+    distribute_latents: bool = False
+    """Shard the latent dimension of every sparse coder across devices.
+
+    Like `distribute_modules` this stores one copy of each parameter, but it keeps
+    every hookpoint on every rank, so the number of hookpoints need not be
+    divisible by the world size and the `[N, num_latents]` pre-activation shrinks
+    with the world size instead of growing with it."""
+
     save_every: int = 1000
     """Save sparse coders every `save_every` steps."""
 
@@ -120,6 +128,17 @@ class TrainConfig(Serializable):
         """Validate the configuration."""
         if self.layers and self.layer_stride != 1:
             raise ValueError("Cannot specify both `layers` and `layer_stride`.")
+
+        if self.distribute_modules and self.distribute_latents:
+            raise ValueError(
+                "Cannot combine `distribute_modules` and `distribute_latents`."
+            )
+
+        if self.distribute_latents and self.loss_fn in ("ce", "kl"):
+            raise ValueError(
+                "Sharding latents across ranks is not compatible with the "
+                "cross-entropy or KL divergence losses."
+            )
 
         if self.distribute_modules and self.loss_fn in ("ce", "kl"):
             raise ValueError(

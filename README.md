@@ -127,6 +127,46 @@ torchrun --nproc_per_node gpu -m sparsify meta-llama/Meta-Llama-3-8B --distribut
 
 The above command trains an SAE for every _even_ layer of Llama 3 8B, using all available GPUs. It accumulates gradients over 8 minibatches, and splits each minibatch into 2 microbatches before feeding them into the SAE encoder, thus saving a lot of memory. It also loads the model in 8-bit precision using `bitsandbytes`. This command requires no more than 48GB of memory per GPU on an 8 GPU node.
 
+Sharding whole layers has two limits: the number of hookpoints must be divisible by
+the number of GPUs, and every rank still materialises the world-sized activation for
+every hookpoint, including the ones it does not own. `--distribute_latents` shards the
+*latent* dimension of every sparse coder instead, so each rank holds `num_latents /
+world_size` rows of every coder:
+
+```bash
+torchrun --nproc_per_node gpu -m sparsify HuggingFaceTB/SmolLM2-135M --distribute_latents --batch_size 8
+```
+
+Parameters, gradients and optimizer state shrink with the world size, every hookpoint
+stays on every rank so any number of GPUs works, and the ranks agree on a single global
+top-k, which makes the result mathematically identical to single-GPU training.
+Checkpoints are gathered and written unsharded, so they load with the ordinary loader.
+
+Measured on SmolLM2-135M, 30 hookpoints, batch size 8 per rank, A100-40GB. Peak
+allocated per rank, and median time per step (the same number of tokens per step in
+every column):
+
+| GPUs | DDP | `--distribute_modules` | `--distribute_latents` |
+|---|---|---|---|
+| 2 | 9.04 GiB / 0.33 s | 3.86 GiB / 0.38 s | **3.65 GiB / 0.33 s** |
+| 4 | 9.04 GiB | not runnable (30 not divisible by 4) | **2.24 GiB / 0.36 s** |
+| 8 | 9.04 GiB / 0.30 s | not runnable | **1.69 GiB / 0.43 s** |
+
+**Which to use.** `--distribute_latents` is strictly better than `--distribute_modules`:
+lighter, faster, and it runs at GPU counts where `--distribute_modules` refuses to
+start. Against DDP it buys a large memory saving for a modest slowdown -- 5.4x less
+memory for 1.4x the step time at 8 GPUs -- because the ranks must agree on the top-k,
+which costs two collectives per coder per forward and none in the backward.
+
+The slowdown grows with the batch, since the collectives scale with the gathered batch
+while the per-rank shard does not: at batch size 64 the same 8-GPU run is 1.9x lighter
+than DDP and 2.1x slower. Prefer a smaller per-rank batch with more gradient
+accumulation when using many ranks.
+
+`--distribute_latents` supports the AuxK loss, `multi_topk` and `skip_connection`, but
+requires `activation="topk"`; `groupmax` partitions the latent dimension itself and
+cannot be split this way.
+
 ## TODO
 
 There are several features that we'd like to add in the near future:

@@ -3,6 +3,13 @@ from typing import Literal, NamedTuple
 import torch
 import torch.nn.functional as F
 
+# Upper bound on the temporary built inside the weight-gradient accumulation. The
+# unchunked form allocates N * k * D elements at once, which for a wide model and
+# a large k is the single biggest tensor in the backward pass -- at N=8192, k=32,
+# D=1024 it is 1 GiB. Consuming it in row-blocks bounds that without changing the
+# result.
+BACKWARD_CHUNK_BYTES = 64 * 1024 * 1024
+
 
 class EncoderOutput(NamedTuple):
     top_acts: torch.Tensor
@@ -66,15 +73,27 @@ class FusedEncoder(torch.autograd.Function):
         # --- Grad w.r.t. weight ---
         if ctx.needs_input_grad[1]:
             grad_weight = torch.zeros_like(weight)
-            # Compute contributions from each top-k element:
-            # computed as grad_values * input for each top-k location.
-            contributions = grad_values.unsqueeze(2) * input.unsqueeze(1)
-            _, _, D = contributions.shape
-            # Flatten contributions to shape (N*k, D)
-            contributions = contributions.reshape(-1, D)
+            # Each top-k location contributes `grad_values * input` to its row of
+            # grad_weight. Materialising all of them at once costs N * k * D
+            # elements, so walk the batch in blocks sized to BACKWARD_CHUNK_BYTES
+            # and fold each block in as it is built. The arithmetic is unchanged;
+            # only the accumulation order inside index_add_ differs, and that was
+            # already unspecified on CUDA.
+            N, k = grad_values.shape
+            D = input.shape[-1]
+            itemsize = torch.promote_types(grad_values.dtype, input.dtype).itemsize
+            rows = max(1, BACKWARD_CHUNK_BYTES // max(1, k * D * itemsize))
 
-            # Accumulate contributions into the correct rows of grad_weight.
-            grad_weight.index_add_(0, indices.flatten(), contributions.type_as(weight))
+            for start in range(0, N, rows):
+                stop = min(start + rows, N)
+                block = grad_values[start:stop].unsqueeze(2) * input[
+                    start:stop
+                ].unsqueeze(1)
+                grad_weight.index_add_(
+                    0,
+                    indices[start:stop].flatten(),
+                    block.reshape(-1, D).type_as(weight),
+                )
 
         # --- Grad w.r.t. bias ---
         if bias is not None and ctx.needs_input_grad[2]:
