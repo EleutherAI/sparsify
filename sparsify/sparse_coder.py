@@ -5,6 +5,7 @@ from typing import NamedTuple
 
 import einops
 import torch
+import torch.nn.functional as F
 from huggingface_hub import snapshot_download
 from natsort import natsorted
 from safetensors import safe_open
@@ -13,6 +14,16 @@ from torch import Tensor, nn
 
 from .config import SparseCoderConfig
 from .fused_encoder import EncoderOutput, fused_encoder
+from .latent_parallel import (
+    Winners,
+    all_reduce_sum,
+    compact_winners,
+    global_sum,
+    global_topk_mask,
+    ragged_decode,
+    shard_size,
+    sparse_encoder_grad,
+)
 from .utils import decoder_impl
 
 
@@ -44,13 +55,48 @@ class SparseCoder(nn.Module):
         dtype: torch.dtype | None = None,
         *,
         decoder: bool = True,
+        latent_shard: tuple[int, int] | None = None,
     ):
         super().__init__()
         self.cfg = cfg
         self.d_in = d_in
-        self.num_latents = cfg.num_latents or d_in * cfg.expansion_factor
+        self.global_num_latents = cfg.num_latents or d_in * cfg.expansion_factor
 
-        self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
+        # `latent_shard` is (rank, world_size): this coder holds only its slice of
+        # the latent dimension and cooperates with its peers in `forward`.
+        if latent_shard is None:
+            self.num_latents = self.global_num_latents
+            self.latent_offset = 0
+            self.latent_world_size = 1
+        else:
+            shard_rank, world_size = latent_shard
+            if cfg.activation != "topk":
+                raise ValueError(
+                    "Latent sharding currently supports activation='topk' only; "
+                    f"'{cfg.activation}' partitions the latent dimension itself."
+                )
+            self.num_latents = shard_size(self.global_num_latents, world_size)
+            self.latent_offset = shard_rank * self.num_latents
+            self.latent_world_size = world_size
+
+        if latent_shard is None:
+            self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
+        else:
+            # Draw the *global* initialization and keep only this rank's rows.
+            # Every rank runs the same seed, so drawing at the sharded shape
+            # directly would give all of them identical weights, collapsing the
+            # dictionary to num_latents // world_size distinct latents. Drawing at
+            # the full shape also makes a sharded run reproduce an unsharded run
+            # with the same seed, row for row. The full draw is transient.
+            full = nn.Linear(d_in, self.global_num_latents, device=device, dtype=dtype)
+            self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
+            self.encoder.weight.data.copy_(
+                full.weight.data[
+                    self.latent_offset : self.latent_offset + self.num_latents
+                ]
+            )
+            del full
+
         self.encoder.bias.data.zero_()
 
         if decoder:
@@ -186,6 +232,10 @@ class SparseCoder(nn.Module):
     def dtype(self):
         return self.encoder.weight.dtype
 
+    @property
+    def is_latent_sharded(self) -> bool:
+        return self.latent_world_size > 1
+
     def encode(self, x: Tensor) -> EncoderOutput:
         """Encode the input and select the top-k latents."""
         if not self.cfg.transcode:
@@ -194,6 +244,58 @@ class SparseCoder(nn.Module):
         return fused_encoder(
             x, self.encoder.weight, self.encoder.bias, self.cfg.k, self.cfg.activation
         )
+
+    def _count_dead(self, dead_mask: Tensor) -> int:
+        """Number of dead latents, counted over the whole dictionary."""
+        if not self.is_latent_sharded:
+            return int(dead_mask.sum())
+
+        return int(global_sum(dead_mask.sum()))
+
+    def _sharded_encode(self, x: Tensor) -> tuple[Tensor, Winners, Tensor]:
+        """Select globally, then rejoin the graph on the surviving pairs only.
+
+        The dense pre-activation exists solely to run the top-k, so it is built
+        outside the graph; `sparse_encoder_grad` reattaches the encoder gradient
+        to the winners, which keeps the backward proportional to how many latents
+        this rank actually owns rather than to how many it offered.
+        """
+        shifted = x if self.cfg.transcode else x - self.b_dec
+
+        with torch.no_grad():
+            pre_acts = F.relu(F.linear(shifted, self.encoder.weight, self.encoder.bias))
+            cand_acts, cand_idx = pre_acts.topk(self.cfg.k, dim=-1, sorted=False)
+            winners = compact_winners(
+                global_topk_mask(cand_acts, self.cfg.k), cand_acts, cand_idx
+            )
+
+        acts = sparse_encoder_grad(
+            winners.values, shifted, self.encoder.weight, self.encoder.bias, winners
+        )
+        return acts, winners, pre_acts
+
+    def _sharded_decode(self, acts: Tensor, winners: Winners, x: Tensor) -> Tensor:
+        """Decode this rank's winners and sum the partial reconstructions.
+
+        `b_dec` and `W_skip` are replicated rather than sharded, so each rank
+        contributes 1/W of them: the sum reproduces each exactly once, and each
+        rank ends up holding 1/W of their gradient, which
+        `latent_parallel.sync_replicated_grads` then adds back up.
+        """
+        assert self.W_dec is not None, "Decoder weight was not initialized."
+        world_size = self.latent_world_size
+
+        partial = ragged_decode(winners, acts, self.W_dec)
+        partial = partial + self.b_dec / world_size
+        if self.W_skip is not None:
+            partial = partial + (x.to(self.dtype) @ self.W_skip.mT) / world_size
+        return all_reduce_sum(partial)
+
+    def _sharded_global_winners(self, scores: Tensor, k: int) -> Winners:
+        """Global top-k over a shard-local score matrix, as a flat winner list."""
+        candidates = min(k, self.num_latents)
+        vals, idx = scores.topk(candidates, sorted=False)
+        return compact_winners(global_topk_mask(vals, k), vals, idx)
 
     def decode(self, top_acts: Tensor, top_indices: Tensor) -> Tensor:
         assert self.W_dec is not None, "Decoder weight was not initialized."
@@ -215,16 +317,23 @@ class SparseCoder(nn.Module):
         dead_mask: Tensor | None = None,
         total_variance: Tensor | None = None,
     ) -> ForwardOutput:
-        top_acts, top_indices, pre_acts = self.encode(x)
+        if self.is_latent_sharded:
+            top_acts, winners, pre_acts = self._sharded_encode(x)
+            top_indices = winners.latents
+        else:
+            top_acts, top_indices, pre_acts = self.encode(x)
 
         # If we aren't given a distinct target, we're autoencoding
         if y is None:
             y = x
 
         # Decode
-        sae_out = self.decode(top_acts, top_indices)
-        if self.W_skip is not None:
-            sae_out += x.to(self.dtype) @ self.W_skip.mT
+        if self.is_latent_sharded:
+            sae_out = self._sharded_decode(top_acts, winners, x)
+        else:
+            sae_out = self.decode(top_acts, top_indices)
+            if self.W_skip is not None:
+                sae_out = sae_out + x.to(self.dtype) @ self.W_skip.mT
 
         # Compute the residual
         e = y - sae_out
@@ -234,7 +343,7 @@ class SparseCoder(nn.Module):
             total_variance = (y - y.mean(0)).pow(2).sum()
 
         # Second decoder pass for AuxK loss
-        if dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
+        if dead_mask is not None and (num_dead := self._count_dead(dead_mask)) > 0:
             # Heuristic from Appendix B.1 in the paper
             k_aux = y.shape[-1] // 2
 
@@ -245,15 +354,20 @@ class SparseCoder(nn.Module):
             # Don't include living latents in this loss
             auxk_latents = torch.where(dead_mask[None], pre_acts, -torch.inf)
 
-            # Top-k dead latents
-            auxk_acts, auxk_indices = auxk_latents.topk(k_aux, sorted=False)
-
             # Encourage the top ~50% of dead latents to predict the residual of the
             # top k living latents. We call decoder_impl directly rather than
             # self.decode because the residual target e already accounts for b_dec
             # (sae_out includes it), so adding b_dec again here would double-count it.
             assert self.W_dec is not None, "Decoder weight was not initialized."
-            e_hat = decoder_impl(auxk_indices, auxk_acts.to(self.dtype), self.W_dec.mT)
+
+            if self.is_latent_sharded:
+                aux = self._sharded_global_winners(auxk_latents, k_aux)
+                e_hat = all_reduce_sum(ragged_decode(aux, aux.values, self.W_dec))
+            else:
+                auxk_acts, auxk_indices = auxk_latents.topk(k_aux, sorted=False)
+                e_hat = decoder_impl(
+                    auxk_indices, auxk_acts.to(self.dtype), self.W_dec.mT
+                )
             auxk_loss = (e_hat - e.detach()).pow(2).sum()
             auxk_loss = scale * auxk_loss / total_variance
         else:
@@ -263,8 +377,15 @@ class SparseCoder(nn.Module):
         fvu = l2_loss / total_variance
 
         if self.cfg.multi_topk:
-            top_acts, top_indices = pre_acts.topk(4 * self.cfg.k, sorted=False)
-            sae_out = self.decode(top_acts, top_indices)
+            wide_k = 4 * self.cfg.k
+            if self.is_latent_sharded:
+                wide = self._sharded_global_winners(pre_acts, wide_k)
+                sae_out = self._sharded_decode(wide.values, wide, x)
+            else:
+                top_acts, top_indices = pre_acts.topk(wide_k, sorted=False)
+                sae_out = self.decode(top_acts, top_indices)
+                if self.W_skip is not None:
+                    sae_out = sae_out + x.to(self.dtype) @ self.W_skip.mT
 
             multi_topk_fvu = (sae_out - y).pow(2).sum() / total_variance
         else:

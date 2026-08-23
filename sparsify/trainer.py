@@ -1,15 +1,17 @@
+import json
 import os
 from collections import defaultdict
 from dataclasses import asdict
 from fnmatch import fnmatchcase
 from glob import glob
+from pathlib import Path
 from typing import Sized
 
 import torch
 import torch.distributed as dist
 from datasets import Dataset as HfDataset
 from natsort import natsorted
-from safetensors.torch import load_model
+from safetensors.torch import load_model, save_file
 from schedulefree import ScheduleFreeWrapper
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -19,10 +21,23 @@ from transformers import PreTrainedModel, get_linear_schedule_with_warmup
 
 from .config import TrainConfig
 from .data import MemmapDataset
+from .latent_parallel import gather_full_state, sync_replicated_grads
 from .muon import Muon
 from .sign_sgd import SignSGD
-from .sparse_coder import SparseCoder
+from .sparse_coder import ForwardOutput, SparseCoder
 from .utils import get_layer_list, resolve_widths, set_submodule
+
+
+def save_full_coder(sae: SparseCoder, state: dict[str, Tensor], path: str) -> None:
+    """Write a reassembled (unsharded) coder so ordinary loaders can read it."""
+    directory = Path(path)
+    directory.mkdir(parents=True, exist_ok=True)
+    save_file(
+        {k: v.contiguous() for k, v in state.items()},
+        str(directory / "sae.safetensors"),
+    )
+    with open(directory / "cfg.json", "w") as f:
+        json.dump({**sae.cfg.to_dict(), "d_in": sae.d_in}, f)
 
 
 def get_saes_by_layer_name(saes: dict, module_name: str):
@@ -97,7 +112,15 @@ class Trainer:
                 # Add suffix to the name to disambiguate multiple seeds
                 name = f"{hook}/seed{seed}" if len(cfg.init_seeds) > 1 else hook
                 self.saes[name] = SparseCoder(
-                    input_widths[hook], cfg.sae, device, dtype=torch.float32
+                    input_widths[hook],
+                    cfg.sae,
+                    device,
+                    dtype=torch.float32,
+                    latent_shard=(
+                        (dist.get_rank(), dist.get_world_size())
+                        if cfg.distribute_latents
+                        else None
+                    ),
                 )
 
         assert isinstance(dataset, Sized)
@@ -120,7 +143,7 @@ class Trainer:
                 pgs = [
                     dict(
                         params=sae.parameters(),
-                        lr=cfg.lr or 2e-4 / (sae.num_latents / (2**14)) ** 0.5,
+                        lr=cfg.lr or 2e-4 / (sae.global_num_latents / (2**14)) ** 0.5,
                     )
                     for sae in self.saes.values()
                 ]
@@ -163,7 +186,7 @@ class Trainer:
                 pgs = [
                     dict(
                         params=sae.parameters(),
-                        lr=cfg.lr or 5e-3 / (sae.num_latents / (2**14)) ** 0.5,
+                        lr=cfg.lr or 5e-3 / (sae.global_num_latents / (2**14)) ** 0.5,
                     )
                     for sae in self.saes.values()
                 ]
@@ -187,7 +210,7 @@ class Trainer:
             self.cfg.exclude_tokens, device=device, dtype=torch.long
         )
 
-        num_latents = list(self.saes.values())[0].num_latents
+        num_latents = list(self.saes.values())[0].global_num_latents
         self.initial_k = min(num_latents, round(list(input_widths.values())[0] * 10))
         self.final_k = self.cfg.sae.k
 
@@ -256,7 +279,9 @@ class Trainer:
         self.model.requires_grad_(False)
 
         rank_zero = not dist.is_initialized() or dist.get_rank() == 0
-        ddp = dist.is_initialized() and not self.cfg.distribute_modules
+        ddp = dist.is_initialized() and not (
+            self.cfg.distribute_modules or self.cfg.distribute_latents
+        )
 
         wandb = None
         if self.cfg.log_to_wandb and rank_zero:
@@ -370,7 +395,7 @@ class Trainer:
             out_shape = outputs.shape
 
             # Scatter and gather the hidden states across ranks if necessary
-            if self.cfg.distribute_modules:
+            if self.cfg.distribute_modules or self.cfg.distribute_latents:
                 world_outputs = outputs.new_empty(
                     outputs.shape[0] * dist.get_world_size(), *outputs.shape[1:]
                 )
@@ -391,7 +416,9 @@ class Trainer:
                 dist.all_gather_into_tensor(world_mask, mask)
                 mask = world_mask.bool()
 
-                if name not in self.module_plan[dist.get_rank()]:
+                if self.cfg.distribute_modules and (
+                    name not in self.module_plan[dist.get_rank()]
+                ):
                     return
 
             # Flatten the batch and sequence dimensions
@@ -436,7 +463,7 @@ class Trainer:
                     out = wrapped(x=inputs, y=outputs, dead_mask=dead_mask)
 
                     # Update the did_fire mask
-                    did_fire[sae_name][out.latent_indices.flatten()] = True
+                    did_fire[sae_name][self.fired_indices(out)] = True
                     self.maybe_all_reduce(did_fire[sae_name], "max")
 
                     # Replace the normal output with the SAE output
@@ -460,7 +487,7 @@ class Trainer:
                     )
 
                     # Update the did_fire mask
-                    did_fire[sae_name][out.latent_indices.flatten()] = True
+                    did_fire[sae_name][self.fired_indices(out)] = True
                     self.maybe_all_reduce(did_fire[sae_name], "max")  # max is "any"
 
                     # Metrics that only make sense for local
@@ -506,7 +533,10 @@ class Trainer:
                 )
 
             # Bookkeeping for dead feature detection
-            N = tokens_mask.sum().item()
+            n_tokens = tokens_mask.sum()
+            if self.cfg.distribute_latents:
+                dist.all_reduce(n_tokens, op=dist.ReduceOp.SUM)
+            N = int(n_tokens.item())
             num_tokens_in_step += N
 
             # Compute clean logits if using KL loss
@@ -551,6 +581,9 @@ class Trainer:
                 if self.cfg.sae.normalize_decoder and not self.cfg.sae.transcode:
                     for sae in self.saes.values():
                         sae.remove_gradient_parallel_to_decoder_directions()
+
+                if self.cfg.distribute_latents:
+                    sync_replicated_grads(self.saes.values())
 
                 for optimizer in self.optimizers:
                     optimizer.step()
@@ -633,6 +666,16 @@ class Trainer:
 
         pbar.close()
 
+    def fired_indices(self, out: ForwardOutput) -> Tensor:
+        """Shard-local indices of the latents that actually fired.
+
+        Under `distribute_latents` the coder returns a flat list of the winners
+        this rank owns, so the only entries to drop are the ones ReLU zeroed.
+        """
+        if not self.cfg.distribute_latents:
+            return out.latent_indices.flatten()
+        return out.latent_indices[out.latent_acts > 0].flatten()
+
     def local_hookpoints(self) -> list[str]:
         return (
             self.module_plan[dist.get_rank()]
@@ -649,8 +692,21 @@ class Trainer:
         dist.all_gather_into_tensor(buffer, x)
         return buffer
 
+    @property
+    def coders_are_sharded(self) -> bool:
+        """Whether each rank owns a distinct slice of the coders.
+
+        True for both distributed modes, and false under DDP, where every rank
+        holds a replica. It decides two things: that per-latent quantities must
+        not be reduced across ranks, and that every rank holds checkpoint state.
+        """
+        return self.cfg.distribute_modules or self.cfg.distribute_latents
+
     def maybe_all_reduce(self, x: Tensor, op: str = "mean") -> Tensor:
-        if not dist.is_initialized() or self.cfg.distribute_modules:
+        # Under `distribute_latents` every rank already sees the same global batch,
+        # so the scalars are identical and need no reduction, while the per-latent
+        # masks are indexed in *shard-local* space and must not be reduced at all.
+        if not dist.is_initialized() or self.coders_are_sharded:
             return x
 
         if op == "sum":
@@ -694,7 +750,13 @@ class Trainer:
         for name, sae in saes.items():
             assert isinstance(sae, SparseCoder)
 
-            sae.save_to_disk(f"{path}/{name}")
+            if self.cfg.distribute_latents:
+                # Collective on every rank; only rank 0 writes the result.
+                full = gather_full_state(sae)
+                if rank_zero:
+                    save_full_coder(sae, full, f"{path}/{name}")
+            else:
+                sae.save_to_disk(f"{path}/{name}")
 
         if rank_zero:
             for i, scheduler in enumerate(self.lr_schedulers):
@@ -729,7 +791,7 @@ class Trainer:
 
         rank_zero = not dist.is_initialized() or dist.get_rank() == 0
 
-        if rank_zero or self.cfg.distribute_modules:
+        if rank_zero or self.coders_are_sharded:
             self._checkpoint(self.saes, path, rank_zero)
 
         # Barrier to ensure all ranks have saved before continuing
@@ -746,7 +808,7 @@ class Trainer:
                 if avg_loss[name] < self.best_loss[name]:  # type: ignore
                     self.best_loss[name] = avg_loss[name]  # type: ignore
 
-                    if rank_zero or self.cfg.distribute_modules:
+                    if rank_zero or self.coders_are_sharded:
                         self._checkpoint(
                             {name: self.saes[name]}, f"{base_path}/{name}", rank_zero
                         )
@@ -754,7 +816,7 @@ class Trainer:
             if avg_loss < self.best_loss:  # type: ignore
                 self.best_loss = avg_loss  # type: ignore
 
-                if rank_zero or self.cfg.distribute_modules:
+                if rank_zero or self.coders_are_sharded:
                     self._checkpoint(self.saes, base_path, rank_zero)
 
         # Barrier to ensure all ranks have saved before continuing
