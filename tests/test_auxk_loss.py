@@ -1,16 +1,19 @@
 import torch
 
+import sparsify.sparse_coder as sparse_coder_module
 from sparsify import SparseCoder, SparseCoderConfig
-from sparsify.utils import decoder_impl
+from sparsify.utils import eager_decode
 
 
-def test_auxk_loss_does_not_double_count_b_dec():
+def test_auxk_loss_does_not_double_count_b_dec(monkeypatch):
     """The AuxK loss target ``e = y - sae_out`` already accounts for ``b_dec``
     (since ``sae_out`` includes it), so the second decoder pass used to compute
     ``e_hat`` must *not* add ``b_dec`` again. See issue #132.
 
-    This runs on CPU using the eager decoder fallback, so it requires no GPU.
+    This runs on CPU, so it needs the eager decoder: `decoder_impl` is bound at
+    import time and prefers the Triton kernel, which rejects CPU tensors.
     """
+    monkeypatch.setattr(sparse_coder_module, "decoder_impl", eager_decode)
     torch.manual_seed(0)
 
     d_in = 16
@@ -49,7 +52,7 @@ def test_auxk_loss_does_not_double_count_b_dec():
 
     # Correct target: decode without adding b_dec a second time.
     assert sae.W_dec is not None
-    e_hat = decoder_impl(auxk_indices, auxk_acts.to(sae.dtype), sae.W_dec.mT)
+    e_hat = eager_decode(auxk_indices, auxk_acts.to(sae.dtype), sae.W_dec.mT)
     expected_auxk_loss = scale * (e_hat - e.detach()).pow(2).sum() / total_variance
 
     torch.testing.assert_close(out.auxk_loss, expected_auxk_loss)
