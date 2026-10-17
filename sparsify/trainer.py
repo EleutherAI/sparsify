@@ -313,7 +313,12 @@ class Trainer:
 
         tokens_mask: torch.Tensor
 
-        acc_steps = self.cfg.grad_acc_steps * self.cfg.micro_acc_steps
+        # Every micro-batch chunk is normalized by the variance of the full batch (see
+        # `total_variance` in the hook below), so the chunk losses already sum to one
+        # batch's loss. Only `grad_acc_steps` should divide the loss, not
+        # `micro_acc_steps`; dividing by both would scale gradients and logged
+        # metrics down by `micro_acc_steps`.
+        acc_steps = self.cfg.grad_acc_steps
         denom = acc_steps * self.cfg.wandb_log_frequency
         num_tokens_in_step = 0
 
