@@ -52,7 +52,13 @@ class TrainConfig(Serializable):
     """Number of steps over which to accumulate gradients."""
 
     micro_acc_steps: int = 1
-    """Chunk the activations into this number of microbatches for training."""
+    """Chunk the activations into this number of microbatches for training.
+
+    Each chunk gets its own forward and backward pass through the sparse coder, so
+    the large latent activations are only held in memory one chunk at a time. The
+    result is equivalent to an unchunked step. Only supported with `loss_fn="fvu"`;
+    use `grad_acc_steps` to reduce memory with the `ce` and `kl` losses.
+    """
 
     loss_fn: Literal["ce", "fvu", "kl"] = "fvu"
     """Loss function to use for training the sparse coders.
