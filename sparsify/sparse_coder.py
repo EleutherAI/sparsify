@@ -265,6 +265,8 @@ class SparseCoder(nn.Module):
         if self.cfg.multi_topk:
             top_acts, top_indices = pre_acts.topk(4 * self.cfg.k, sorted=False)
             sae_out = self.decode(top_acts, top_indices)
+            if self.W_skip is not None:
+                sae_out += x.to(self.dtype) @ self.W_skip.mT
 
             multi_topk_fvu = (sae_out - y).pow(2).sum() / total_variance
         else:
