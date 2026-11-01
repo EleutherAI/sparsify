@@ -108,8 +108,12 @@ def handle_arg_string(arg):
         return True
     elif arg.lower() == "false":
         return False
-    elif arg.isnumeric():
+    # int() decides, not str.isnumeric(): "-5" is not numeric but is an int, and
+    # "½" is numeric but int() rejects it.
+    try:
         return int(arg)
+    except ValueError:
+        pass
     try:
         return float(arg)
     except ValueError:
