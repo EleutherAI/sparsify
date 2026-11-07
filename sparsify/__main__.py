@@ -39,6 +39,10 @@ class RunConfig(TrainConfig):
     split: str = "train"
     """Dataset split to use for training."""
 
+    eval_split: str | None = None
+    """Dataset split on which to evaluate, every `save_every` steps, the KL divergence
+    of the model with all sparse coders spliced in from the original model."""
+
     ctx_len: int = 2048
     """Context length to use for training."""
 
@@ -79,7 +83,7 @@ class RunConfig(TrainConfig):
 
 def load_artifacts(
     args: RunConfig, rank: int
-) -> tuple[PreTrainedModel, Dataset | MemmapDataset]:
+) -> tuple[PreTrainedModel, Dataset | MemmapDataset, Dataset | None]:
     if args.load_in_8bit:
         dtype = torch.float16
     elif torch.cuda.is_bf16_supported():
@@ -104,31 +108,11 @@ def load_artifacts(
 
     # For memmap-style datasets
     if args.dataset.endswith(".bin"):
+        if args.eval_split is not None:
+            raise ValueError("`eval_split` is not supported for memmap datasets.")
         dataset = MemmapDataset(args.dataset, args.ctx_len, args.max_examples)
     else:
-        # For Huggingface datasets
-        try:
-            kwargs = simple_parse_args_string(args.data_args)
-            dataset = load_dataset(args.dataset, split=args.split, **kwargs)
-        except ValueError as e:
-            # Automatically use load_from_disk if appropriate
-            if "load_from_disk" in str(e):
-                dataset = Dataset.load_from_disk(args.dataset, keep_in_memory=False)
-            else:
-                raise e
-
-        assert isinstance(dataset, Dataset)
-        if "input_ids" not in dataset.column_names:
-            tokenizer = AutoTokenizer.from_pretrained(args.model, token=args.hf_token)
-            dataset = chunk_and_tokenize(
-                dataset,
-                tokenizer,
-                max_seq_len=args.ctx_len,
-                num_proc=args.data_preprocessing_num_proc,
-                text_key=args.text_column,
-            )
-        else:
-            print("Dataset already tokenized; skipping tokenization.")
+        dataset = load_hf_dataset(args, args.split)
 
         print(f"Shuffling dataset with seed {args.shuffle_seed}")
         dataset = dataset.shuffle(args.shuffle_seed)
@@ -137,7 +121,38 @@ def load_artifacts(
         if limit := args.max_examples:
             dataset = dataset.select(range(limit))
 
-    return model, dataset
+    eval_dataset = None
+    if args.eval_split is not None:
+        eval_dataset = load_hf_dataset(args, args.eval_split).with_format("torch")
+
+    return model, dataset, eval_dataset
+
+
+def load_hf_dataset(args: RunConfig, split: str) -> Dataset:
+    try:
+        kwargs = simple_parse_args_string(args.data_args)
+        dataset = load_dataset(args.dataset, split=split, **kwargs)
+    except ValueError as e:
+        # Automatically use load_from_disk if appropriate
+        if "load_from_disk" in str(e):
+            dataset = Dataset.load_from_disk(args.dataset, keep_in_memory=False)
+        else:
+            raise e
+
+    assert isinstance(dataset, Dataset)
+    if "input_ids" not in dataset.column_names:
+        tokenizer = AutoTokenizer.from_pretrained(args.model, token=args.hf_token)
+        dataset = chunk_and_tokenize(
+            dataset,
+            tokenizer,
+            max_seq_len=args.ctx_len,
+            num_proc=args.data_preprocessing_num_proc,
+            text_key=args.text_column,
+        )
+    else:
+        print("Dataset already tokenized; skipping tokenization.")
+
+    return dataset
 
 
 def run():
@@ -163,17 +178,19 @@ def run():
     with nullcontext() if rank == 0 else redirect_stdout(None):
         # Awkward hack to prevent other ranks from duplicating data preprocessing
         if not ddp or rank == 0:
-            model, dataset = load_artifacts(args, rank)
+            model, dataset, eval_dataset = load_artifacts(args, rank)
         if ddp:
             dist.barrier()
             if rank != 0:
-                model, dataset = load_artifacts(args, rank)
+                model, dataset, eval_dataset = load_artifacts(args, rank)
 
             # Drop examples that are indivisible across processes to prevent deadlock
             remainder_examples = len(dataset) % dist.get_world_size()
             dataset = dataset.select(range(len(dataset) - remainder_examples))
 
             dataset = dataset.shard(dist.get_world_size(), rank)
+            if eval_dataset is not None:
+                eval_dataset = eval_dataset.shard(dist.get_world_size(), rank)
 
             # Drop examples that are indivisible across processes to prevent deadlock
             remainder_examples = len(dataset) % dist.get_world_size()
@@ -182,7 +199,7 @@ def run():
         print(f"Training on '{args.dataset}' (split '{args.split}')")
         print(f"Storing model weights in {model.dtype}")
 
-        trainer = Trainer(args, dataset, model)
+        trainer = Trainer(args, dataset, model, eval_dataset)
         if args.resume:
             trainer.load_state(f"checkpoints/{args.run_name}" or "checkpoints/unnamed")
         elif args.finetune:
