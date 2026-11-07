@@ -95,6 +95,14 @@ To finetune a pretrained SAE, pass its path to the `finetune` argument.
 python -m sparsify EleutherAI/pythia-160m togethercomputer/RedPajama-Data-1T-Sample --finetune EleutherAI/sae-pythia-160m-32x
 ```
 
+## Evaluating the spliced model
+
+With `--eval_split`, the SAEs are evaluated on that split of the dataset every `--save_every` steps: all of them are spliced into the model at once, and the KL divergence between the next-token distributions of the original and the spliced model is logged as `eval/kl`.
+
+```bash
+python -m sparsify EleutherAI/pythia-160m --eval_split "train[:1%]" --split "train[1%:]"
+```
+
 ## Custom hookpoints
 
 By default, the SAEs are trained on the residual stream activations of the model. However, you can also train SAEs on the activations of any other submodule(s) by specifying custom hookpoint patterns. These patterns are like standard PyTorch module names (e.g. `h.0.ln_1`) but also allow [Unix pattern matching syntax](https://docs.python.org/3/library/fnmatch.html), including wildcards and character sets. For example, to train SAEs on the output of every attention module and the inner activations of every MLP in GPT-2, you can use the following code:

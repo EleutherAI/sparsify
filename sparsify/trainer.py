@@ -39,9 +39,25 @@ class Trainer:
         cfg: TrainConfig,
         dataset: HfDataset | MemmapDataset,
         model: PreTrainedModel,
+        eval_dataset: HfDataset | MemmapDataset | None = None,
     ):
         # Store the whole model, including any potential causal LM wrapper
         self.model = model
+        self.eval_dataset = eval_dataset
+        if eval_dataset is not None:
+            if cfg.distribute_modules:
+                raise ValueError(
+                    "KL evaluation is not supported with `distribute_modules`."
+                )
+            if len(cfg.init_seeds) > 1:
+                raise ValueError(
+                    "KL evaluation is not supported with multiple `init_seeds`."
+                )
+            if cfg.loss_fn == "ce" and cfg.sae.transcode:
+                raise ValueError(
+                    "KL evaluation needs the original model, which end-to-end "
+                    "transcoder training modifies."
+                )
 
         if cfg.hookpoints:
             assert not cfg.layers, "Cannot specify both `hookpoints` and `layers`."
@@ -581,6 +597,13 @@ class Trainer:
                     if self.cfg.save_best:
                         self.save_best(avg_losses)
 
+                    if self.eval_dataset is not None:
+                        eval_kl = self.evaluate()
+                        if rank_zero:
+                            print(f"Step {step + 1}: eval KL divergence {eval_kl:.4f}")
+                        if wandb is not None:
+                            wandb.log({"eval/kl": eval_kl}, step=step)
+
                 if (
                     self.cfg.log_to_wandb
                     and (step + 1) % self.cfg.wandb_log_frequency == 0
@@ -632,6 +655,66 @@ class Trainer:
             self.save_best(avg_losses)
 
         pbar.close()
+
+    @torch.no_grad()
+    def evaluate(self) -> float:
+        """Splice all sparse coders into the model at once and return the mean KL
+        divergence of its next-token distributions from those of the original model,
+        over all tokens of the eval set."""
+        assert self.eval_dataset is not None, "No eval dataset was given"
+        device = self.model.device
+        tokens_mask: Tensor
+
+        module_to_sae = {
+            self.model.base_model.get_submodule(name): self.saes[name]
+            for name in self.cfg.hookpoints
+        }
+
+        def splice(module: nn.Module, inputs, outputs):
+            aux_out = None
+            if isinstance(inputs, tuple):
+                inputs = inputs[0]
+            if isinstance(outputs, tuple):
+                outputs, *aux_out = outputs
+
+            x = inputs if self.cfg.sae.transcode else outputs
+            sae_out = module_to_sae[module](x.flatten(0, 1)).sae_out
+            sae_out = sae_out.reshape(outputs.shape).type_as(outputs)
+
+            # Tokens excluded from training keep their original activations
+            output = torch.where(tokens_mask[..., None], sae_out, outputs)
+            return (output, *aux_out) if aux_out is not None else output
+
+        for optimizer in self.optimizers:
+            if isinstance(optimizer, ScheduleFreeWrapper):
+                optimizer.eval()
+
+        total_kl = torch.zeros((), device=device, dtype=torch.float64)
+        num_tokens = torch.zeros((), device=device, dtype=torch.float64)
+        dl = DataLoader(self.eval_dataset, batch_size=self.cfg.batch_size)  # type: ignore
+        for batch in dl:
+            x = batch["input_ids"].to(device)
+            tokens_mask = torch.isin(x, self.exclude_tokens, invert=True)
+
+            clean_lps = self.model(x).logits.float().log_softmax(dim=-1)
+            handles = [mod.register_forward_hook(splice) for mod in module_to_sae]
+            try:
+                spliced_lps = self.model(x).logits.float().log_softmax(dim=-1)
+            finally:
+                for handle in handles:
+                    handle.remove()
+
+            kl = torch.sum(clean_lps.exp() * (clean_lps - spliced_lps), dim=-1)
+            total_kl += kl.sum()
+            num_tokens += kl.numel()
+
+        for optimizer in self.optimizers:
+            if isinstance(optimizer, ScheduleFreeWrapper):
+                optimizer.train()
+
+        total_kl = self.maybe_all_reduce(total_kl, "sum")
+        num_tokens = self.maybe_all_reduce(num_tokens, "sum")
+        return (total_kl / num_tokens).item()
 
     def local_hookpoints(self) -> list[str]:
         return (
